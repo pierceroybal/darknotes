@@ -2,8 +2,9 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     div, fill, point, prelude::*, px, relative, rgb, size, uniform_list, AnyElement, App, Bounds,
-    Context, FocusHandle, Focusable, Font, GlobalElementId, Hsla, InspectorElementId, KeyDownEvent,
-    LayoutId, MouseButton, MouseUpEvent, Pixels, ShapedLine, SharedString, Style, TextRun, Window,
+    Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
+    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ShapedLine,
+    SharedString, Style, TextRun, Window,
 };
 
 use crate::document::Document;
@@ -356,10 +357,11 @@ struct LineCaret {
     block: bool,
 }
 
-/// One text line, painted as a single shaped run with the caret drawn as an
-/// overlay quad. Splitting a line into before/caret/after elements re-shapes
-/// each fragment on its own, so glyphs drift as the caret moves through the
-/// line; shaping the whole line once keeps every glyph fixed.
+/// One text line, shaped as a single uniform run with the caret drawn entirely
+/// as an overlay. Shaping never depends on the caret, so a line's layout-cache
+/// key is identical whether or not the cursor is on it — cursor movement reuses
+/// cached layouts instead of re-shaping every visible line each frame. The block
+/// caret's inverted glyph is repainted from the cached layout, not re-shaped.
 struct LineElement {
     text: SharedString,
     /// `Some` only on the cursor line.
@@ -370,6 +372,9 @@ struct LinePrepaint {
     shaped: ShapedLine,
     /// `(x within the line, width)` of the caret quad; `None` off the cursor line.
     caret: Option<(Pixels, Pixels)>,
+    /// Block caret only: the glyph under the caret, repainted dark over the
+    /// block. `(font, glyph, x within the line)`. `None` for the bar and at EOL.
+    caret_glyph: Option<(FontId, GlyphId, Pixels)>,
 }
 
 impl IntoElement for LineElement {
@@ -418,55 +423,45 @@ impl Element for LineElement {
         let fg = style.color;
         let font_size = style.font_size.to_pixels(window.rem_size());
 
-        let (caret_byte, under_end) = match self.caret {
-            Some(c) => caret_bytes(&self.text, c.col),
-            None => (0, None),
-        };
-
-        // The block caret inverts the char under it: shape that one char dark so
-        // it reads against the yellow block. Every run shares one font, so a
-        // single shape call lays glyphs out exactly as an unsplit line would —
-        // the caret never nudges surrounding text.
-        let invert = match (self.caret, under_end) {
-            (Some(c), Some(end)) if c.block => Some((caret_byte, end)),
-            _ => None,
-        };
-        let dark: Hsla = rgb(0x1a1a1a).into();
-        let runs = match invert {
-            Some((s, e)) => {
-                let mut v = Vec::with_capacity(3);
-                if s > 0 {
-                    v.push(run(&font, s, fg));
-                }
-                v.push(run(&font, e - s, dark));
-                if self.text.len() > e {
-                    v.push(run(&font, self.text.len() - e, fg));
-                }
-                v
-            }
-            None => vec![run(&font, self.text.len(), fg)],
-        };
-
+        // One uniform run: the line's shaping key never depends on the caret, so
+        // the layout cache keeps hitting as the cursor moves. The caret is an
+        // overlay below; nothing here re-shapes per keystroke.
+        let runs = [run(&font, self.text.len(), fg)];
         let shaped = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
 
-        let caret = self.caret.map(|c| {
-            let x = shaped.x_for_index(caret_byte);
-            let width = if c.block {
-                match under_end {
-                    Some(end) => shaped.x_for_index(end) - x,
+        let (caret, caret_glyph) = match self.caret {
+            None => (None, None),
+            Some(c) => {
+                let (caret_byte, under_end) = caret_bytes(&self.text, c.col);
+                let x = shaped.x_for_index(caret_byte);
+                match (c.block, under_end) {
+                    // Block caret over a char: full-cell quad, and grab that
+                    // glyph from the cached layout to repaint it dark on top.
+                    (true, Some(end)) => {
+                        let glyph = shaped.runs.iter().find_map(|r| {
+                            r.glyphs
+                                .iter()
+                                .find(|g| g.index == caret_byte)
+                                .map(|g| (r.font_id, g.id, g.position.x))
+                        });
+                        (Some((x, shaped.x_for_index(end) - x)), glyph)
+                    }
                     // ponytail: EOL block width is a font-size estimate; it only
                     // shows past the last glyph, where exactness doesn't matter.
-                    None => font_size * 0.5,
+                    (true, None) => (Some((x, font_size * 0.5)), None),
+                    // Insert-mode bar.
+                    (false, _) => (Some((x, px(2.))), None),
                 }
-            } else {
-                px(2.)
-            };
-            (x, width)
-        });
+            }
+        };
 
-        LinePrepaint { shaped, caret }
+        LinePrepaint {
+            shaped,
+            caret,
+            caret_glyph,
+        }
     }
 
     fn paint(
@@ -480,7 +475,8 @@ impl Element for LineElement {
         cx: &mut App,
     ) {
         let line_height = window.line_height();
-        // Quad first so the inverted under-char glyph paints over it.
+        // Quad first (under the text), then the line, then the inverted caret
+        // glyph on top so it reads dark against the yellow block.
         if let Some((x, width)) = prepaint.caret {
             let origin = point(bounds.origin.x + x, bounds.origin.y);
             window.paint_quad(fill(
@@ -488,7 +484,15 @@ impl Element for LineElement {
                 rgb(0xffcc00),
             ));
         }
-        let _ = prepaint.shaped.paint(bounds.origin, line_height, window, cx);
+        let shaped = &prepaint.shaped;
+        let _ = shaped.paint(bounds.origin, line_height, window, cx);
+        if let Some((font_id, glyph_id, gx)) = prepaint.caret_glyph {
+            // Match the baseline `ShapedLine::paint` uses: line is vertically
+            // centered, glyph sits on the baseline (`paint_glyph` y is baseline).
+            let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;
+            let baseline = point(bounds.origin.x + gx, bounds.origin.y + padding_top + shaped.ascent);
+            let _ = window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, rgb(0x1a1a1a).into());
+        }
     }
 }
 
