@@ -1,0 +1,61 @@
+mod document;
+mod editor;
+mod vault;
+mod vim;
+
+use std::path::PathBuf;
+
+use editor::Editor;
+use gpui::{
+    App, Application, Bounds, Focusable, WindowBounds, WindowOptions, prelude::*, px, size,
+};
+
+fn main() {
+    // WSLg advertises a Wayland compositor whose version GPUI rejects; force the
+    // X11 backend (DISPLAY) there by hiding WAYLAND_DISPLAY before GPUI probes it.
+    // ponytail: WSL-only guard; native Wayland desktops keep their compositor.
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    }
+
+    Application::new().run(|cx: &mut App| {
+        // A directory argument opens a vault; a file argument opens that file
+        // with its parent as the vault; no argument uses the current directory.
+        let (root, initial) = match std::env::args().nth(1) {
+            Some(p) => {
+                let path = PathBuf::from(p);
+                if path.is_dir() {
+                    (path, None)
+                } else {
+                    let root = path
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    (root, Some(path))
+                }
+            }
+            None => (
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                None,
+            ),
+        };
+
+        let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            move |window, cx| {
+                let editor = cx.new(|cx| Editor::new(root, initial, cx));
+                // Focus on launch, or on_key_down never fires and nothing types.
+                let handle = editor.read(cx).focus_handle(cx);
+                window.focus(&handle);
+                editor
+            },
+        )
+        .unwrap();
+        cx.activate(true);
+    });
+}
