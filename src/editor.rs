@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use gpui::{
     div, fill, point, prelude::*, px, relative, rgb, size, uniform_list, AnyElement, App, Bounds,
     Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
-    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ShapedLine,
-    SharedString, Style, TextRun, Window,
+    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ScrollStrategy,
+    ShapedLine, SharedString, Style, TextRun, UniformListScrollHandle, Window,
 };
 
 use crate::document::Document;
@@ -42,6 +42,10 @@ pub struct Editor {
     selected: usize,
     /// `Ctrl-W` was the previous key; the next key picks a pane.
     pending_window: bool,
+    /// Drives the editor line list's scroll position (wheel + scroll-to-cursor).
+    scroll: UniformListScrollHandle,
+    /// Caret line at the last render; a change requests a scroll-to-cursor.
+    last_line: usize,
 }
 
 impl Editor {
@@ -67,6 +71,8 @@ impl Editor {
             message: None,
             pane: Pane::Editor,
             pending_window: false,
+            scroll: UniformListScrollHandle::new(),
+            last_line: 0,
         }
     }
 
@@ -77,6 +83,8 @@ impl Editor {
         self.doc = open_or_empty(&path);
         self.vim = Vim::new();
         self.current = Some(i);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top); // new file starts at the top
+        self.last_line = 0;
         window.focus(&self.focus); // keep keys flowing to the editor after a click
     }
 
@@ -236,6 +244,22 @@ impl Focusable for Editor {
 impl Render for Editor {
     fn render(&mut self, _win: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (cur_line, cur_col) = self.doc.caret_line_col();
+
+        // Keep the caret on screen, but only when it actually moved — so the
+        // mouse wheel can scroll freely without snapping back every frame.
+        // `scroll_to_item` snaps an offscreen line to the strategy's edge, so
+        // pick the edge by direction: moving down lands it at the bottom, up at
+        // the top — each a one-line scroll, never a page jump.
+        if cur_line != self.last_line {
+            let strategy = if cur_line > self.last_line {
+                ScrollStrategy::Bottom
+            } else {
+                ScrollStrategy::Top
+            };
+            self.scroll.scroll_to_item(cur_line, strategy);
+            self.last_line = cur_line;
+        }
+
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
         let mode = self.vim.mode;
@@ -335,6 +359,7 @@ impl Render for Editor {
                                 })
                                 .collect()
                         })
+                        .track_scroll(self.scroll.clone())
                         .flex_1(),
                     )
                     .child(
