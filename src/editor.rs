@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, prelude::*, px, rgb, uniform_list, AnyElement, App, Context, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseUpEvent, Window,
+    div, fill, point, prelude::*, px, relative, rgb, size, uniform_list, AnyElement, App, Bounds,
+    Context, FocusHandle, Focusable, Font, GlobalElementId, Hsla, InspectorElementId, KeyDownEvent,
+    LayoutId, MouseButton, MouseUpEvent, Pixels, ShapedLine, SharedString, Style, TextRun, Window,
 };
 
 use crate::document::Document;
@@ -324,7 +325,13 @@ impl Render for Editor {
                     .child(
                         uniform_list("lines", line_count, move |range, _win, _cx| {
                             range
-                                .map(|i| render_line(&rope, i, cur_line, cur_col, mode))
+                                .map(|i| LineElement {
+                                    text: line_text(&rope, i).into(),
+                                    caret: (i == cur_line).then_some(LineCaret {
+                                        col: cur_col,
+                                        block: mode != Mode::Insert,
+                                    }),
+                                })
                                 .collect()
                         })
                         .flex_1(),
@@ -341,48 +348,192 @@ impl Render for Editor {
     }
 }
 
-fn render_line(
-    rope: &ropey::Rope,
-    i: usize,
-    cur_line: usize,
-    cur_col: usize,
-    mode: Mode,
-) -> AnyElement {
-    let text: String = rope.line(i).chars().filter(|c| *c != '\n').collect();
-    if i != cur_line {
-        return div().child(text).into_any_element();
+/// One caret on the cursor line. `block` is vim's normal/command block caret
+/// (inverts the char under it); otherwise it's the insert-mode bar.
+#[derive(Clone, Copy)]
+struct LineCaret {
+    col: usize,
+    block: bool,
+}
+
+/// One text line, painted as a single shaped run with the caret drawn as an
+/// overlay quad. Splitting a line into before/caret/after elements re-shapes
+/// each fragment on its own, so glyphs drift as the caret moves through the
+/// line; shaping the whole line once keeps every glyph fixed.
+struct LineElement {
+    text: SharedString,
+    /// `Some` only on the cursor line.
+    caret: Option<LineCaret>,
+}
+
+struct LinePrepaint {
+    shaped: ShapedLine,
+    /// `(x within the line, width)` of the caret quad; `None` off the cursor line.
+    caret: Option<(Pixels, Pixels)>,
+}
+
+impl IntoElement for LineElement {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
     }
-    let before: String = text.chars().take(cur_col).collect();
-    let mut rest = text.chars().skip(cur_col);
-    match mode {
-        // ponytail: caret height hardcoded to ~line_height; derive from
-        // window.line_height() when the view moves to a custom Element.
-        Mode::Insert => {
-            let after: String = rest.collect();
-            div()
-                .flex()
-                .child(before)
-                .child(div().w(px(2.)).h(px(18.)).bg(rgb(0xffcc00)))
-                .child(after)
-                .into_any_element()
-        }
-        // Command mode keeps the normal block caret in the text.
-        Mode::Normal | Mode::Command => {
-            let under = rest.next();
-            let after: String = rest.collect();
-            let caret = match under {
-                Some(c) => div()
-                    .bg(rgb(0xffcc00))
-                    .text_color(rgb(0x1a1a1a))
-                    .child(c.to_string()),
-                None => div().w(px(9.)).h(px(18.)).bg(rgb(0xffcc00)),
+}
+
+impl Element for LineElement {
+    type RequestLayoutState = ();
+    type PrepaintState = LinePrepaint;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, ()) {
+        let mut style = Style::default();
+        style.size.width = relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _layout: &mut (),
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> LinePrepaint {
+        let style = window.text_style();
+        let font = style.font();
+        let fg = style.color;
+        let font_size = style.font_size.to_pixels(window.rem_size());
+
+        let (caret_byte, under_end) = match self.caret {
+            Some(c) => caret_bytes(&self.text, c.col),
+            None => (0, None),
+        };
+
+        // The block caret inverts the char under it: shape that one char dark so
+        // it reads against the yellow block. Every run shares one font, so a
+        // single shape call lays glyphs out exactly as an unsplit line would —
+        // the caret never nudges surrounding text.
+        let invert = match (self.caret, under_end) {
+            (Some(c), Some(end)) if c.block => Some((caret_byte, end)),
+            _ => None,
+        };
+        let dark: Hsla = rgb(0x1a1a1a).into();
+        let runs = match invert {
+            Some((s, e)) => {
+                let mut v = Vec::with_capacity(3);
+                if s > 0 {
+                    v.push(run(&font, s, fg));
+                }
+                v.push(run(&font, e - s, dark));
+                if self.text.len() > e {
+                    v.push(run(&font, self.text.len() - e, fg));
+                }
+                v
+            }
+            None => vec![run(&font, self.text.len(), fg)],
+        };
+
+        let shaped = window
+            .text_system()
+            .shape_line(self.text.clone(), font_size, &runs, None);
+
+        let caret = self.caret.map(|c| {
+            let x = shaped.x_for_index(caret_byte);
+            let width = if c.block {
+                match under_end {
+                    Some(end) => shaped.x_for_index(end) - x,
+                    // ponytail: EOL block width is a font-size estimate; it only
+                    // shows past the last glyph, where exactness doesn't matter.
+                    None => font_size * 0.5,
+                }
+            } else {
+                px(2.)
             };
-            div()
-                .flex()
-                .child(before)
-                .child(caret)
-                .child(after)
-                .into_any_element()
+            (x, width)
+        });
+
+        LinePrepaint { shaped, caret }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _layout: &mut (),
+        prepaint: &mut LinePrepaint,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let line_height = window.line_height();
+        // Quad first so the inverted under-char glyph paints over it.
+        if let Some((x, width)) = prepaint.caret {
+            let origin = point(bounds.origin.x + x, bounds.origin.y);
+            window.paint_quad(fill(
+                Bounds::new(origin, size(width, line_height)),
+                rgb(0xffcc00),
+            ));
         }
+        let _ = prepaint.shaped.paint(bounds.origin, line_height, window, cx);
+    }
+}
+
+fn run(font: &Font, len: usize, color: Hsla) -> TextRun {
+    TextRun {
+        len,
+        font: font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+/// Text of line `i` without its trailing newline.
+fn line_text(rope: &ropey::Rope, i: usize) -> String {
+    rope.line(i).chars().filter(|c| *c != '\n').collect()
+}
+
+/// `(byte offset of char column `col`, byte offset just past the char under it)`.
+/// The second is `None` at or past end-of-line, where no char sits under the caret.
+fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
+    let caret_byte = text
+        .char_indices()
+        .nth(col)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len());
+    let under_end = text[caret_byte..]
+        .chars()
+        .next()
+        .map(|c| caret_byte + c.len_utf8());
+    (caret_byte, under_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::caret_bytes;
+
+    #[test]
+    fn caret_bytes_handles_unicode_and_eol() {
+        // "aé": col 0 → byte 0, 'a' ends at 1; col 1 → byte 1, 'é' (2 bytes)
+        // ends at 3; col 2 → EOL, byte 3, nothing under.
+        assert_eq!(caret_bytes("aé", 0), (0, Some(1)));
+        assert_eq!(caret_bytes("aé", 1), (1, Some(3)));
+        assert_eq!(caret_bytes("aé", 2), (3, None));
+        assert_eq!(caret_bytes("", 0), (0, None));
     }
 }
