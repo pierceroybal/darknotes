@@ -328,6 +328,10 @@ impl Render for Editor {
             .flex()
             .bg(rgb(0x1a1a1a))
             .text_color(rgb(0xcccccc))
+            // ponytail: hardcoded to a font that's actually installed. GPUI's
+            // default family triggers per-line fallback scanning when absent
+            // (~8ms/cold line). Move to user config + per-OS defaults later.
+            .font_family("DejaVu Sans Mono")
             .text_size(px(15.))
             .line_height(px(22.))
             .child(
