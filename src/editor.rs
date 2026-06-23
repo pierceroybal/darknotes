@@ -1,8 +1,10 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
     div, fill, point, prelude::*, px, relative, rgb, size, uniform_list, AnyElement, App, Bounds,
-    Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
+    ContentMask, Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
     InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ScrollStrategy,
     ShapedLine, SharedString, Style, TextRun, UniformListScrollHandle, Window,
 };
@@ -46,6 +48,11 @@ pub struct Editor {
     scroll: UniformListScrollHandle,
     /// Caret line at the last render; a change requests a scroll-to-cursor.
     last_line: usize,
+    /// Horizontal scroll offset in pixels (lines have no soft-wrap, so they
+    /// overflow right). The caret line's element nudges this in prepaint to keep
+    /// the caret on screen; every line reads it in paint. Shared because the line
+    /// elements that write/read it are built outside this struct.
+    scroll_x: Rc<Cell<Pixels>>,
 }
 
 impl Editor {
@@ -73,6 +80,7 @@ impl Editor {
             pending_window: false,
             scroll: UniformListScrollHandle::new(),
             last_line: 0,
+            scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
         }
     }
 
@@ -263,6 +271,7 @@ impl Render for Editor {
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
         let mode = self.vim.mode;
+        let scroll_x = self.scroll_x.clone();
 
         let bar = if mode == Mode::Command {
             format!(":{}", self.vim.command_line())
@@ -360,6 +369,7 @@ impl Render for Editor {
                                         col: cur_col,
                                         block: mode != Mode::Insert,
                                     }),
+                                    scroll_x: scroll_x.clone(),
                                 })
                                 .collect()
                         })
@@ -395,6 +405,9 @@ struct LineElement {
     text: SharedString,
     /// `Some` only on the cursor line.
     caret: Option<LineCaret>,
+    /// Shared horizontal scroll offset. The cursor line writes it (prepaint),
+    /// every line reads it (paint) — see `Editor::scroll_x`.
+    scroll_x: Rc<Cell<Pixels>>,
 }
 
 struct LinePrepaint {
@@ -442,7 +455,7 @@ impl Element for LineElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _layout: &mut (),
         window: &mut Window,
         _cx: &mut App,
@@ -465,6 +478,23 @@ impl Element for LineElement {
             Some(c) => {
                 let (caret_byte, under_end) = caret_bytes(&self.text, c.col);
                 let x = shaped.x_for_index(caret_byte);
+                // Follow the caret horizontally: keep it `margin` inside both
+                // edges of the pane. Only the cursor line writes scroll_x; every
+                // line reads it in paint. A short line (caret near x=0) snaps the
+                // offset back to 0 on its own.
+                // ponytail: margin ≈ 2 chars; no mouse-wheel/`zh`/`zl` scroll yet.
+                let margin = font_size * 2.;
+                let viewport = bounds.size.width;
+                let mut s = self.scroll_x.get();
+                if x < s + margin {
+                    s = x - margin;
+                    if s < Pixels::ZERO {
+                        s = Pixels::ZERO;
+                    }
+                } else if x > s + viewport - margin {
+                    s = x - viewport + margin;
+                }
+                self.scroll_x.set(s);
                 match (c.block, under_end) {
                     // Block caret over a char: full-cell quad, and grab that
                     // glyph from the cached layout to repaint it dark on top.
@@ -504,24 +534,31 @@ impl Element for LineElement {
         cx: &mut App,
     ) {
         let line_height = window.line_height();
-        // Quad first (under the text), then the line, then the inverted caret
-        // glyph on top so it reads dark against the yellow block.
-        if let Some((x, width)) = prepaint.caret {
-            let origin = point(bounds.origin.x + x, bounds.origin.y);
-            window.paint_quad(fill(
-                Bounds::new(origin, size(width, line_height)),
-                rgb(0xffcc00),
-            ));
-        }
-        let shaped = &prepaint.shaped;
-        let _ = shaped.paint(bounds.origin, line_height, window, cx);
-        if let Some((font_id, glyph_id, gx)) = prepaint.caret_glyph {
-            // Match the baseline `ShapedLine::paint` uses: line is vertically
-            // centered, glyph sits on the baseline (`paint_glyph` y is baseline).
-            let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;
-            let baseline = point(bounds.origin.x + gx, bounds.origin.y + padding_top + shaped.ascent);
-            let _ = window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, rgb(0x1a1a1a).into());
-        }
+        // Shift everything left by the horizontal scroll offset, then clip to the
+        // line's box so left-overflow doesn't bleed onto the sidebar and
+        // right-overflow stops at the pane edge.
+        let ox = bounds.origin.x - self.scroll_x.get();
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // Quad first (under the text), then the line, then the inverted caret
+            // glyph on top so it reads dark against the yellow block.
+            if let Some((x, width)) = prepaint.caret {
+                let origin = point(ox + x, bounds.origin.y);
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(width, line_height)),
+                    rgb(0xffcc00),
+                ));
+            }
+            let shaped = &prepaint.shaped;
+            let _ = shaped.paint(point(ox, bounds.origin.y), line_height, window, cx);
+            if let Some((font_id, glyph_id, gx)) = prepaint.caret_glyph {
+                // Match the baseline `ShapedLine::paint` uses: line is vertically
+                // centered, glyph sits on the baseline (`paint_glyph` y is baseline).
+                let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;
+                let baseline = point(ox + gx, bounds.origin.y + padding_top + shaped.ascent);
+                let _ =
+                    window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, rgb(0x1a1a1a).into());
+            }
+        });
     }
 }
 
