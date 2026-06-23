@@ -147,6 +147,8 @@ impl Vim {
                 Action::InsertText("\n".into()),
                 Action::Move(Motion::LineUp, 1),
             ]),
+            // `C`: change to end of line — delete to EOL, then insert. Same as `c$`.
+            ("c", true) => self.enter_insert(vec![Action::DeleteMotion(Motion::LineEnd, 1)]),
             (":", _) => {
                 self.count = None;
                 self.command.clear();
@@ -292,6 +294,18 @@ mod tests {
         let mut v = Vim::new();
         v.on_key(&k("d"));
         assert_eq!(v.on_key(&k("w")), vec![Action::DeleteMotion(Motion::WordForward, 1)]);
+    }
+
+    #[test]
+    fn capital_c_changes_to_eol() {
+        let mut v = Vim::new();
+        let c_shift = Keystroke {
+            key: "c".into(),
+            key_char: Some("C".into()),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&c_shift), vec![Action::DeleteMotion(Motion::LineEnd, 1)]);
+        assert_eq!(v.mode, Mode::Insert);
     }
 
     #[test]
