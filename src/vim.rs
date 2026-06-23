@@ -11,12 +11,35 @@ pub enum Action {
     DeleteMotion(Motion, usize),
     DeleteLines(usize),
     DeleteCharUnder(usize),
+    YankMotion(Motion, usize),
+    YankLines(usize),
+    /// `p` (after) / `P` (before).
+    Paste { after: bool },
     InsertText(String),
     DeleteBackward,
     DeleteForward,
+    Undo,
     /// A submitted `:` command line (without the leading colon). The editor,
     /// not the grammar, decides what `w`/`q`/… mean.
     ExecuteCommand(String),
+}
+
+impl Action {
+    /// Whether this action changes buffer text. The editor checkpoints undo
+    /// before a mutating normal-mode command; `Undo` is excluded so it never
+    /// records itself.
+    pub fn mutates(&self) -> bool {
+        matches!(
+            self,
+            Action::DeleteMotion(..)
+                | Action::DeleteLines(..)
+                | Action::DeleteCharUnder(..)
+                | Action::Paste { .. }
+                | Action::InsertText(..)
+                | Action::DeleteBackward
+                | Action::DeleteForward
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +52,7 @@ pub enum Mode {
 #[derive(Clone, Copy)]
 enum Operator {
     Delete,
+    Yank,
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
@@ -134,6 +158,25 @@ impl Vim {
                 self.operator = Some(Operator::Delete);
                 vec![]
             }
+            ("y", false) => {
+                self.operator = Some(Operator::Yank);
+                vec![]
+            }
+            ("y", true) => vec![Action::YankLines(self.take_count())], // Y == yy
+            // ponytail: count (`3p`) ignored — paste once. Add repeat when needed.
+            ("p", false) => {
+                self.count = None;
+                vec![Action::Paste { after: true }]
+            }
+            ("p", true) => {
+                self.count = None;
+                vec![Action::Paste { after: false }]
+            }
+            // ponytail: count (`3u`) ignored — undo one step.
+            ("u", false) => {
+                self.count = None;
+                vec![Action::Undo]
+            }
             ("i", false) => self.enter_insert(vec![]),
             ("i", true) => self.enter_insert(vec![Action::Move(Motion::LineStart, 1)]),
             ("a", false) => self.enter_insert(vec![Action::Move(Motion::CharRight, 1)]),
@@ -233,6 +276,15 @@ fn operate(op: Operator, key: &str, count: usize) -> Vec<Action> {
                 vec![] // unsupported motion after `d` → abort the operator
             }
         }
+        Operator::Yank => {
+            if key == "y" {
+                vec![Action::YankLines(count)]
+            } else if let Some(motion) = motion_for_op(key) {
+                vec![Action::YankMotion(motion, count)]
+            } else {
+                vec![] // unsupported motion after `y` → abort
+            }
+        }
     }
 }
 
@@ -306,6 +358,38 @@ mod tests {
         };
         assert_eq!(v.on_key(&c_shift), vec![Action::DeleteMotion(Motion::LineEnd, 1)]);
         assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn yy_yanks_lines() {
+        let mut v = Vim::new();
+        assert!(v.on_key(&k("y")).is_empty());
+        assert_eq!(v.on_key(&k("y")), vec![Action::YankLines(1)]);
+    }
+
+    #[test]
+    fn yw_yanks_word() {
+        let mut v = Vim::new();
+        v.on_key(&k("y"));
+        assert_eq!(v.on_key(&k("w")), vec![Action::YankMotion(Motion::WordForward, 1)]);
+    }
+
+    #[test]
+    fn p_and_capital_p_paste() {
+        let mut v = Vim::new();
+        assert_eq!(v.on_key(&k("p")), vec![Action::Paste { after: true }]);
+        let p_shift = Keystroke {
+            key: "p".into(),
+            key_char: Some("P".into()),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&p_shift), vec![Action::Paste { after: false }]);
+    }
+
+    #[test]
+    fn u_undoes() {
+        let mut v = Vim::new();
+        assert_eq!(v.on_key(&k("u")), vec![Action::Undo]);
     }
 
     #[test]

@@ -175,10 +175,25 @@ impl Editor {
                     cx.notify();
                     return;
                 }
+                "r" => {
+                    self.doc.redo();
+                    cx.notify();
+                    return;
+                }
                 _ => {}
             }
         }
-        for action in self.vim.on_key(&ev.keystroke) {
+        // Checkpoint undo once per undoable unit: before a mutating normal-mode
+        // command, or on entering insert (the whole insert session coalesces
+        // into that one checkpoint).
+        let mode_before = self.vim.mode;
+        let actions = self.vim.on_key(&ev.keystroke);
+        let entering_insert = mode_before == Mode::Normal && self.vim.mode == Mode::Insert;
+        let mutates = mode_before == Mode::Normal && actions.iter().any(Action::mutates);
+        if entering_insert || mutates {
+            self.doc.checkpoint();
+        }
+        for action in actions {
             self.apply(action, window, cx);
         }
         // Mode (hence caret style) can change with no action, so always notify.
@@ -192,9 +207,13 @@ impl Editor {
             Action::DeleteMotion(m, n) => self.doc.delete_motion(m, n),
             Action::DeleteLines(n) => self.doc.delete_lines(n),
             Action::DeleteCharUnder(n) => self.doc.delete_char_under(n),
+            Action::YankMotion(m, n) => self.doc.yank_motion(m, n),
+            Action::YankLines(n) => self.doc.yank_lines(n),
+            Action::Paste { after } => self.doc.paste(after),
             Action::InsertText(s) => self.doc.insert(&s),
             Action::DeleteBackward => self.doc.delete_backward(),
             Action::DeleteForward => self.doc.delete_forward(),
+            Action::Undo => self.doc.undo(),
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
         }
     }

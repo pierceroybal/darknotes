@@ -46,6 +46,23 @@ pub enum Motion {
     FileEnd,
 }
 
+/// The unnamed register: text from the last delete/yank, replayed by `p`/`P`.
+/// `linewise` (from `dd`/`yy`) pastes on new lines; charwise pastes inline.
+#[derive(Clone, Default)]
+struct Register {
+    text: String,
+    linewise: bool,
+}
+
+/// A point-in-time buffer state for undo/redo. Full-rope snapshots — ropey
+/// clones are CoW-cheap (shared backing). ponytail: swap for an op-log only if
+/// huge buffers make the clones bite.
+struct Snapshot {
+    rope: Rope,
+    caret: usize,
+    dirty: bool,
+}
+
 /// The text buffer plus its cursors. All positions are absolute char offsets
 /// into the rope; convert to `(line, col)` only for rendering.
 pub struct Document {
@@ -56,6 +73,11 @@ pub struct Document {
     path: Option<PathBuf>,
     /// Set on every edit, cleared on save.
     dirty: bool,
+    /// Last delete/yank, for `p`/`P`.
+    register: Register,
+    /// States before each change (`u` pops); `redo` is the inverse (`Ctrl-R`).
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
 }
 
 impl Document {
@@ -65,6 +87,9 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: None,
             dirty: false,
+            register: Register::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
         }
     }
 
@@ -82,6 +107,9 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: Some(path),
             dirty: false,
+            register: Register::default(),
+            undo: Vec::new(),
+            redo: Vec::new(),
         })
     }
 
@@ -148,6 +176,7 @@ impl Document {
         let to = self.motion_target(m, from, count);
         let (a, b) = (from.min(to), from.max(to));
         if a < b {
+            self.set_register(self.rope.slice(a..b).to_string(), false);
             self.rope.remove(a..b);
             self.dirty = true;
             self.set_caret(a);
@@ -165,6 +194,7 @@ impl Document {
             self.rope.line_to_char(end_line)
         };
         if start < end {
+            self.set_register(self.rope.slice(start..end).to_string(), true);
             self.rope.remove(start..end);
             self.dirty = true;
         }
@@ -179,12 +209,116 @@ impl Document {
         let line_end = start + self.line_len_chars(line);
         let to = (from + count.max(1)).min(line_end);
         if from < to {
+            self.set_register(self.rope.slice(from..to).to_string(), false);
             self.rope.remove(from..to);
             self.dirty = true;
         }
         // Keep the caret on a real char of the (now shorter) line.
         let last_col = self.line_len_chars(line).saturating_sub(1);
         self.set_caret(start + (from - start).min(last_col));
+    }
+
+    /// Stash text in the unnamed register. Linewise text is normalized to end in
+    /// a newline so paste can treat it as whole lines regardless of EOF quirks.
+    fn set_register(&mut self, text: String, linewise: bool) {
+        let text = if linewise && !text.ends_with('\n') {
+            format!("{text}\n")
+        } else {
+            text
+        };
+        self.register = Register { text, linewise };
+    }
+
+    /// `y{motion}`: copy the char range into the register (charwise). Caret moves
+    /// to the range start, as in vim.
+    pub fn yank_motion(&mut self, m: Motion, count: usize) {
+        let from = self.caret();
+        let to = self.motion_target(m, from, count);
+        let (a, b) = (from.min(to), from.max(to));
+        if a < b {
+            self.set_register(self.rope.slice(a..b).to_string(), false);
+            self.set_caret(a);
+        }
+    }
+
+    /// `yy`: copy `count` whole lines into the register (linewise). Caret stays.
+    pub fn yank_lines(&mut self, count: usize) {
+        let (line, _) = self.line_col_of(self.caret());
+        let start = self.rope.line_to_char(line);
+        let end_line = (line + count.max(1)).min(self.rope.len_lines());
+        let end = if end_line >= self.rope.len_lines() {
+            self.rope.len_chars()
+        } else {
+            self.rope.line_to_char(end_line)
+        };
+        self.set_register(self.rope.slice(start..end).to_string(), true);
+    }
+
+    /// `p`/`P`: insert the register. Linewise pastes below (`after`) or above the
+    /// current line; charwise pastes after the caret char (`after`) or at it.
+    pub fn paste(&mut self, after: bool) {
+        if self.register.text.is_empty() {
+            return;
+        }
+        let text = self.register.text.clone();
+        let caret = self.caret();
+        let (line, _) = self.line_col_of(caret);
+        let line_start = self.rope.line_to_char(line);
+
+        let (at, payload, new_caret) = if self.register.linewise {
+            let eol = line_start + self.line_len_chars(line);
+            if !after {
+                (line_start, text, line_start) // paste above this line
+            } else if eol < self.rope.len_chars() {
+                (eol + 1, text, eol + 1) // after the line's newline
+            } else {
+                // Last line with no trailing newline: prepend one to split.
+                (eol, format!("\n{text}"), eol + 1)
+            }
+        } else {
+            let line_end = line_start + self.line_len_chars(line);
+            let at = if after { (caret + 1).min(line_end) } else { caret };
+            let last = at + text.chars().count().saturating_sub(1); // vim lands on last pasted char
+            (at, text, last)
+        };
+
+        self.rope.insert(at, &payload);
+        self.dirty = true;
+        self.set_caret(new_caret.min(self.rope.len_chars()));
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot { rope: self.rope.clone(), caret: self.caret(), dirty: self.dirty }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.rope = s.rope;
+        self.dirty = s.dirty;
+        self.set_caret(s.caret.min(self.rope.len_chars()));
+    }
+
+    /// Record the pre-change state. The editor calls this once per undoable unit
+    /// (a normal-mode edit, or entering insert — the whole insert session coalesces).
+    pub fn checkpoint(&mut self) {
+        let snap = self.snapshot();
+        self.undo.push(snap);
+        self.redo.clear();
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            let cur = self.snapshot();
+            self.redo.push(cur);
+            self.restore(prev);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            let cur = self.snapshot();
+            self.undo.push(cur);
+            self.restore(next);
+        }
     }
 
     /// 0-based `(line, column)` of the primary caret; column counted in chars.
@@ -423,6 +557,52 @@ mod tests {
         let mut d = Document::new("abc");
         d.delete_char_under(1);
         assert_eq!(d.rope.to_string(), "bc");
+    }
+
+    #[test]
+    fn yank_line_and_paste_below() {
+        let mut d = Document::new("foo\nbar\n");
+        d.yank_lines(1); // caret on line 0 → yanks "foo\n"
+        d.paste(true); // p → duplicate below
+        assert_eq!(d.rope.to_string(), "foo\nfoo\nbar\n");
+        assert_eq!(d.caret_line_col(), (1, 0)); // caret on pasted line
+    }
+
+    #[test]
+    fn paste_charwise_after_caret() {
+        let mut d = Document::new("abc");
+        d.yank_motion(Motion::CharRight, 2); // yank "ab", caret back to 0
+        d.paste(true); // p inserts after 'a'
+        assert_eq!(d.rope.to_string(), "aabbc");
+    }
+
+    #[test]
+    fn linewise_paste_at_eof_without_newline() {
+        let mut d = Document::new("only");
+        d.yank_lines(1); // normalized to "only\n"
+        d.paste(true);
+        assert_eq!(d.rope.to_string(), "only\nonly\n");
+    }
+
+    #[test]
+    fn delete_then_paste_roundtrips() {
+        let mut d = Document::new("foo bar");
+        d.delete_motion(Motion::WordForward, 1); // "foo " into register
+        assert_eq!(d.rope.to_string(), "bar");
+        d.paste(false); // P puts it back before caret
+        assert_eq!(d.rope.to_string(), "foo bar");
+    }
+
+    #[test]
+    fn undo_redo_restores_text() {
+        let mut d = Document::new("hello");
+        d.checkpoint();
+        d.delete_char_under(1);
+        assert_eq!(d.rope.to_string(), "ello");
+        d.undo();
+        assert_eq!(d.rope.to_string(), "hello");
+        d.redo();
+        assert_eq!(d.rope.to_string(), "ello");
     }
 
     #[test]
