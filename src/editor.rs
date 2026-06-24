@@ -161,7 +161,7 @@ impl Editor {
         if m.control && !m.alt && !m.platform {
             match ev.keystroke.key.as_str() {
                 "s" => {
-                    self.save();
+                    self.save(None);
                     cx.notify();
                     return;
                 }
@@ -218,13 +218,40 @@ impl Editor {
         }
     }
 
-    fn save(&mut self) {
-        let Some(name) = self.doc.path().map(|p| p.display().to_string()) else {
-            self.message = Some("E32: No file name".into());
-            return;
+    /// Re-read the vault from disk and re-point `current` at the open file.
+    /// A file saved outside the vault root simply won't be found (`current` →
+    /// `None`), which is correct — it isn't part of this vault.
+    fn rescan_vault(&mut self) {
+        self.vault = Vault::scan(self.vault.root.clone());
+        let open = self.doc.path().map(Path::to_path_buf);
+        self.current = open.and_then(|p| self.vault.files.iter().position(|f| f == &p));
+    }
+
+    /// `:w` with no arg writes the backing file; `:w <name>` saves as `<name>`,
+    /// defaulting a bare name to `.md`.
+    fn save(&mut self, arg: Option<&str>) {
+        let result = match arg {
+            Some(name) => {
+                let path = with_md_ext(name);
+                let display = path.display().to_string();
+                let r = self.doc.save_as(path).map(|()| display);
+                if r.is_ok() {
+                    // A new file may now exist under the vault root — re-scan so
+                    // the sidebar shows it and `current` tracks the open file.
+                    self.rescan_vault();
+                }
+                r
+            }
+            None => match self.doc.path().map(|p| p.display().to_string()) {
+                Some(display) => self.doc.save().map(|()| display),
+                None => {
+                    self.message = Some("E32: No file name".into());
+                    return;
+                }
+            },
         };
-        self.message = Some(match self.doc.save() {
-            Ok(()) => format!("\"{name}\" written"),
+        self.message = Some(match result {
+            Ok(name) => format!("\"{name}\" written"),
             Err(e) => format!("save failed: {e}"),
         });
     }
@@ -232,9 +259,14 @@ impl Editor {
     /// Run a submitted `:` command. `:q` refuses on unsaved changes (vim E37);
     /// `:q!` overrides; `:wq`/`:x` quit only if the save actually succeeded.
     fn exec_command(&mut self, cmd: &str, _window: &mut Window, cx: &mut Context<Self>) {
-        match cmd.trim() {
+        let cmd = cmd.trim();
+        if let Some(name) = cmd.strip_prefix("w ") {
+            self.save(Some(name.trim()));
+            return;
+        }
+        match cmd {
             "" => {}
-            "w" => self.save(),
+            "w" => self.save(None),
             "q" => {
                 if self.doc.is_dirty() {
                     self.message =
@@ -245,13 +277,23 @@ impl Editor {
             }
             "q!" => cx.quit(),
             "wq" | "x" => {
-                self.save();
+                self.save(None);
                 if !self.doc.is_dirty() {
                     cx.quit();
                 }
             }
             other => self.message = Some(format!("E492: Not an editor command: {other}")),
         }
+    }
+}
+
+/// Bare names get a `.md` extension; anything with an extension is left alone.
+fn with_md_ext(name: &str) -> PathBuf {
+    let p = PathBuf::from(name);
+    if p.extension().is_none() {
+        p.with_extension("md")
+    } else {
+        p
     }
 }
 

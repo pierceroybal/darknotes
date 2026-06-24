@@ -122,6 +122,12 @@ impl Document {
         Ok(())
     }
 
+    /// Adopt `path` as the backing file and write to it (vim `:w <name>`).
+    pub fn save_as(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
+        self.path = Some(path.into());
+        self.save()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
