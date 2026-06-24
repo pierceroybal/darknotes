@@ -88,12 +88,56 @@ impl Editor {
         let Some(path) = self.vault.files.get(i).cloned() else {
             return;
         };
-        self.doc = open_or_empty(&path);
+        self.load(open_or_empty(&path), Some(i), window);
+    }
+
+    /// Swap in `doc` as the open buffer: reset vim/scroll state, point `current`
+    /// at its vault index (`None` when it isn't a vault file), and refocus the
+    /// editor so keys keep flowing after a click or command.
+    fn load(&mut self, doc: Document, current: Option<usize>, window: &mut Window) {
+        self.doc = doc;
         self.vim = Vim::new();
-        self.current = Some(i);
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top); // new file starts at the top
+        self.current = current;
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top); // a fresh buffer starts at the top
         self.last_line = 0;
-        window.focus(&self.focus); // keep keys flowing to the editor after a click
+        window.focus(&self.focus);
+    }
+
+    /// Guard before replacing the buffer: `true` if it's safe to discard, else
+    /// sets the vim E37 message and returns `false`. `bang` (`:e!`/`:enew!`)
+    /// forces it through.
+    fn may_discard(&mut self, bang: bool) -> bool {
+        if self.doc.is_dirty() && !bang {
+            self.message = Some("E37: No write since last change (add ! to override)".into());
+            false
+        } else {
+            true
+        }
+    }
+
+    /// `:e {path}` — open `path` for editing. A nonexistent file opens as a
+    /// blank buffer that `:w` creates (`Document::open` is vim-lazy). Relative
+    /// names resolve under the vault root, so a new note lands in — and shows up
+    /// in — the vault. Refuses to abandon unsaved changes unless `bang` (`:e!`).
+    fn edit(&mut self, name: &str, bang: bool, window: &mut Window) {
+        if name.is_empty() {
+            self.message = Some("E32: No file name".into());
+            return;
+        }
+        if !self.may_discard(bang) {
+            return;
+        }
+        let path = resolve(&self.vault.root, name);
+        let idx = self.vault.files.iter().position(|f| f == &path);
+        self.load(open_or_empty(&path), idx, window);
+    }
+
+    /// `:enew` — start a blank, unnamed buffer; name it on the first `:w {name}`.
+    fn enew(&mut self, bang: bool, window: &mut Window) {
+        if !self.may_discard(bang) {
+            return;
+        }
+        self.load(Document::new(""), None, window);
     }
 
     fn open_relative(&mut self, delta: isize, window: &mut Window) {
@@ -232,7 +276,7 @@ impl Editor {
     fn save(&mut self, arg: Option<&str>) {
         let result = match arg {
             Some(name) => {
-                let path = with_md_ext(name);
+                let path = resolve(&self.vault.root, name);
                 let display = path.display().to_string();
                 let r = self.doc.save_as(path).map(|()| display);
                 if r.is_ok() {
@@ -243,7 +287,16 @@ impl Editor {
                 r
             }
             None => match self.doc.path().map(|p| p.display().to_string()) {
-                Some(display) => self.doc.save().map(|()| display),
+                Some(display) => {
+                    let r = self.doc.save().map(|()| display);
+                    // A blank `:e`-created buffer isn't in the vault yet (it had
+                    // no file on disk); once written, re-scan so the sidebar
+                    // picks it up and `current` tracks it.
+                    if r.is_ok() && self.current.is_none() {
+                        self.rescan_vault();
+                    }
+                    r
+                }
                 None => {
                     self.message = Some("E32: No file name".into());
                     return;
@@ -256,22 +309,30 @@ impl Editor {
         });
     }
 
-    /// Run a submitted `:` command. `:q` refuses on unsaved changes (vim E37);
-    /// `:q!` overrides; `:wq`/`:x` quit only if the save actually succeeded.
-    fn exec_command(&mut self, cmd: &str, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Run a submitted `:` command. `:e`/`:enew` and `:q` refuse on unsaved
+    /// changes (vim E37); a trailing `!` overrides; `:wq`/`:x` quit only if the
+    /// save actually succeeded.
+    fn exec_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
         let cmd = cmd.trim();
         if let Some(name) = cmd.strip_prefix("w ") {
             self.save(Some(name.trim()));
             return;
         }
+        if let Some(name) = cmd.strip_prefix("e! ") {
+            self.edit(name.trim(), true, window);
+            return;
+        }
+        if let Some(name) = cmd.strip_prefix("e ") {
+            self.edit(name.trim(), false, window);
+            return;
+        }
         match cmd {
             "" => {}
             "w" => self.save(None),
+            "enew" => self.enew(false, window),
+            "enew!" => self.enew(true, window),
             "q" => {
-                if self.doc.is_dirty() {
-                    self.message =
-                        Some("E37: No write since last change (add ! to override)".into());
-                } else {
+                if self.may_discard(false) {
                     cx.quit();
                 }
             }
@@ -294,6 +355,18 @@ fn with_md_ext(name: &str) -> PathBuf {
         p.with_extension("md")
     } else {
         p
+    }
+}
+
+/// Resolve a `:w`/`:e` filename to a path: default bare names to `.md`, and
+/// root relative names under the vault (`root`) so the sidebar finds them after
+/// a save. Absolute paths are honored as typed.
+fn resolve(root: &Path, name: &str) -> PathBuf {
+    let p = with_md_ext(name);
+    if p.is_absolute() {
+        p
+    } else {
+        root.join(p)
     }
 }
 
@@ -656,7 +729,17 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::caret_bytes;
+    use super::{caret_bytes, resolve};
+    use std::path::Path;
+
+    #[test]
+    fn resolve_roots_relative_names_and_defaults_md() {
+        let root = Path::new("/vault");
+        assert_eq!(resolve(root, "foo"), Path::new("/vault/foo.md"));
+        assert_eq!(resolve(root, "sub/bar.md"), Path::new("/vault/sub/bar.md"));
+        // Absolute paths are honored, not re-rooted under the vault.
+        assert_eq!(resolve(root, "/elsewhere/baz"), Path::new("/elsewhere/baz.md"));
+    }
 
     #[test]
     fn caret_bytes_handles_unicode_and_eol() {
