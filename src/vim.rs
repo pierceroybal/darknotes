@@ -346,6 +346,9 @@ impl Vim {
             "backspace" => vec![Action::DeleteBackward],
             "delete" => vec![Action::DeleteForward],
             "enter" => vec![Action::InsertText("\n".into())],
+            // Opinionated: a markdown buffer has no literal tabs — Tab inserts two
+            // spaces. Shift-Tab is left unhandled, reserved for dedent.
+            "tab" if !m.shift => vec![Action::InsertText("  ".into())],
             _ if !m.control && !m.platform && !m.alt => match &ks.key_char {
                 Some(s) => vec![Action::InsertText(s.clone())],
                 None => vec![],
@@ -514,6 +517,13 @@ mod tests {
         let mut v = Vim::new();
         v.on_key(&k("i"));
         assert_eq!(v.on_key(&k("x")), vec![Action::InsertText("x".into())]);
+    }
+
+    #[test]
+    fn tab_inserts_two_spaces() {
+        let mut v = Vim::new();
+        v.on_key(&k("i"));
+        assert_eq!(v.on_key(&named("tab")), vec![Action::InsertText("  ".into())]);
     }
 
     #[test]
