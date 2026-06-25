@@ -15,6 +15,11 @@ pub enum Action {
     YankLines(usize),
     /// `p` (after) / `P` (before).
     Paste { after: bool },
+    /// Visual-mode `d`/`x`/`y` over the current selection.
+    DeleteSelection { linewise: bool },
+    YankSelection { linewise: bool },
+    /// Collapse the selection back to a caret (leaving visual mode).
+    CollapseSelection,
     InsertText(String),
     DeleteBackward,
     DeleteForward,
@@ -34,6 +39,7 @@ impl Action {
             Action::DeleteMotion(..)
                 | Action::DeleteLines(..)
                 | Action::DeleteCharUnder(..)
+                | Action::DeleteSelection { .. }
                 | Action::Paste { .. }
                 | Action::InsertText(..)
                 | Action::DeleteBackward
@@ -47,6 +53,15 @@ pub enum Mode {
     Normal,
     Insert,
     Command,
+    /// Charwise (`v`) and linewise (`V`) visual selection.
+    Visual,
+    VisualLine,
+}
+
+impl Mode {
+    pub fn is_visual(self) -> bool {
+        matches!(self, Mode::Visual | Mode::VisualLine)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +101,8 @@ impl Vim {
             Mode::Insert => self.insert_key(ks),
             Mode::Normal => self.normal_key(ks),
             Mode::Command => self.command_key(ks),
+            Mode::Visual => self.visual_key(ks, false),
+            Mode::VisualLine => self.visual_key(ks, true),
         }
     }
 
@@ -192,6 +209,18 @@ impl Vim {
             ]),
             // `C`: change to end of line — delete to EOL, then insert. Same as `c$`.
             ("c", true) => self.enter_insert(vec![Action::DeleteMotion(Motion::LineEnd, 1)]),
+            // The current caret is already the selection's anchor (normal-mode
+            // ops leave a bare caret), so entering visual just flips the mode.
+            ("v", false) => {
+                self.count = None;
+                self.mode = Mode::Visual;
+                vec![]
+            }
+            ("v", true) => {
+                self.count = None;
+                self.mode = Mode::VisualLine;
+                vec![]
+            }
             (":", _) => {
                 self.count = None;
                 self.command.clear();
@@ -234,6 +263,67 @@ impl Vim {
             }
             _ => vec![],
         }
+    }
+
+    /// Visual mode (`line` = linewise `V`). Motions extend the selection's head
+    /// (the editor routes `Move` to `extend_motion` while visual); `d`/`x`/`y`
+    /// act on the span and return to normal; `v`/`V` toggle or switch submode.
+    fn visual_key(&mut self, ks: &Keystroke, line: bool) -> Vec<Action> {
+        let key = ks.key.as_str();
+        let m = &ks.modifiers;
+        let shift = m.shift;
+
+        if key == "escape" {
+            self.count = None;
+            self.mode = Mode::Normal;
+            return vec![Action::CollapseSelection];
+        }
+        if m.control || m.alt || m.platform {
+            self.count = None;
+            return vec![];
+        }
+        // Count digits (mid-count `0` included; a bare `0` is the line-start motion).
+        if key.len() == 1 {
+            if let Some(d) = key.chars().next().unwrap().to_digit(10) {
+                let d = d as usize;
+                if d != 0 || self.count.is_some() {
+                    self.count = Some(self.count.unwrap_or(0) * 10 + d);
+                    return vec![];
+                }
+            }
+        }
+
+        // Toggle off (same key) or switch submode (the other key).
+        let toggle = |me: &mut Self, target: Mode| {
+            me.count = None;
+            me.mode = target;
+            if target == Mode::Normal {
+                vec![Action::CollapseSelection]
+            } else {
+                vec![]
+            }
+        };
+        match (key, shift) {
+            ("v", false) => return toggle(self, if line { Mode::Visual } else { Mode::Normal }),
+            ("v", true) => return toggle(self, if line { Mode::Normal } else { Mode::VisualLine }),
+            ("d", false) | ("x", _) => {
+                self.count = None;
+                self.mode = Mode::Normal;
+                return vec![Action::DeleteSelection { linewise: line }];
+            }
+            ("y", false) => {
+                self.count = None;
+                self.mode = Mode::Normal;
+                return vec![Action::YankSelection { linewise: line }];
+            }
+            _ => {}
+        }
+
+        if let Some(motion) = motion_for_key(key, shift) {
+            return vec![Action::Move(motion, self.take_count())];
+        }
+        self.count = None;
+        vec![]
     }
 
     fn enter_insert(&mut self, actions: Vec<Action>) -> Vec<Action> {
@@ -286,6 +376,24 @@ fn operate(op: Operator, key: &str, count: usize) -> Vec<Action> {
             }
         }
     }
+}
+
+/// The cursor-movement keys shared by normal and visual mode. `G` (`shift+g`)
+/// is file-end; lowercase `g` has no standalone motion yet.
+fn motion_for_key(key: &str, shift: bool) -> Option<Motion> {
+    Some(match (key, shift) {
+        ("h", _) | ("left", _) => Motion::CharLeft,
+        ("l", _) | ("right", _) => Motion::CharRight,
+        ("k", _) | ("up", _) => Motion::LineUp,
+        ("j", _) | ("down", _) => Motion::LineDown,
+        ("w", _) => Motion::WordForward,
+        ("b", _) => Motion::WordBackward,
+        ("e", _) => Motion::WordEnd,
+        ("0", _) => Motion::LineStart,
+        ("$", _) => Motion::LineEnd,
+        ("g", true) => Motion::FileEnd,
+        _ => return None,
+    })
 }
 
 /// Motions usable as an operator target. `j`/`k` are excluded — `dj` is
@@ -436,6 +544,65 @@ mod tests {
         v.on_key(&named("escape"));
         assert_eq!(v.mode, Mode::Normal);
         assert_eq!(v.command_line(), "");
+    }
+
+    fn shift(key: &str, ch: &str) -> Keystroke {
+        Keystroke {
+            key: key.into(),
+            key_char: Some(ch.into()),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        }
+    }
+
+    #[test]
+    fn v_and_capital_v_enter_visual() {
+        let mut v = Vim::new();
+        v.on_key(&k("v"));
+        assert_eq!(v.mode, Mode::Visual);
+        let mut v = Vim::new();
+        v.on_key(&shift("v", "V"));
+        assert_eq!(v.mode, Mode::VisualLine);
+    }
+
+    #[test]
+    fn visual_motion_extends_then_delete_returns_to_normal() {
+        let mut v = Vim::new();
+        v.on_key(&shift("v", "V"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
+        assert_eq!(
+            v.on_key(&k("d")),
+            vec![Action::DeleteSelection { linewise: true }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_count_then_motion() {
+        let mut v = Vim::new();
+        v.on_key(&k("v"));
+        v.on_key(&k("3"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 3)]);
+    }
+
+    #[test]
+    fn visual_escape_collapses() {
+        let mut v = Vim::new();
+        v.on_key(&k("v"));
+        assert_eq!(v.on_key(&named("escape")), vec![Action::CollapseSelection]);
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn v_toggles_off_capital_v_switches_submode() {
+        let mut v = Vim::new();
+        v.on_key(&k("v"));
+        v.on_key(&k("v")); // same key → leave visual
+        assert_eq!(v.mode, Mode::Normal);
+
+        let mut v = Vim::new();
+        v.on_key(&k("v"));
+        v.on_key(&shift("v", "V")); // other key → switch to linewise
+        assert_eq!(v.mode, Mode::VisualLine);
     }
 
     #[test]

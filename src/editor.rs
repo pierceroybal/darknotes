@@ -233,7 +233,10 @@ impl Editor {
         let mode_before = self.vim.mode;
         let actions = self.vim.on_key(&ev.keystroke);
         let entering_insert = mode_before == Mode::Normal && self.vim.mode == Mode::Insert;
-        let mutates = mode_before == Mode::Normal && actions.iter().any(Action::mutates);
+        // Checkpoint a single undoable unit. Insert-mode edits are excluded so the
+        // whole session coalesces into the entering-insert checkpoint; everything
+        // else (normal- and visual-mode mutations) gets its own.
+        let mutates = mode_before != Mode::Insert && actions.iter().any(Action::mutates);
         if entering_insert || mutates {
             self.doc.checkpoint();
         }
@@ -247,7 +250,18 @@ impl Editor {
     /// The single execution seam every input grammar funnels through.
     fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         match action {
-            Action::Move(m, n) => self.doc.move_motion(m, n),
+            // In visual mode a motion drags the selection's head; otherwise it
+            // just moves the caret.
+            Action::Move(m, n) => {
+                if self.vim.mode.is_visual() {
+                    self.doc.extend_motion(m, n);
+                } else {
+                    self.doc.move_motion(m, n);
+                }
+            }
+            Action::DeleteSelection { linewise } => self.doc.delete_selection(linewise),
+            Action::YankSelection { linewise } => self.doc.yank_selection(linewise),
+            Action::CollapseSelection => self.doc.collapse_selection(),
             Action::DeleteMotion(m, n) => self.doc.delete_motion(m, n),
             Action::DeleteLines(n) => self.doc.delete_lines(n),
             Action::DeleteCharUnder(n) => self.doc.delete_char_under(n),
@@ -406,6 +420,9 @@ impl Render for Editor {
         let line_count = rope.len_lines();
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
+        // The selected char-range to highlight, `None` outside visual mode.
+        let highlight: Option<(usize, usize)> =
+            mode.is_visual().then(|| self.doc.selection_span(mode == Mode::VisualLine));
 
         let bar = if mode == Mode::Command {
             format!(":{}", self.vim.command_line())
@@ -414,6 +431,8 @@ impl Render for Editor {
         } else {
             let mode_label = match mode {
                 Mode::Insert => "INSERT",
+                Mode::Visual => "VISUAL",
+                Mode::VisualLine => "VISUAL LINE",
                 _ => "NORMAL",
             };
             let name = self
@@ -503,6 +522,8 @@ impl Render for Editor {
                                         col: cur_col,
                                         block: mode != Mode::Insert,
                                     }),
+                                    selection: highlight
+                                        .and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi)),
                                     scroll_x: scroll_x.clone(),
                                 })
                                 .collect()
@@ -530,6 +551,15 @@ struct LineCaret {
     block: bool,
 }
 
+/// The selected column span within a line (visual mode). `to_eol` means the
+/// selection covers this line's newline, so the highlight fills to the edge.
+#[derive(Clone, Copy)]
+struct Highlight {
+    start_col: usize,
+    end_col: usize,
+    to_eol: bool,
+}
+
 /// One text line, shaped as a single uniform run with the caret drawn entirely
 /// as an overlay. Shaping never depends on the caret, so a line's layout-cache
 /// key is identical whether or not the cursor is on it — cursor movement reuses
@@ -539,6 +569,8 @@ struct LineElement {
     text: SharedString,
     /// `Some` only on the cursor line.
     caret: Option<LineCaret>,
+    /// `Some` when part of this line falls inside the visual selection.
+    selection: Option<Highlight>,
     /// Shared horizontal scroll offset. The cursor line writes it (prepaint),
     /// every line reads it (paint) — see `Editor::scroll_x`.
     scroll_x: Rc<Cell<Pixels>>,
@@ -546,6 +578,8 @@ struct LineElement {
 
 struct LinePrepaint {
     shaped: ShapedLine,
+    /// `(x within the line, width)` of the selection quad; `None` if unselected.
+    selection: Option<(Pixels, Pixels)>,
     /// `(x within the line, width)` of the caret quad; `None` off the cursor line.
     caret: Option<(Pixels, Pixels)>,
     /// Block caret only: the glyph under the caret, repainted dark over the
@@ -650,8 +684,21 @@ impl Element for LineElement {
             }
         };
 
+        // Resolve the highlight columns to a pixel span. `to_eol` overshoots to
+        // the pane width; the content mask in paint clips it to the line box.
+        let selection = self.selection.map(|h| {
+            let x0 = shaped.x_for_index(caret_bytes(&self.text, h.start_col).0);
+            let width = if h.to_eol {
+                bounds.size.width
+            } else {
+                shaped.x_for_index(caret_bytes(&self.text, h.end_col).0) - x0
+            };
+            (x0, width)
+        });
+
         LinePrepaint {
             shaped,
+            selection,
             caret,
             caret_glyph,
         }
@@ -673,8 +720,16 @@ impl Element for LineElement {
         // right-overflow stops at the pane edge.
         let ox = bounds.origin.x - self.scroll_x.get();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            // Quad first (under the text), then the line, then the inverted caret
-            // glyph on top so it reads dark against the yellow block.
+            // Selection highlight sits under everything; then the caret quad, the
+            // line, and the inverted caret glyph on top so it reads dark against
+            // the yellow block.
+            if let Some((x, width)) = prepaint.selection {
+                let origin = point(ox + x, bounds.origin.y);
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(width, line_height)),
+                    rgb(0x264f78),
+                ));
+            }
             if let Some((x, width)) = prepaint.caret {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
@@ -710,6 +765,26 @@ fn run(font: &Font, len: usize, color: Hsla) -> TextRun {
 /// Text of line `i` without its trailing newline.
 fn line_text(rope: &ropey::Rope, i: usize) -> String {
     rope.line(i).chars().filter(|c| *c != '\n').collect()
+}
+
+/// Which columns of line `i` fall inside the selection char-range `[lo, hi)`.
+/// `to_eol` is set when the range reaches into this line's newline, so the
+/// highlight should fill past the last char (selected blank space / joined line).
+fn line_highlight(rope: &ropey::Rope, i: usize, lo: usize, hi: usize) -> Option<Highlight> {
+    let line_start = rope.line_to_char(i);
+    let line = rope.line(i);
+    let total = line.len_chars(); // includes a trailing '\n' if present
+    let content = if line.chars().last() == Some('\n') { total - 1 } else { total };
+    let a = lo.max(line_start);
+    let b = hi.min(line_start + total); // clamp to past-the-newline
+    if a >= b {
+        return None;
+    }
+    Some(Highlight {
+        start_col: a - line_start,
+        end_col: (b - line_start).min(content),
+        to_eol: b > line_start + content,
+    })
 }
 
 /// `(byte offset of char column `col`, byte offset just past the char under it)`.

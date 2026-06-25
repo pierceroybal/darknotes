@@ -24,7 +24,6 @@ impl Selection {
         self.anchor == self.head
     }
 
-    #[allow(dead_code)]
     pub fn range(&self) -> std::ops::Range<usize> {
         self.anchor.min(self.head)..self.anchor.max(self.head)
     }
@@ -174,6 +173,63 @@ impl Document {
     pub fn move_motion(&mut self, m: Motion, count: usize) {
         let target = self.motion_target(m, self.caret(), count);
         self.set_caret(target);
+    }
+
+    /// Visual mode: move the selection's head, leaving the anchor fixed so the
+    /// span grows/shrinks.
+    pub fn extend_motion(&mut self, m: Motion, count: usize) {
+        let head = self.selections[0].head;
+        self.selections[0].head = self.motion_target(m, head, count);
+    }
+
+    /// Collapse the primary selection to a bare caret at its head (leaving visual).
+    pub fn collapse_selection(&mut self) {
+        self.set_caret(self.selections[0].head);
+    }
+
+    /// Char range `[start, end)` the primary selection covers. Charwise is
+    /// inclusive of the char under the head (vim semantics); linewise rounds out
+    /// to whole lines.
+    pub fn selection_span(&self, linewise: bool) -> (usize, usize) {
+        let r = self.selections[0].range(); // r.end == max(anchor, head)
+        if linewise {
+            let l0 = self.rope.char_to_line(r.start);
+            let l1 = self.rope.char_to_line(r.end);
+            let start = self.rope.line_to_char(l0);
+            let end = if l1 + 1 >= self.rope.len_lines() {
+                self.rope.len_chars()
+            } else {
+                self.rope.line_to_char(l1 + 1)
+            };
+            (start, end)
+        } else {
+            (r.start, (r.end + 1).min(self.rope.len_chars()))
+        }
+    }
+
+    /// Visual `d`/`x`: delete the selection into the register, then drop the caret
+    /// on a real char of the resulting line.
+    pub fn delete_selection(&mut self, linewise: bool) {
+        let (start, end) = self.selection_span(linewise);
+        if start < end {
+            self.set_register(self.rope.slice(start..end).to_string(), linewise);
+            self.rope.remove(start..end);
+            self.dirty = true;
+        }
+        let at = start.min(self.rope.len_chars());
+        let (line, _) = self.line_col_of(at);
+        let line_start = self.rope.line_to_char(line);
+        let last_col = self.line_len_chars(line).saturating_sub(1);
+        self.set_caret(line_start + (at - line_start).min(last_col));
+    }
+
+    /// Visual `y`: copy the selection into the register; caret drops to its start.
+    pub fn yank_selection(&mut self, linewise: bool) {
+        let (start, end) = self.selection_span(linewise);
+        if start < end {
+            self.set_register(self.rope.slice(start..end).to_string(), linewise);
+        }
+        self.set_caret(start.min(self.rope.len_chars()));
     }
 
     /// `d{motion}`: delete the char range the motion sweeps over.
@@ -597,6 +653,43 @@ mod tests {
         assert_eq!(d.rope.to_string(), "bar");
         d.paste(false); // P puts it back before caret
         assert_eq!(d.rope.to_string(), "foo bar");
+    }
+
+    #[test]
+    fn extend_motion_keeps_anchor() {
+        let mut d = Document::new("abcdef");
+        d.extend_motion(Motion::CharRight, 3);
+        assert_eq!(d.selections[0].anchor, 0);
+        assert_eq!(d.selections[0].head, 3);
+    }
+
+    #[test]
+    fn visual_linewise_delete_removes_whole_lines() {
+        // Anchor on line 0, head dragged to line 1 → `Vjd` deletes both.
+        let mut d = Document::new("aaa\nbbb\nccc\n");
+        d.extend_motion(Motion::LineDown, 1);
+        d.delete_selection(true);
+        assert_eq!(d.rope.to_string(), "ccc\n");
+        assert_eq!(d.caret_line_col(), (0, 0));
+    }
+
+    #[test]
+    fn visual_charwise_delete_is_inclusive() {
+        // anchor 0, head 2 selects "abc" (char under head included).
+        let mut d = Document::new("abcdef");
+        d.extend_motion(Motion::CharRight, 2);
+        d.delete_selection(false);
+        assert_eq!(d.rope.to_string(), "def");
+    }
+
+    #[test]
+    fn visual_yank_then_paste() {
+        let mut d = Document::new("abcdef");
+        d.extend_motion(Motion::CharRight, 2); // select "abc"
+        d.yank_selection(false);
+        assert_eq!(d.caret_line_col(), (0, 0)); // caret drops to selection start
+        d.paste(true); // p after caret
+        assert_eq!(d.rope.to_string(), "aabcbcdef");
     }
 
     #[test]
