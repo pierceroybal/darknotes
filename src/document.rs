@@ -42,6 +42,7 @@ pub enum Motion {
     WordEnd,
     LineStart,
     LineEnd,
+    FileStart,
     FileEnd,
 }
 
@@ -420,6 +421,7 @@ impl Document {
                 let (line, _) = self.line_col_of(from);
                 self.rope.line_to_char(line) + self.line_len_chars(line)
             }
+            Motion::FileStart => 0,
             Motion::FileEnd => {
                 let last = self.rope.len_lines().saturating_sub(1);
                 self.rope.line_to_char(last)

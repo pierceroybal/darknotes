@@ -65,18 +65,32 @@ impl Mode {
 }
 
 #[derive(Clone, Copy)]
-enum Operator {
+enum Op {
     Delete,
     Yank,
+    Change,
+}
+
+/// Mid-sequence grammar state beyond a pending count (which is tracked
+/// separately, since a count coexists with an operator — `d3w`). One key-press
+/// resolves whichever variant is active. New multi-key forms (`f`/`t`, more
+/// `g`-sequences) slot in as variants here, not as ad-hoc fields.
+#[derive(Clone, Copy)]
+enum Pending {
+    None,
+    /// An operator (`d`/`y`/`c`) awaiting its motion, or a doubled key (`dd`).
+    Operator(Op),
+    /// `g` was pressed; the next key completes a `g`-sequence (`gg`).
+    GPrefix,
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
-/// of which (counts, an operator) build up pending state — and emits zero or
+/// of which (counts, a pending sequence) build up state — and emits zero or
 /// more `Action`s once a complete command is recognized.
 pub struct Vim {
     pub mode: Mode,
     count: Option<usize>,
-    operator: Option<Operator>,
+    pending: Pending,
     /// The `:` command line being typed, valid only in `Mode::Command`.
     command: String,
 }
@@ -86,7 +100,7 @@ impl Vim {
         Self {
             mode: Mode::Normal,
             count: None,
-            operator: None,
+            pending: Pending::None,
             command: String::new(),
         }
     }
@@ -117,7 +131,7 @@ impl Vim {
 
         if key == "escape" {
             self.count = None;
-            self.operator = None;
+            self.pending = Pending::None;
             return vec![];
         }
 
@@ -126,13 +140,14 @@ impl Vim {
         // Without this, `Ctrl-a` would fall through and trigger `a`.
         if m.control || m.alt || m.platform {
             self.count = None;
-            self.operator = None;
+            self.pending = Pending::None;
             return vec![];
         }
 
-        // Count digits (no chord modifier). '0' counts only mid-count; with no
-        // count pending it's the line-start motion handled below.
-        if !m.control && !m.alt && !m.platform && key.len() == 1 {
+        // Count digits. '0' counts only mid-count; with no count pending it's the
+        // line-start motion handled below. Runs before the pending-sequence step
+        // so a count between operator and motion accumulates (`d3w`).
+        if key.len() == 1 {
             if let Some(d) = key.chars().next().unwrap().to_digit(10) {
                 let d = d as usize;
                 if d != 0 || self.count.is_some() {
@@ -142,41 +157,36 @@ impl Vim {
             }
         }
 
-        // A pending operator turns this keystroke into its motion (or `dd`).
-        if let Some(op) = self.operator.take() {
-            let count = self.count.take().unwrap_or(1);
-            return operate(op, key, count);
+        // An active sequence (operator-pending, `g`-prefix) consumes this key.
+        match std::mem::replace(&mut self.pending, Pending::None) {
+            Pending::Operator(op) => return self.apply_operator(op, key, shift),
+            Pending::GPrefix => return self.complete_g_prefix(key),
+            Pending::None => {}
         }
 
-        // Letters arrive lowercased with `shift` separate, so capitals are
-        // matched as (key, true).
+        // Motions come from one table shared with visual and operator-pending;
+        // letters arrive lowercased with `shift` separate, so capitals match as
+        // (key, true).
+        if let Some(spec) = motion(key, shift) {
+            return vec![Action::Move(spec.motion, self.take_count())];
+        }
         match (key, shift) {
-            ("h", _) | ("left", _) => vec![Action::Move(Motion::CharLeft, self.take_count())],
-            ("l", _) | ("right", _) => vec![Action::Move(Motion::CharRight, self.take_count())],
-            ("k", _) | ("up", _) => vec![Action::Move(Motion::LineUp, self.take_count())],
-            ("j", _) | ("down", _) => vec![Action::Move(Motion::LineDown, self.take_count())],
-            ("w", _) => vec![Action::Move(Motion::WordForward, self.take_count())],
-            ("b", _) => vec![Action::Move(Motion::WordBackward, self.take_count())],
-            ("e", _) => vec![Action::Move(Motion::WordEnd, self.take_count())],
-            ("0", _) => {
-                self.count = None;
-                vec![Action::Move(Motion::LineStart, 1)]
-            }
-            ("$", _) => {
-                self.count = None;
-                vec![Action::Move(Motion::LineEnd, 1)]
-            }
-            ("g", true) => {
-                self.count = None;
-                vec![Action::Move(Motion::FileEnd, 1)]
+            // `g` starts a sequence (`gg`); `G` is a single-key motion in the table.
+            ("g", false) => {
+                self.pending = Pending::GPrefix;
+                vec![]
             }
             ("x", _) => vec![Action::DeleteCharUnder(self.take_count())],
             ("d", false) => {
-                self.operator = Some(Operator::Delete);
+                self.pending = Pending::Operator(Op::Delete);
                 vec![]
             }
             ("y", false) => {
-                self.operator = Some(Operator::Yank);
+                self.pending = Pending::Operator(Op::Yank);
+                vec![]
+            }
+            ("c", false) => {
+                self.pending = Pending::Operator(Op::Change);
                 vec![]
             }
             ("y", true) => vec![Action::YankLines(self.take_count())], // Y == yy
@@ -319,8 +329,8 @@ impl Vim {
             _ => {}
         }
 
-        if let Some(motion) = motion_for_key(key, shift) {
-            return vec![Action::Move(motion, self.take_count())];
+        if let Some(spec) = motion(key, shift) {
+            return vec![Action::Move(spec.motion, self.take_count())];
         }
         self.count = None;
         vec![]
@@ -358,59 +368,73 @@ impl Vim {
     }
 }
 
-fn operate(op: Operator, key: &str, count: usize) -> Vec<Action> {
-    match op {
-        Operator::Delete => {
-            if key == "d" {
-                vec![Action::DeleteLines(count)]
-            } else if let Some(motion) = motion_for_op(key) {
-                vec![Action::DeleteMotion(motion, count)]
-            } else {
-                vec![] // unsupported motion after `d` → abort the operator
-            }
+impl Vim {
+    /// Resolve a pending operator against the key that follows it: a doubled
+    /// operator key is linewise (`dd`/`yy`/`cc`); otherwise the key must name an
+    /// operator-target motion. `c` deletes then enters insert (like `C` = `c$`).
+    fn apply_operator(&mut self, op: Op, key: &str, shift: bool) -> Vec<Action> {
+        let count = self.count.take().unwrap_or(1);
+        let doubled = matches!(
+            (op, key),
+            (Op::Delete, "d") | (Op::Yank, "y") | (Op::Change, "c")
+        );
+        if doubled {
+            return match op {
+                Op::Delete => vec![Action::DeleteLines(count)],
+                Op::Yank => vec![Action::YankLines(count)],
+                // ponytail: single-line `cc` (count ignored) — clear the line,
+                // enter insert. Multi-line `2cc` when it's wanted.
+                Op::Change => self.enter_insert(vec![
+                    Action::Move(Motion::LineStart, 1),
+                    Action::DeleteMotion(Motion::LineEnd, 1),
+                ]),
+            };
         }
-        Operator::Yank => {
-            if key == "y" {
-                vec![Action::YankLines(count)]
-            } else if let Some(motion) = motion_for_op(key) {
-                vec![Action::YankMotion(motion, count)]
-            } else {
-                vec![] // unsupported motion after `y` → abort
-            }
+        match motion(key, shift) {
+            Some(spec) if spec.op_target => match op {
+                Op::Delete => vec![Action::DeleteMotion(spec.motion, count)],
+                Op::Yank => vec![Action::YankMotion(spec.motion, count)],
+                Op::Change => self.enter_insert(vec![Action::DeleteMotion(spec.motion, count)]),
+            },
+            _ => vec![], // unsupported target → abort the operator
+        }
+    }
+
+    /// Complete a `g`-sequence: `gg` jumps to file start; anything else aborts.
+    fn complete_g_prefix(&mut self, key: &str) -> Vec<Action> {
+        self.count = None; // ponytail: `2gg` (go to line N) ignored — file start.
+        if key == "g" {
+            vec![Action::Move(Motion::FileStart, 1)]
+        } else {
+            vec![]
         }
     }
 }
 
-/// The cursor-movement keys shared by normal and visual mode. `G` (`shift+g`)
-/// is file-end; lowercase `g` has no standalone motion yet.
-fn motion_for_key(key: &str, shift: bool) -> Option<Motion> {
-    Some(match (key, shift) {
-        ("h", _) | ("left", _) => Motion::CharLeft,
-        ("l", _) | ("right", _) => Motion::CharRight,
-        ("k", _) | ("up", _) => Motion::LineUp,
-        ("j", _) | ("down", _) => Motion::LineDown,
-        ("w", _) => Motion::WordForward,
-        ("b", _) => Motion::WordBackward,
-        ("e", _) => Motion::WordEnd,
-        ("0", _) => Motion::LineStart,
-        ("$", _) => Motion::LineEnd,
-        ("g", true) => Motion::FileEnd,
-        _ => return None,
-    })
+/// A cursor motion plus whether it's a valid operator target. One table read by
+/// normal mode, visual mode, and operator-pending — a new motion is one entry
+/// here. `j`/`k`/`e`/`G` are non-targets (`dj` is linewise; `de`/`dG` are just a
+/// flag flip away). `G` (`shift+g`) is file-end; lowercase `g` is a prefix.
+struct MotionSpec {
+    motion: Motion,
+    op_target: bool,
 }
 
-/// Motions usable as an operator target. `j`/`k` are excluded — `dj` is
-/// linewise in real vim and char-range deletion would be wrong.
-fn motion_for_op(key: &str) -> Option<Motion> {
-    Some(match key {
-        "h" => Motion::CharLeft,
-        "l" => Motion::CharRight,
-        "w" => Motion::WordForward,
-        "b" => Motion::WordBackward,
-        "0" => Motion::LineStart,
-        "$" => Motion::LineEnd,
+fn motion(key: &str, shift: bool) -> Option<MotionSpec> {
+    let (motion, op_target) = match (key, shift) {
+        ("h", _) | ("left", _) => (Motion::CharLeft, true),
+        ("l", _) | ("right", _) => (Motion::CharRight, true),
+        ("k", _) | ("up", _) => (Motion::LineUp, false),
+        ("j", _) | ("down", _) => (Motion::LineDown, false),
+        ("w", _) => (Motion::WordForward, true),
+        ("b", _) => (Motion::WordBackward, true),
+        ("e", _) => (Motion::WordEnd, false),
+        ("0", _) => (Motion::LineStart, true),
+        ("$", _) => (Motion::LineEnd, true),
+        ("g", true) => (Motion::FileEnd, false),
         _ => return None,
-    })
+    };
+    Some(MotionSpec { motion, op_target })
 }
 
 #[cfg(test)]
@@ -468,6 +492,46 @@ mod tests {
             modifiers: Modifiers { shift: true, ..Default::default() },
         };
         assert_eq!(v.on_key(&c_shift), vec![Action::DeleteMotion(Motion::LineEnd, 1)]);
+        assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn gg_moves_to_file_start() {
+        let mut v = Vim::new();
+        assert!(v.on_key(&k("g")).is_empty()); // prefix armed, no action yet
+        assert_eq!(v.on_key(&k("g")), vec![Action::Move(Motion::FileStart, 1)]);
+    }
+
+    #[test]
+    fn g_then_other_key_aborts() {
+        let mut v = Vim::new();
+        v.on_key(&k("g"));
+        assert!(v.on_key(&k("x")).is_empty()); // `gx` unbound → no-op, not delete
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn cw_changes_word() {
+        let mut v = Vim::new();
+        assert!(v.on_key(&k("c")).is_empty());
+        assert_eq!(
+            v.on_key(&k("w")),
+            vec![Action::DeleteMotion(Motion::WordForward, 1)]
+        );
+        assert_eq!(v.mode, Mode::Insert); // change = delete then insert
+    }
+
+    #[test]
+    fn cc_changes_line() {
+        let mut v = Vim::new();
+        v.on_key(&k("c"));
+        assert_eq!(
+            v.on_key(&k("c")),
+            vec![
+                Action::Move(Motion::LineStart, 1),
+                Action::DeleteMotion(Motion::LineEnd, 1)
+            ]
+        );
         assert_eq!(v.mode, Mode::Insert);
     }
 
