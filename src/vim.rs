@@ -24,9 +24,20 @@ pub enum Action {
     DeleteBackward,
     DeleteForward,
     Undo,
+    /// Reposition the viewport around the caret line (`zz`/`zt`/`zb`). The editor
+    /// owns the scroll handle; the grammar only names the alignment.
+    Scroll(Scroll),
     /// A submitted `:` command line (without the leading colon). The editor,
     /// not the grammar, decides what `w`/`q`/… mean.
     ExecuteCommand(String),
+}
+
+/// Where to place the caret line within the viewport (`z` scroll commands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scroll {
+    Center,
+    Top,
+    Bottom,
 }
 
 impl Action {
@@ -82,6 +93,8 @@ enum Pending {
     Operator(Op),
     /// `g` was pressed; the next key completes a `g`-sequence (`gg`).
     GPrefix,
+    /// `z` was pressed; the next key completes a `z`-sequence (`zz`/`zt`/`zb`).
+    ZPrefix,
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
@@ -161,6 +174,7 @@ impl Vim {
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::Operator(op) => return self.apply_operator(op, key, shift),
             Pending::GPrefix => return self.complete_g_prefix(key),
+            Pending::ZPrefix => return self.complete_z_prefix(key),
             Pending::None => {}
         }
 
@@ -174,6 +188,10 @@ impl Vim {
             // `g` starts a sequence (`gg`); `G` is a single-key motion in the table.
             ("g", false) => {
                 self.pending = Pending::GPrefix;
+                vec![]
+            }
+            ("z", false) => {
+                self.pending = Pending::ZPrefix;
                 vec![]
             }
             ("x", _) => vec![Action::DeleteCharUnder(self.take_count())],
@@ -409,6 +427,20 @@ impl Vim {
             vec![]
         }
     }
+
+    /// Complete a `z`-sequence: position the caret line in the viewport
+    /// (`zz` center, `zt` top, `zb` bottom); anything else aborts. The
+    /// `+first-non-blank` variants (`z.`/`z<CR>`/`z-`) wait on a `^` motion;
+    /// `zh`/`zl` (horizontal) and `zf`/`zo` (folds) wait on those features.
+    fn complete_z_prefix(&mut self, key: &str) -> Vec<Action> {
+        self.count = None;
+        match key {
+            "z" => vec![Action::Scroll(Scroll::Center)],
+            "t" => vec![Action::Scroll(Scroll::Top)],
+            "b" => vec![Action::Scroll(Scroll::Bottom)],
+            _ => vec![],
+        }
+    }
 }
 
 /// A cursor motion plus whether it's a valid operator target. One table read by
@@ -533,6 +565,25 @@ mod tests {
             ]
         );
         assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn z_scroll_commands() {
+        let mut v = Vim::new();
+        assert!(v.on_key(&k("z")).is_empty()); // prefix armed
+        assert_eq!(v.on_key(&k("z")), vec![Action::Scroll(Scroll::Center)]);
+        v.on_key(&k("z"));
+        assert_eq!(v.on_key(&k("t")), vec![Action::Scroll(Scroll::Top)]);
+        v.on_key(&k("z"));
+        assert_eq!(v.on_key(&k("b")), vec![Action::Scroll(Scroll::Bottom)]);
+    }
+
+    #[test]
+    fn z_then_unknown_aborts() {
+        let mut v = Vim::new();
+        v.on_key(&k("z"));
+        assert!(v.on_key(&k("q")).is_empty());
+        assert_eq!(v.mode, Mode::Normal);
     }
 
     #[test]

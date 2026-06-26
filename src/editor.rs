@@ -12,7 +12,7 @@ use gpui::{
 use crate::document::Document;
 use crate::theme::Theme;
 use crate::vault::Vault;
-use crate::vim::{Action, Mode, Vim};
+use crate::vim::{Action, Mode, Scroll, Vim};
 
 const WELCOME: &str =
     "# Welcome to darknotes\n\nOpen a vault: darknotes <folder>\nOr a file: darknotes <path.md>\n";
@@ -273,6 +273,18 @@ impl Editor {
             Action::DeleteBackward => self.doc.delete_backward(),
             Action::DeleteForward => self.doc.delete_forward(),
             Action::Undo => self.doc.undo(),
+            // `z` scroll commands don't move the caret, so the render auto-scroll
+            // won't override this; `_strict` repositions the already-visible
+            // cursor line (plain `scroll_to_item` no-ops when it's on screen).
+            Action::Scroll(s) => {
+                let line = self.doc.caret_line_col().0;
+                let strategy = match s {
+                    Scroll::Center => ScrollStrategy::Center,
+                    Scroll::Top => ScrollStrategy::Top,
+                    Scroll::Bottom => ScrollStrategy::Bottom,
+                };
+                self.scroll.scroll_to_item_strict(line, strategy);
+            }
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
         }
     }
