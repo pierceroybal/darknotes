@@ -1,5 +1,6 @@
 mod document;
 mod editor;
+mod theme;
 mod vault;
 mod vim;
 
@@ -19,6 +20,8 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
+        cx.set_global(theme::Theme::default());
+
         // A directory argument opens a vault; a file argument opens that file
         // with its parent as the vault; no argument uses the current directory.
         let (root, initial) = match std::env::args().nth(1) {

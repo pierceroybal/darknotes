@@ -3,13 +3,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    div, fill, point, prelude::*, px, relative, rgb, size, uniform_list, AnyElement, App, Bounds,
+    div, fill, point, prelude::*, px, relative, size, uniform_list, AnyElement, App, Bounds,
     ContentMask, Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
     InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ScrollStrategy,
     ShapedLine, SharedString, Style, TextRun, UniformListScrollHandle, Window,
 };
 
 use crate::document::Document;
+use crate::theme::Theme;
 use crate::vault::Vault;
 use crate::vim::{Action, Mode, Vim};
 
@@ -399,6 +400,7 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _win: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = *cx.global::<Theme>();
         let (cur_line, cur_col) = self.doc.caret_line_col();
 
         // Keep the caret on screen, but only when it actually moved — so the
@@ -460,11 +462,11 @@ impl Render for Editor {
                     .to_string();
                 // Sidebar cursor (active pane) outranks the open-file highlight.
                 let (bg, fg) = if cursor == Some(i) {
-                    (rgb(0x3a3a5a), rgb(0xffffff))
+                    (theme.sidebar_cursor_background, theme.sidebar_active_foreground)
                 } else if current == Some(i) {
-                    (rgb(0x2a2a40), rgb(0xffffff))
+                    (theme.sidebar_current_background, theme.sidebar_active_foreground)
                 } else {
-                    (rgb(0x141414), rgb(0x9a9a9a))
+                    (theme.sidebar_background, theme.sidebar_foreground)
                 };
                 div()
                     .px_2()
@@ -488,8 +490,8 @@ impl Render for Editor {
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
             .flex()
-            .bg(rgb(0x1a1a1a))
-            .text_color(rgb(0xcccccc))
+            .bg(theme.background)
+            .text_color(theme.foreground)
             // ponytail: hardcoded to a font that's actually installed. GPUI's
             // default family triggers per-line fallback scanning when absent
             // (~8ms/cold line). Move to user config + per-OS defaults later.
@@ -503,7 +505,7 @@ impl Render for Editor {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .bg(rgb(0x141414))
+                    .bg(theme.sidebar_background)
                     .overflow_y_scroll()
                     .children(rows),
             )
@@ -535,8 +537,8 @@ impl Render for Editor {
                         div()
                             .w_full()
                             .px_2()
-                            .bg(rgb(0x2a2a2a))
-                            .text_color(rgb(0x888888))
+                            .bg(theme.status_background)
+                            .text_color(theme.status_foreground)
                             .child(bar),
                     ),
             )
@@ -719,22 +721,23 @@ impl Element for LineElement {
         // line's box so left-overflow doesn't bleed onto the sidebar and
         // right-overflow stops at the pane edge.
         let ox = bounds.origin.x - self.scroll_x.get();
+        let theme = *cx.global::<Theme>();
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             // Selection highlight sits under everything; then the caret quad, the
             // line, and the inverted caret glyph on top so it reads dark against
-            // the yellow block.
+            // the accent block.
             if let Some((x, width)) = prepaint.selection {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
                     Bounds::new(origin, size(width, line_height)),
-                    rgb(0x264f78),
+                    theme.selection,
                 ));
             }
             if let Some((x, width)) = prepaint.caret {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
                     Bounds::new(origin, size(width, line_height)),
-                    rgb(0xffcc00),
+                    theme.accent,
                 ));
             }
             let shaped = &prepaint.shaped;
@@ -745,7 +748,7 @@ impl Element for LineElement {
                 let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;
                 let baseline = point(ox + gx, bounds.origin.y + padding_top + shaped.ascent);
                 let _ =
-                    window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, rgb(0x1a1a1a).into());
+                    window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, theme.background);
             }
         });
     }
