@@ -1,14 +1,16 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gpui::{
     div, fill, point, prelude::*, px, relative, size, uniform_list, AnyElement, App, Bounds,
     ContentMask, Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
     InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ScrollStrategy,
-    ShapedLine, SharedString, Style, TextRun, UniformListScrollHandle, Window,
+    ShapedLine, SharedString, Style, Task, TextRun, UniformListScrollHandle, Window,
 };
 
+use crate::config::Config;
 use crate::document::Document;
 use crate::theme::Theme;
 use crate::vault::Vault;
@@ -54,10 +56,22 @@ pub struct Editor {
     /// the caret on screen; every line reads it in paint. Shared because the line
     /// elements that write/read it are built outside this struct.
     scroll_x: Rc<Cell<Pixels>>,
+    /// Editor font, from config.
+    font_family: SharedString,
+    font_size: f32,
+    /// Pending insert-exit timeout. Held so it stays alive; dropping/replacing it
+    /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
+    /// buffered lead keys as text.
+    exit_timer: Option<Task<()>>,
 }
 
 impl Editor {
-    pub fn new(vault_root: PathBuf, initial: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        vault_root: PathBuf,
+        initial: Option<PathBuf>,
+        config: Config,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let vault = Vault::scan(vault_root);
         let (doc, current) = match initial {
             Some(path) => {
@@ -69,9 +83,14 @@ impl Editor {
                 None => (Document::new(WELCOME), None),
             },
         };
+        let vim = Vim::new(
+            config.tab_width,
+            &config.keymap.insert_exit,
+            config.keymap.timeoutlen,
+        );
         Self {
             doc,
-            vim: Vim::new(),
+            vim,
             focus: cx.focus_handle(),
             vault,
             selected: current.unwrap_or(0),
@@ -82,6 +101,9 @@ impl Editor {
             scroll: UniformListScrollHandle::new(),
             last_line: 0,
             scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
+            font_family: config.font_family.into(),
+            font_size: config.font_size,
+            exit_timer: None,
         }
     }
 
@@ -97,7 +119,8 @@ impl Editor {
     /// editor so keys keep flowing after a click or command.
     fn load(&mut self, doc: Document, current: Option<usize>, window: &mut Window) {
         self.doc = doc;
-        self.vim = Vim::new();
+        self.vim.reset(); // clears transient state, keeps config (tab/keymap)
+        self.exit_timer = None;
         self.current = current;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top); // a fresh buffer starts at the top
         self.last_line = 0;
@@ -244,8 +267,32 @@ impl Editor {
         for action in actions {
             self.apply(action, window, cx);
         }
+        self.arm_exit_timer(cx);
         // Mode (hence caret style) can change with no action, so always notify.
         cx.notify();
+    }
+
+    /// (Re)arm the insert-exit timeout while a sequence lead key is buffered, or
+    /// cancel it once the buffer resolves. Each lead key restarts the clock
+    /// (vim's per-key `timeoutlen`); on fire, the buffered keys are inserted as
+    /// literal text. Replacing/clearing the stored `Task` cancels the prior one.
+    fn arm_exit_timer(&mut self, cx: &mut Context<Self>) {
+        if !self.vim.exit_pending() {
+            self.exit_timer = None;
+            return;
+        }
+        let dur = Duration::from_millis(self.vim.timeoutlen());
+        self.exit_timer = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(dur).await;
+            this.update(cx, |this, cx| {
+                let text = this.vim.flush_pending_exit();
+                if !text.is_empty() {
+                    this.doc.insert(&text);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     /// The single execution seam every input grammar funnels through.
@@ -504,12 +551,13 @@ impl Render for Editor {
             .flex()
             .bg(theme.background)
             .text_color(theme.foreground)
-            // ponytail: hardcoded to a font that's actually installed. GPUI's
-            // default family triggers per-line fallback scanning when absent
-            // (~8ms/cold line). Move to user config + per-OS defaults later.
-            .font_family("DejaVu Sans Mono")
-            .text_size(px(15.))
-            .line_height(px(22.))
+            // Font from config. A real installed family matters: GPUI's default
+            // triggers per-line fallback scanning when absent (~8ms/cold line).
+            // ponytail: line_height tracks font_size at a fixed ~1.47 ratio (22px
+            // at the 15px default); expose it as its own config key only if asked.
+            .font_family(self.font_family.clone())
+            .text_size(px(self.font_size))
+            .line_height(px(self.font_size * 22.0 / 15.0))
             .child(
                 div()
                     .id("sidebar") // stateful → enables overflow_y_scroll

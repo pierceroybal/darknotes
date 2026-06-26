@@ -1,0 +1,20 @@
+# darknotes config — created automatically on first run. Edit by hand; it's
+# read once at startup. Every key is optional: delete one to fall back to its
+# built-in default.
+
+# Vault opened when you launch with no path argument. `~` expands to $HOME.
+# A path on the command line always wins over this. (A future onboarding flow
+# will set this for you when you pick a vault.)
+# vault = "~/notes"
+
+font_family = "DejaVu Sans Mono"
+font_size   = 15
+tab_width    = 2   # spaces inserted for Tab
+
+[keymap]
+# Insert-mode key sequence that acts as <Esc> (e.g. "jf"). Disabled by default —
+# uncomment to enable. <Esc> always exits regardless.
+# insert_exit = "jf"
+# How long (ms) to wait for the sequence to finish before the lead key is typed
+# as text. Vim's default is 1000; ~150 feels snappier for jf-style exits.
+timeoutlen = 1000

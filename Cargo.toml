@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 gpui = "0.2"
 ropey = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

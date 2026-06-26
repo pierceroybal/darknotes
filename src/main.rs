@@ -1,3 +1,4 @@
+mod config;
 mod document;
 mod editor;
 mod theme;
@@ -6,6 +7,7 @@ mod vim;
 
 use std::path::PathBuf;
 
+use config::Config;
 use editor::Editor;
 use gpui::{
     App, Application, Bounds, Focusable, WindowBounds, WindowOptions, prelude::*, px, size,
@@ -20,10 +22,12 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
+        let config = Config::load();
         cx.set_global(theme::Theme::default());
 
         // A directory argument opens a vault; a file argument opens that file
-        // with its parent as the vault; no argument uses the current directory.
+        // with its parent as the vault. With no argument, fall back to the
+        // configured vault, then the current directory.
         let (root, initial) = match std::env::args().nth(1) {
             Some(p) => {
                 let path = PathBuf::from(p);
@@ -38,10 +42,14 @@ fn main() {
                     (root, Some(path))
                 }
             }
-            None => (
-                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                None,
-            ),
+            None => {
+                let root = config
+                    .vault_path()
+                    .filter(|p| p.is_dir())
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                (root, None)
+            }
         };
 
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
@@ -51,7 +59,7 @@ fn main() {
                 ..Default::default()
             },
             move |window, cx| {
-                let editor = cx.new(|cx| Editor::new(root, initial, cx));
+                let editor = cx.new(|cx| Editor::new(root, initial, config, cx));
                 // Focus on launch, or on_key_down never fires and nothing types.
                 let handle = editor.read(cx).focus_handle(cx);
                 window.focus(&handle);
