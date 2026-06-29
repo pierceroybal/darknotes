@@ -5,13 +5,15 @@ use std::time::Duration;
 
 use gpui::{
     div, fill, point, prelude::*, px, relative, size, uniform_list, AnyElement, App, Bounds,
-    ContentMask, Context, FocusHandle, Focusable, Font, FontId, GlobalElementId, GlyphId, Hsla,
-    InspectorElementId, KeyDownEvent, LayoutId, MouseButton, MouseUpEvent, Pixels, ScrollStrategy,
-    ShapedLine, SharedString, Style, Task, TextRun, UniformListScrollHandle, Window,
+    ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle, FontWeight,
+    GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
+    MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task, TextRun,
+    UniformListScrollHandle, Window,
 };
 
 use crate::config::Config;
 use crate::document::Document;
+use crate::markdown::{self, Span, SpanKind};
 use crate::theme::Theme;
 use crate::vault::Vault;
 use crate::vim::{Action, Mode, Scroll, Vim};
@@ -479,6 +481,9 @@ impl Render for Editor {
 
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
+        // ponytail: full re-scan each render (≈ per keystroke). Markdown docs are
+        // small and it's a cheap char walk; cache on a doc revision if it bites.
+        let spans = markdown::parse(&rope);
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
         // The selected char-range to highlight, `None` outside visual mode.
@@ -580,6 +585,7 @@ impl Render for Editor {
                             range
                                 .map(|i| LineElement {
                                     text: line_text(&rope, i).into(),
+                                    spans: spans.get(i).cloned().unwrap_or_default(),
                                     caret: (i == cur_line).then_some(LineCaret {
                                         col: cur_col,
                                         block: mode != Mode::Insert,
@@ -629,6 +635,10 @@ struct Highlight {
 /// caret's inverted glyph is repainted from the cached layout, not re-shaped.
 struct LineElement {
     text: SharedString,
+    /// This line's markdown spans (line-local byte ranges), flattened to styled
+    /// runs in `prepaint`. Depends only on text + markup, never the caret, so the
+    /// layout cache still keys on content alone.
+    spans: Vec<Span>,
     /// `Some` only on the cursor line.
     caret: Option<LineCaret>,
     /// `Some` when part of this line falls inside the visual selection.
@@ -688,17 +698,18 @@ impl Element for LineElement {
         bounds: Bounds<Pixels>,
         _layout: &mut (),
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> LinePrepaint {
         let style = window.text_style();
         let font = style.font();
         let fg = style.color;
         let font_size = style.font_size.to_pixels(window.rem_size());
 
-        // One uniform run: the line's shaping key never depends on the caret, so
-        // the layout cache keeps hitting as the cursor moves. The caret is an
-        // overlay below; nothing here re-shapes per keystroke.
-        let runs = [run(&font, self.text.len(), fg)];
+        // Styled runs from this line's markdown spans. Shaping keys on text +
+        // markup, never the caret, so the layout cache keeps hitting as the
+        // cursor moves; the caret below is an overlay that re-shapes nothing.
+        let theme = *cx.global::<Theme>();
+        let runs = spans_to_runs(&self.text, &self.spans, &font, fg, &theme);
         let shaped = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
@@ -822,6 +833,49 @@ fn run(font: &Font, len: usize, color: Hsla) -> TextRun {
         background_color: None,
         underline: None,
         strikethrough: None,
+    }
+}
+
+/// Flatten this line's markdown spans into styled runs covering the whole line —
+/// `shape_line` drops glyphs unless the run lengths sum to the byte length. An
+/// empty line keeps one zero-length default run, matching the prior behavior.
+fn spans_to_runs(text: &str, spans: &[Span], font: &Font, fg: Hsla, theme: &Theme) -> Vec<TextRun> {
+    let segments = markdown::flatten(text.len(), spans);
+    if segments.is_empty() {
+        return vec![run(font, text.len(), fg)];
+    }
+    segments
+        .iter()
+        .map(|seg| {
+            let (color, weight, style, background_color) = segment_style(seg.kind, fg, theme);
+            let mut font = font.clone();
+            font.weight = weight;
+            font.style = style;
+            TextRun { len: seg.len, font, color, background_color, underline: None, strikethrough: None }
+        })
+        .collect()
+}
+
+/// Visual style for a flattened segment: (color, weight, slant, background).
+/// `None` is default body text.
+fn segment_style(
+    kind: Option<SpanKind>,
+    fg: Hsla,
+    theme: &Theme,
+) -> (Hsla, FontWeight, FontStyle, Option<Hsla>) {
+    let normal = (fg, FontWeight::NORMAL, FontStyle::Normal, None);
+    let Some(kind) = kind else { return normal };
+    match kind {
+        SpanKind::Heading(_) => (theme.heading, FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Strong => (fg, FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Code | SpanKind::CodeText | SpanKind::CodeFence => {
+            (theme.code, FontWeight::NORMAL, FontStyle::Normal, Some(theme.code_bg))
+        }
+        SpanKind::BlockQuote => (theme.muted, FontWeight::NORMAL, FontStyle::Italic, None),
+        SpanKind::Frontmatter | SpanKind::Marker => {
+            (theme.muted, FontWeight::NORMAL, FontStyle::Normal, None)
+        }
+        SpanKind::ListItem => normal,
     }
 }
 

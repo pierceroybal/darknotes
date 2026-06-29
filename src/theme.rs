@@ -23,6 +23,13 @@ pub struct Theme {
     pub sidebar_cursor_background: Hsla,
     pub status_background: Hsla,
     pub status_foreground: Hsla,
+    // Markdown rendering (see `markdown::SpanKind`). `muted` styles syntactic
+    // punctuation (`##`, `**`, bullets); `code`/`code_bg` style inline and
+    // fenced code.
+    pub heading: Hsla,
+    pub code: Hsla,
+    pub code_bg: Hsla,
+    pub muted: Hsla,
 }
 
 impl Global for Theme {}
@@ -51,6 +58,10 @@ impl Theme {
             sidebar_cursor_background: rgb(0x3a3a5a).into(),
             status_background: rgb(0x2a2a2a).into(),
             status_foreground: rgb(0x888888).into(),
+            heading: rgb(0x87b3ff).into(),
+            code: rgb(0xb5cea8).into(),
+            code_bg: rgb(0x262626).into(),
+            muted: rgb(0x707070).into(),
         }
     }
 
@@ -69,6 +80,10 @@ impl Theme {
             sidebar_cursor_background: rgb(0xc7d4ee).into(),
             status_background: rgb(0xe9e9e6).into(),
             status_foreground: rgb(0x555555).into(),
+            heading: rgb(0x1d63d1).into(),
+            code: rgb(0x9a3b2f).into(),
+            code_bg: rgb(0xecebe7).into(),
+            muted: rgb(0x8a8a8a).into(),
         }
     }
 }
