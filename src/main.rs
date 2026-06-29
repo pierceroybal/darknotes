@@ -57,10 +57,11 @@ fn main() {
             }
         };
 
+        // Start maximized; the centered size is the restore bounds.
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(WindowBounds::Maximized(bounds)),
                 ..Default::default()
             },
             move |window, cx| {

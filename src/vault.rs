@@ -101,7 +101,8 @@ fn build_dir(dir: &Path) -> Vec<Entry> {
                 }
             }
         } else if path.extension().is_some_and(|e| e == "md") {
-            files.push(Entry::File { name: file_name(&path), path });
+            // Show the stem — the `.md` extension is implied by the app.
+            files.push(Entry::File { name: file_stem(&path), path });
         }
     }
     dirs.sort_by(|a, b| entry_name(a).cmp(entry_name(b)));
@@ -127,6 +128,14 @@ fn entry_name(e: &Entry) -> &str {
 
 fn file_name(path: &Path) -> String {
     path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// File name without its extension — only `.md` files reach here, so this drops
+/// the implied `.md` for the sidebar label.
+fn file_stem(path: &Path) -> String {
+    path.file_stem()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
@@ -184,10 +193,11 @@ mod tests {
         let vault = Vault::scan(&root);
         let mut expanded = HashSet::new();
 
-        // Collapsed: the folder and the root file, both at depth 0.
+        // Collapsed: the folder and the root file, both at depth 0. File labels
+        // drop the `.md` extension; folder names are shown as-is.
         assert_eq!(
             depth_names(&vault.visible_rows(&expanded)),
-            vec![(0, "sub".to_string()), (0, "a.md".to_string())]
+            vec![(0, "sub".to_string()), (0, "a".to_string())]
         );
 
         // Expanded: the folder's child appears between, indented one level.
@@ -196,8 +206,8 @@ mod tests {
             depth_names(&vault.visible_rows(&expanded)),
             vec![
                 (0, "sub".to_string()),
-                (1, "c.md".to_string()),
-                (0, "a.md".to_string()),
+                (1, "c".to_string()),
+                (0, "a".to_string()),
             ]
         );
 

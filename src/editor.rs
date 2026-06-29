@@ -691,7 +691,7 @@ impl Render for Editor {
                         .collect::<Vec<_>>()
                 })
                 .track_scroll(self.sidebar_scroll.clone())
-                .w(px(220.))
+                .w(px(330.))
                 .h_full()
                 .flex_shrink_0() // never let a wide editor pane squeeze the sidebar
                 .bg(theme.sidebar_background),
