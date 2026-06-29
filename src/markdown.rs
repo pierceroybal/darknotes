@@ -113,7 +113,10 @@ impl Scan {
         // harmless and keeps one code path.
         if let Some(level) = heading_level(trimmed) {
             spans.push(Span { range: 0..len, kind: SpanKind::Heading(level) });
-            spans.push(Span { range: indent..indent + level as usize, kind: SpanKind::Marker });
+            // Marker spans the `#`s plus the one trailing space, so concealing a
+            // heading leaves its title flush-left rather than space-indented.
+            let marker_end = (indent + level as usize + 1).min(len);
+            spans.push(Span { range: indent..marker_end, kind: SpanKind::Marker });
         } else if trimmed.starts_with('>') {
             spans.push(Span { range: 0..len, kind: SpanKind::BlockQuote });
             spans.push(Span { range: indent..indent + 1, kind: SpanKind::Marker });
@@ -228,6 +231,44 @@ pub fn flatten(line_len: usize, spans: &[Span]) -> Vec<Segment> {
     out
 }
 
+/// A line's display form with `Marker` segments dropped (their bytes removed),
+/// so markdown renders without its syntax punctuation. `segments` still sum to
+/// `text.len()` — the invariant `shape_line` requires.
+pub struct Concealed {
+    pub text: String,
+    pub segments: Vec<Segment>,
+    // ponytail: no source-byte map yet. Per-block reveal (showing source only for
+    // the element under the caret) needs one; it's emitted from this same walk —
+    // record, per kept byte, the source offset it came from.
+}
+
+/// Drop `Marker` segments from a flattened line, returning the concealed text and
+/// the segments that survive. Boundaries fall on char boundaries (markers are all
+/// ASCII), so slicing `text` is safe. The cursor line renders from source
+/// instead, so this byte shift never reaches caret math.
+pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
+    let mut out_text = String::with_capacity(text.len());
+    let mut out_segments = Vec::with_capacity(segments.len());
+    let mut byte = 0;
+    for seg in segments {
+        let end = byte + seg.len;
+        let slice = &text[byte..end];
+        if seg.kind != Some(SpanKind::Marker) || keep_marker(slice) {
+            out_text.push_str(slice);
+            out_segments.push(*seg);
+        }
+        byte = end;
+    }
+    Concealed { text: out_text, segments: out_segments }
+}
+
+/// List bullets and the blockquote bar stay visible when rendering — they're
+/// structural prefixes with no rendered substitute yet, so concealing them would
+/// orphan the content. Heading `#`, `**`, and backticks are dropped.
+fn keep_marker(marker: &str) -> bool {
+    matches!(marker, "-" | "*" | "+" | ">")
+}
+
 fn priority(k: SpanKind) -> u8 {
     match k {
         SpanKind::Marker => 4,
@@ -276,6 +317,25 @@ mod tests {
     #[test]
     fn empty_line_has_no_segments() {
         assert!(flatten(0, &[]).is_empty());
+    }
+
+    #[test]
+    fn conceal_drops_markers_and_keeps_invariant() {
+        let line = "## **hi** there";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        let c = conceal(line, &segs);
+        // `## ` and the `**` pairs gone; content (bold + plain) kept.
+        assert_eq!(c.text, "hi there");
+        // Segments still cover the concealed text exactly — the shape_line rule.
+        assert_eq!(c.segments.iter().map(|s| s.len).sum::<usize>(), c.text.len());
+    }
+
+    #[test]
+    fn conceal_keeps_list_and_quote_markers() {
+        for line in ["- item", "> quote"] {
+            let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+            assert_eq!(conceal(line, &segs).text, line);
+        }
     }
 
     #[test]

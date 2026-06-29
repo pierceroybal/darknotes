@@ -18,6 +18,11 @@ tab_width    = 2   # spaces inserted for Tab
 # hybrid — the cursor line shows its absolute number, others the distance to it.
 line_numbers = "off"
 
+# Render markdown by hiding syntax markers (#, **, `) on every line except the
+# one the cursor is on, which shows full source for editing. Set false for a
+# plain source view.
+render_markdown = true
+
 [keymap]
 # Insert-mode key sequence that acts as <Esc> (e.g. "jf"). Disabled by default —
 # uncomment to enable. <Esc> always exits regardless.

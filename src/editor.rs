@@ -14,7 +14,7 @@ use gpui::{
 
 use crate::config::{Config, LineNumbers};
 use crate::document::Document;
-use crate::markdown::{self, Span, SpanKind};
+use crate::markdown::{self, Segment, SpanKind};
 use crate::theme::Theme;
 use crate::vault::Vault;
 use crate::vim::{Action, Mode, Scroll, Vim};
@@ -72,6 +72,8 @@ pub struct Editor {
     font_size: f32,
     /// Line-number gutter mode, from config.
     line_numbers: LineNumbers,
+    /// Hide markdown syntax markers on non-cursor lines, from config.
+    render_markdown: bool,
     /// Pending insert-exit timeout. Held so it stays alive; dropping/replacing it
     /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
     /// buffered lead keys as text.
@@ -133,6 +135,7 @@ impl Editor {
             font_family: config.font_family.into(),
             font_size: config.font_size,
             line_numbers: config.line_numbers,
+            render_markdown: config.render_markdown,
             exit_timer: None,
         }
     }
@@ -593,6 +596,7 @@ impl Render for Editor {
         let spans = markdown::parse(&rope);
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
+        let render_markdown = self.render_markdown;
         let line_numbers = self.line_numbers;
         // Gutter wide enough for the largest line number, monospace-aligned.
         let num_width = line_count.to_string().len().max(3);
@@ -733,9 +737,21 @@ impl Render for Editor {
                                         };
                                         (format!(" {n:>num_width$}  ").into(), color)
                                     });
+                                    // Conceal markers on every line but the cursor
+                                    // line, which keeps full source so caret math
+                                    // stays on real document bytes.
+                                    let text = line_text(&rope, i);
+                                    let line_spans = spans.get(i).map_or(&[][..], Vec::as_slice);
+                                    let segs = markdown::flatten(text.len(), line_spans);
+                                    let (text, segments) = if render_markdown && i != cur_line {
+                                        let c = markdown::conceal(&text, &segs);
+                                        (c.text, c.segments)
+                                    } else {
+                                        (text, segs)
+                                    };
                                     LineElement {
-                                        text: line_text(&rope, i).into(),
-                                        spans: spans.get(i).cloned().unwrap_or_default(),
+                                        text: text.into(),
+                                        segments,
                                         caret: (i == cur_line).then_some(LineCaret {
                                             col: cur_col,
                                             block: mode != Mode::Insert,
@@ -782,16 +798,16 @@ struct Highlight {
 }
 
 /// One text line, shaped as a single uniform run with the caret drawn entirely
-/// as an overlay. Shaping never depends on the caret, so a line's layout-cache
-/// key is identical whether or not the cursor is on it — cursor movement reuses
-/// cached layouts instead of re-shaping every visible line each frame. The block
-/// caret's inverted glyph is repainted from the cached layout, not re-shaped.
+/// as an overlay. Shaping keys on `text` + `segments`, never the caret position,
+/// so GPUI's shaped-line cache reuses layouts as the caret moves within a line.
+/// When `render_markdown` is on, non-cursor lines carry concealed text/segments
+/// and the cursor line carries source, so only the two lines a vertical move
+/// swaps between re-shape — everything else stays cached.
 struct LineElement {
     text: SharedString,
-    /// This line's markdown spans (line-local byte ranges), flattened to styled
-    /// runs in `prepaint`. Depends only on text + markup, never the caret, so the
-    /// layout cache still keys on content alone.
-    spans: Vec<Span>,
+    /// Styled segments matching `text` (concealed or source), mapped to runs in
+    /// `prepaint`. Independent of the caret, so the cache keys on content alone.
+    segments: Vec<Segment>,
     /// `Some` only on the cursor line.
     caret: Option<LineCaret>,
     /// `Some` when part of this line falls inside the visual selection.
@@ -868,7 +884,7 @@ impl Element for LineElement {
         // markup, never the caret, so the layout cache keeps hitting as the
         // cursor moves; the caret below is an overlay that re-shapes nothing.
         let theme = *cx.global::<Theme>();
-        let runs = spans_to_runs(&self.text, &self.spans, &font, fg, &theme);
+        let runs = segments_to_runs(&self.text, &self.segments, &font, fg, &theme);
         // Shape the line-number gutter (if any). It sits at a fixed left position
         // and never scrolls, so the text below is shifted right by its width.
         let gutter = self.gutter.as_ref().map(|(text, color)| {
@@ -1016,11 +1032,16 @@ fn run(font: &Font, len: usize, color: Hsla) -> TextRun {
     }
 }
 
-/// Flatten this line's markdown spans into styled runs covering the whole line —
+/// Map a line's flattened segments to styled runs covering the whole line —
 /// `shape_line` drops glyphs unless the run lengths sum to the byte length. An
 /// empty line keeps one zero-length default run, matching the prior behavior.
-fn spans_to_runs(text: &str, spans: &[Span], font: &Font, fg: Hsla, theme: &Theme) -> Vec<TextRun> {
-    let segments = markdown::flatten(text.len(), spans);
+fn segments_to_runs(
+    text: &str,
+    segments: &[Segment],
+    font: &Font,
+    fg: Hsla,
+    theme: &Theme,
+) -> Vec<TextRun> {
     if segments.is_empty() {
         return vec![run(font, text.len(), fg)];
     }

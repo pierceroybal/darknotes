@@ -33,6 +33,9 @@ pub struct Config {
     pub tab_width: usize,
     /// Line-number gutter: off, absolute, or relative-to-cursor.
     pub line_numbers: LineNumbers,
+    /// Render markdown by hiding syntax markers on every line except the one the
+    /// cursor is on, which shows full source.
+    pub render_markdown: bool,
     pub keymap: Keymap,
 }
 
@@ -66,6 +69,7 @@ impl Default for Config {
             font_size: 15.0,
             tab_width: 2,
             line_numbers: LineNumbers::Off,
+            render_markdown: true,
             keymap: Keymap::default(),
         }
     }
