@@ -235,6 +235,8 @@ impl Vim {
                 vec![]
             }
             ("x", _) => vec![Action::DeleteCharUnder(self.take_count())],
+            // `s`: substitute — delete char(s) under cursor, then insert.
+            ("s", false) => self.enter_insert(vec![Action::DeleteCharUnder(self.take_count())]),
             ("d", false) => {
                 self.pending = Pending::Operator(Op::Delete);
                 vec![]
