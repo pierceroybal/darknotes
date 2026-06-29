@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -45,8 +46,12 @@ pub struct Editor {
     message: Option<String>,
     /// Pane that receives keystrokes (`Ctrl-W h`/`l` switches).
     pane: Pane,
-    /// Sidebar cursor (the row `j`/`k` move); meaningful while in `Pane::Sidebar`.
+    /// Sidebar cursor as an index into the currently *visible* rows (folders +
+    /// expanded contents); meaningful while in `Pane::Sidebar`.
     selected: usize,
+    /// Folder paths the user has expanded in the sidebar tree. Keyed by path so
+    /// it survives a re-scan; stale entries for vanished folders are harmless.
+    expanded: HashSet<PathBuf>,
     /// Drives the sidebar list's scroll position (wheel + scroll-to-selected).
     sidebar_scroll: UniformListScrollHandle,
     /// Sidebar cursor at the last render; a change scrolls it into view.
@@ -94,14 +99,28 @@ impl Editor {
             &config.keymap.insert_exit,
             config.keymap.timeoutlen,
         );
+        // Open the tree to the initial file and park the sidebar cursor on it.
+        let mut expanded = HashSet::new();
+        let selected = doc
+            .path()
+            .map(|p| {
+                expand_ancestors(&vault.root, p, &mut expanded);
+                vault
+                    .visible_rows(&expanded)
+                    .iter()
+                    .position(|r| r.path == p)
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
         Self {
             doc,
             vim,
             focus: cx.focus_handle(),
             vault,
-            selected: current.unwrap_or(0),
+            selected,
+            expanded,
             sidebar_scroll: UniformListScrollHandle::new(),
-            last_selected: current.unwrap_or(0),
+            last_selected: selected,
             current,
             message: None,
             pane: Pane::Editor,
@@ -120,6 +139,23 @@ impl Editor {
             return;
         };
         self.load(open_or_empty(&path), Some(i), window);
+    }
+
+    /// Open a file by path (sidebar click / Enter), pointing `current` at its
+    /// flat-list index so the open-file highlight and `Ctrl-N`/`Ctrl-P` track it.
+    fn open_path(&mut self, path: PathBuf, window: &mut Window) {
+        let idx = self.vault.files.iter().position(|f| f == &path);
+        self.load(open_or_empty(&path), idx, window);
+    }
+
+    /// Expand or collapse a folder, then clamp the cursor — collapsing drops the
+    /// rows beneath it, so `selected` can land past the end.
+    fn toggle(&mut self, dir: PathBuf) {
+        if !self.expanded.remove(&dir) {
+            self.expanded.insert(dir);
+        }
+        let n = self.vault.visible_rows(&self.expanded).len();
+        self.selected = self.selected.min(n.saturating_sub(1));
     }
 
     /// Swap in `doc` as the open buffer: reset vim/scroll state, point `current`
@@ -182,19 +218,38 @@ impl Editor {
         self.open_index(next, window);
     }
 
-    /// Navigate the sidebar (`Pane::Sidebar`): `j`/`k` move the cursor, `l`/Enter
-    /// open the selection in the editor, Escape returns without opening.
+    /// Navigate the sidebar tree (`Pane::Sidebar`): `j`/`k` move the cursor over
+    /// visible rows, `l`/Enter toggles a folder or opens a file, `h` collapses an
+    /// open folder or jumps to the parent folder, Escape returns.
     fn sidebar_key(&mut self, key: &str, window: &mut Window) {
-        let n = self.vault.files.len();
-        if n == 0 {
+        let rows = self.vault.visible_rows(&self.expanded);
+        if rows.is_empty() {
             return;
         }
+        self.selected = self.selected.min(rows.len() - 1);
         match key {
-            "j" | "down" => self.selected = (self.selected + 1).min(n - 1),
+            "j" | "down" => self.selected = (self.selected + 1).min(rows.len() - 1),
             "k" | "up" => self.selected = self.selected.saturating_sub(1),
             "l" | "enter" => {
-                self.open_index(self.selected, window); // refocuses the editor pane
-                self.pane = Pane::Editor;
+                let row = &rows[self.selected];
+                if row.is_dir {
+                    self.toggle(row.path.clone());
+                } else {
+                    self.open_path(row.path.clone(), window); // refocuses the editor pane
+                    self.pane = Pane::Editor;
+                }
+            }
+            "h" => {
+                let row = &rows[self.selected];
+                if row.is_dir && row.expanded {
+                    self.toggle(row.path.clone()); // collapse
+                } else if let Some(parent) = row.path.parent() {
+                    // Jump to the enclosing folder's row; top-level rows have no
+                    // folder parent (the vault root isn't a row), so they stay put.
+                    if let Some(idx) = rows.iter().position(|r| r.is_dir && r.path == parent) {
+                        self.selected = idx;
+                    }
+                }
             }
             "escape" => self.pane = Pane::Editor,
             _ => {}
@@ -214,7 +269,18 @@ impl Editor {
             match key {
                 "h" => {
                     self.pane = Pane::Sidebar;
-                    self.selected = self.current.unwrap_or(0);
+                    // Reveal the open file and park the cursor on it.
+                    if let Some(path) = self.doc.path().map(Path::to_path_buf) {
+                        expand_ancestors(&self.vault.root, &path, &mut self.expanded);
+                        self.selected = self
+                            .vault
+                            .visible_rows(&self.expanded)
+                            .iter()
+                            .position(|r| r.path == path)
+                            .unwrap_or(0);
+                    } else {
+                        self.selected = 0;
+                    }
                 }
                 "l" => self.pane = Pane::Editor,
                 _ => {}
@@ -351,6 +417,9 @@ impl Editor {
         self.vault = Vault::scan(self.vault.root.clone());
         let open = self.doc.path().map(Path::to_path_buf);
         self.current = open.and_then(|p| self.vault.files.iter().position(|f| f == &p));
+        // The tree may have shrunk; keep the sidebar cursor in range.
+        let n = self.vault.visible_rows(&self.expanded).len();
+        self.selected = self.selected.min(n.saturating_sub(1));
     }
 
     /// `:w` with no arg writes the backing file; `:w <name>` saves as `<name>`,
@@ -459,6 +528,19 @@ fn open_or_empty(path: &Path) -> Document {
     })
 }
 
+/// Mark every folder between the vault `root` and `path` as expanded, so a
+/// nested file's row is visible. `root` itself isn't a row, so it's excluded.
+fn expand_ancestors(root: &Path, path: &Path, set: &mut HashSet<PathBuf>) {
+    let mut cur = path.parent();
+    while let Some(dir) = cur {
+        if dir == root || !dir.starts_with(root) {
+            break;
+        }
+        set.insert(dir.to_path_buf());
+        cur = dir.parent();
+    }
+}
+
 impl Focusable for Editor {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -535,11 +617,10 @@ impl Render for Editor {
             format!("{mode_label}  {name}{dirty}")
         };
 
-        let root = self.vault.root.clone();
-        let current = self.current;
+        let open_path = self.doc.path().map(Path::to_path_buf);
         let cursor = (self.pane == Pane::Sidebar).then_some(self.selected);
-        let files = self.vault.files.clone();
-        let file_count = files.len();
+        let rows = self.vault.visible_rows(&self.expanded);
+        let row_count = rows.len();
         let entity = cx.entity();
 
         div()
@@ -557,34 +638,51 @@ impl Render for Editor {
             .text_size(px(self.font_size))
             .line_height(px(self.font_size * 22.0 / 15.0))
             .child(
-                uniform_list("sidebar", file_count, move |range, _win, _cx| {
+                uniform_list("sidebar", row_count, move |range, _win, _cx| {
                     range
                         .map(|i| {
-                            let label = files[i]
-                                .strip_prefix(&root)
-                                .unwrap_or(files[i].as_path())
-                                .display()
-                                .to_string();
+                            let row = &rows[i];
+                            let is_open_file =
+                                open_path.as_deref() == Some(row.path.as_path());
                             // Sidebar cursor (active pane) outranks open-file highlight.
                             let (bg, fg) = if cursor == Some(i) {
                                 (theme.sidebar_cursor_background, theme.sidebar_active_foreground)
-                            } else if current == Some(i) {
+                            } else if is_open_file {
                                 (theme.sidebar_current_background, theme.sidebar_active_foreground)
                             } else {
                                 (theme.sidebar_background, theme.sidebar_foreground)
                             };
+                            // Folders get a disclosure triangle; files are padded to
+                            // line their names up under sibling folder names.
+                            let label = if row.is_dir {
+                                let tri = if row.expanded { "▾" } else { "▸" };
+                                format!("{tri} {}", row.name)
+                            } else {
+                                format!("  {}", row.name)
+                            };
+                            // Indent one step per tree level; px_2 (8px) is the base.
+                            let indent = px(8. + row.depth as f32 * 14.);
+                            let path = row.path.clone();
+                            let is_dir = row.is_dir;
                             let entity = entity.clone();
                             div()
-                                .px_2()
+                                .pl(indent)
+                                .pr_2()
                                 .bg(bg)
                                 .text_color(fg)
                                 .child(label)
                                 .on_mouse_up(
                                     MouseButton::Left,
                                     move |_ev: &MouseUpEvent, window, cx| {
+                                        let path = path.clone();
                                         entity.update(cx, |this, cx| {
                                             this.selected = i;
-                                            this.open_index(i, window);
+                                            if is_dir {
+                                                this.toggle(path);
+                                            } else {
+                                                this.open_path(path, window);
+                                                this.pane = Pane::Editor;
+                                            }
                                             cx.notify();
                                         });
                                     },
