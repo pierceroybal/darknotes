@@ -7,6 +7,9 @@
 # will set this for you when you pick a vault.)
 # vault = "~/notes"
 
+# Color palette: "dark" (default) or "light".
+theme = "dark"
+
 font_family = "DejaVu Sans Mono"
 font_size   = 15
 tab_width    = 2   # spaces inserted for Tab

@@ -24,6 +24,9 @@ const DEFAULT_CONFIG: &str = include_str!("../config.default.toml");
 pub struct Config {
     /// Vault opened when no path is given on the CLI. `~` expands to `$HOME`.
     pub vault: Option<String>,
+    /// Built-in palette name (`"dark"`/`"light"`), resolved via `Theme::by_name`.
+    /// An unknown name warns and falls back to the default at startup.
+    pub theme: String,
     pub font_family: String,
     pub font_size: f32,
     /// Spaces inserted for a Tab (markdown has no literal tabs).
@@ -45,6 +48,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             vault: None,
+            theme: "dark".into(),
             font_family: "DejaVu Sans Mono".into(),
             font_size: 15.0,
             tab_width: 2,
@@ -141,6 +145,7 @@ mod tests {
     fn empty_config_is_all_defaults() {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.tab_width, 2);
+        assert_eq!(c.theme, "dark");
         assert!(c.keymap.insert_exit.is_empty());
     }
 

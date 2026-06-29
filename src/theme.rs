@@ -1,9 +1,9 @@
 use gpui::{rgb, Global, Hsla};
 
-/// The one semantic color palette. Every rendered color reads from here instead
-/// of a hardcoded hex, so a theme swap is a single `cx.set_global(Theme)` and
-/// (later) config can override it. Stored as a GPUI global: set once at startup,
-/// read in `Editor::render` and `LineElement::paint`.
+/// A semantic color palette. Every rendered color reads from here instead of a
+/// hardcoded hex, so a theme swap is a single `cx.set_global(Theme)`. Stored as
+/// a GPUI global: set once at startup from the configured `theme` name, read in
+/// `Editor::render` and `LineElement::paint`. New palette = a `by_name` arm.
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub background: Hsla,
@@ -27,8 +27,18 @@ pub struct Theme {
 
 impl Global for Theme {}
 
-impl Default for Theme {
-    fn default() -> Self {
+impl Theme {
+    /// Resolve a config `theme = "<name>"` to a built-in palette. `None` for an
+    /// unknown name, so the caller can warn and fall back to the default.
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name {
+            "dark" => Some(Self::dark()),
+            "light" => Some(Self::light()),
+            _ => None,
+        }
+    }
+
+    fn dark() -> Self {
         Self {
             background: rgb(0x1a1a1a).into(),
             foreground: rgb(0xcccccc).into(),
@@ -42,5 +52,43 @@ impl Default for Theme {
             status_background: rgb(0x2a2a2a).into(),
             status_foreground: rgb(0x888888).into(),
         }
+    }
+
+    fn light() -> Self {
+        Self {
+            background: rgb(0xfbfbfa).into(),
+            foreground: rgb(0x2b2b2b).into(),
+            // Dark amber so the block caret's `background`-painted glyph cutout
+            // still reads against it on a light field.
+            accent: rgb(0xc77800).into(),
+            selection: rgb(0xb3d4fc).into(),
+            sidebar_background: rgb(0xf0f0ee).into(),
+            sidebar_foreground: rgb(0x6b6b6b).into(),
+            sidebar_active_foreground: rgb(0x1a1a1a).into(),
+            sidebar_current_background: rgb(0xdde7f5).into(),
+            sidebar_cursor_background: rgb(0xc7d4ee).into(),
+            status_background: rgb(0xe9e9e6).into(),
+            status_foreground: rgb(0x555555).into(),
+        }
+    }
+}
+
+impl Default for Theme {
+    /// The dark palette is the default — first-run config and the fallback for
+    /// an unknown configured name.
+    fn default() -> Self {
+        Self::dark()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_names_resolve_unknown_is_none() {
+        assert!(Theme::by_name("dark").is_some());
+        assert!(Theme::by_name("light").is_some());
+        assert!(Theme::by_name("nope").is_none());
     }
 }

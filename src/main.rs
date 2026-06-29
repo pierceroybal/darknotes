@@ -23,7 +23,11 @@ fn main() {
 
     Application::new().run(|cx: &mut App| {
         let config = Config::load();
-        cx.set_global(theme::Theme::default());
+        let theme = theme::Theme::by_name(&config.theme).unwrap_or_else(|| {
+            eprintln!("darknotes: unknown theme {:?}; using default", config.theme);
+            theme::Theme::default()
+        });
+        cx.set_global(theme);
 
         // A directory argument opens a vault; a file argument opens that file
         // with its parent as the vault. With no argument, fall back to the
