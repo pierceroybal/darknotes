@@ -116,6 +116,9 @@ impl Document {
     /// Write the buffer to its backing file. No-op for an unnamed buffer.
     pub fn save(&mut self) -> io::Result<()> {
         if let Some(path) = &self.path {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
             std::fs::write(path, self.rope.to_string())?;
             self.dirty = false;
         }
