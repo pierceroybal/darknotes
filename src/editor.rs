@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, fill, point, prelude::*, px, relative, size, uniform_list, AnyElement, App, Bounds,
+    div, fill, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
     ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle, FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
     MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task, TextRun,
@@ -47,6 +47,10 @@ pub struct Editor {
     pane: Pane,
     /// Sidebar cursor (the row `j`/`k` move); meaningful while in `Pane::Sidebar`.
     selected: usize,
+    /// Drives the sidebar list's scroll position (wheel + scroll-to-selected).
+    sidebar_scroll: UniformListScrollHandle,
+    /// Sidebar cursor at the last render; a change scrolls it into view.
+    last_selected: usize,
     /// `Ctrl-W` was the previous key; the next key picks a pane.
     pending_window: bool,
     /// Drives the editor line list's scroll position (wheel + scroll-to-cursor).
@@ -96,6 +100,8 @@ impl Editor {
             focus: cx.focus_handle(),
             vault,
             selected: current.unwrap_or(0),
+            sidebar_scroll: UniformListScrollHandle::new(),
+            last_selected: current.unwrap_or(0),
             current,
             message: None,
             pane: Pane::Editor,
@@ -479,6 +485,22 @@ impl Render for Editor {
             self.last_line = cur_line;
         }
 
+        // Keep the sidebar cursor on screen as `j`/`k` move it past the viewport.
+        // Only while the sidebar drives keys, so a click (which switches to the
+        // editor) and the mouse wheel don't snap it back. Direction picks the edge
+        // like the editor above: down lands at the bottom, up at the top.
+        if self.selected != self.last_selected {
+            if self.pane == Pane::Sidebar {
+                let strategy = if self.selected > self.last_selected {
+                    ScrollStrategy::Bottom
+                } else {
+                    ScrollStrategy::Top
+                };
+                self.sidebar_scroll.scroll_to_item(self.selected, strategy);
+            }
+            self.last_selected = self.selected;
+        }
+
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
         // ponytail: full re-scan each render (≈ per keystroke). Markdown docs are
@@ -501,10 +523,13 @@ impl Render for Editor {
                 Mode::VisualLine => "VISUAL LINE",
                 _ => "NORMAL",
             };
+            // Basename only — the sidebar shows the location. ponytail: drop this
+            // from the status line entirely once tabs/buffers display the basename.
             let name = self
                 .doc
                 .path()
-                .map(|p| p.display().to_string())
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "[No Name]".to_string());
             let dirty = if self.doc.is_dirty() { " [+]" } else { "" };
             format!("{mode_label}  {name}{dirty}")
@@ -513,41 +538,9 @@ impl Render for Editor {
         let root = self.vault.root.clone();
         let current = self.current;
         let cursor = (self.pane == Pane::Sidebar).then_some(self.selected);
-        let rows: Vec<AnyElement> = self
-            .vault
-            .files
-            .iter()
-            .enumerate()
-            .map(|(i, path)| {
-                let label = path
-                    .strip_prefix(&root)
-                    .unwrap_or(path.as_path())
-                    .display()
-                    .to_string();
-                // Sidebar cursor (active pane) outranks the open-file highlight.
-                let (bg, fg) = if cursor == Some(i) {
-                    (theme.sidebar_cursor_background, theme.sidebar_active_foreground)
-                } else if current == Some(i) {
-                    (theme.sidebar_current_background, theme.sidebar_active_foreground)
-                } else {
-                    (theme.sidebar_background, theme.sidebar_foreground)
-                };
-                div()
-                    .px_2()
-                    .bg(bg)
-                    .text_color(fg)
-                    .child(label)
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(move |this, _ev: &MouseUpEvent, window, cx| {
-                            this.selected = i;
-                            this.open_index(i, window);
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element()
-            })
-            .collect();
+        let files = self.vault.files.clone();
+        let file_count = files.len();
+        let entity = cx.entity();
 
         div()
             .track_focus(&self.focus)
@@ -564,19 +557,55 @@ impl Render for Editor {
             .text_size(px(self.font_size))
             .line_height(px(self.font_size * 22.0 / 15.0))
             .child(
-                div()
-                    .id("sidebar") // stateful → enables overflow_y_scroll
-                    .w(px(220.))
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .bg(theme.sidebar_background)
-                    .overflow_y_scroll()
-                    .children(rows),
+                uniform_list("sidebar", file_count, move |range, _win, _cx| {
+                    range
+                        .map(|i| {
+                            let label = files[i]
+                                .strip_prefix(&root)
+                                .unwrap_or(files[i].as_path())
+                                .display()
+                                .to_string();
+                            // Sidebar cursor (active pane) outranks open-file highlight.
+                            let (bg, fg) = if cursor == Some(i) {
+                                (theme.sidebar_cursor_background, theme.sidebar_active_foreground)
+                            } else if current == Some(i) {
+                                (theme.sidebar_current_background, theme.sidebar_active_foreground)
+                            } else {
+                                (theme.sidebar_background, theme.sidebar_foreground)
+                            };
+                            let entity = entity.clone();
+                            div()
+                                .px_2()
+                                .bg(bg)
+                                .text_color(fg)
+                                .child(label)
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    move |_ev: &MouseUpEvent, window, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.selected = i;
+                                            this.open_index(i, window);
+                                            cx.notify();
+                                        });
+                                    },
+                                )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .track_scroll(self.sidebar_scroll.clone())
+                .w(px(220.))
+                .h_full()
+                .flex_shrink_0() // never let a wide editor pane squeeze the sidebar
+                .bg(theme.sidebar_background),
             )
             .child(
                 div()
                     .flex_1()
+                    // A flex item's min width is its content's min-content width, so
+                    // an unwrapped status line (long name/message) would push the row
+                    // wider than the window and shove the sidebar off. Allow shrink to
+                    // 0 and clip the status line instead.
+                    .min_w_0()
                     .h_full()
                     .flex()
                     .flex_col()
@@ -603,6 +632,7 @@ impl Render for Editor {
                         div()
                             .w_full()
                             .px_2()
+                            .truncate() // clip an over-long status line, don't grow the layout
                             .bg(theme.status_background)
                             .text_color(theme.status_foreground)
                             .child(bar),
