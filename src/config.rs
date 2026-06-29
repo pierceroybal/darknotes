@@ -31,7 +31,20 @@ pub struct Config {
     pub font_size: f32,
     /// Spaces inserted for a Tab (markdown has no literal tabs).
     pub tab_width: usize,
+    /// Line-number gutter: off, absolute, or relative-to-cursor.
+    pub line_numbers: LineNumbers,
     pub keymap: Keymap,
+}
+
+/// Line-number gutter mode. `relative` is hybrid: the cursor line shows its
+/// absolute number, others show the distance to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineNumbers {
+    #[default]
+    Off,
+    Absolute,
+    Relative,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,6 +65,7 @@ impl Default for Config {
             font_family: "DejaVu Sans Mono".into(),
             font_size: 15.0,
             tab_width: 2,
+            line_numbers: LineNumbers::Off,
             keymap: Keymap::default(),
         }
     }

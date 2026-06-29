@@ -12,7 +12,7 @@ use gpui::{
     UniformListScrollHandle, Window,
 };
 
-use crate::config::Config;
+use crate::config::{Config, LineNumbers};
 use crate::document::Document;
 use crate::markdown::{self, Span, SpanKind};
 use crate::theme::Theme;
@@ -70,6 +70,8 @@ pub struct Editor {
     /// Editor font, from config.
     font_family: SharedString,
     font_size: f32,
+    /// Line-number gutter mode, from config.
+    line_numbers: LineNumbers,
     /// Pending insert-exit timeout. Held so it stays alive; dropping/replacing it
     /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
     /// buffered lead keys as text.
@@ -130,6 +132,7 @@ impl Editor {
             scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
             font_family: config.font_family.into(),
             font_size: config.font_size,
+            line_numbers: config.line_numbers,
             exit_timer: None,
         }
     }
@@ -590,6 +593,9 @@ impl Render for Editor {
         let spans = markdown::parse(&rope);
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
+        let line_numbers = self.line_numbers;
+        // Gutter wide enough for the largest line number, monospace-aligned.
+        let num_width = line_count.to_string().len().max(3);
         // The selected char-range to highlight, `None` outside visual mode.
         let highlight: Option<(usize, usize)> =
             mode.is_visual().then(|| self.doc.selection_span(mode == Mode::VisualLine));
@@ -710,16 +716,35 @@ impl Render for Editor {
                     .child(
                         uniform_list("lines", line_count, move |range, _win, _cx| {
                             range
-                                .map(|i| LineElement {
-                                    text: line_text(&rope, i).into(),
-                                    spans: spans.get(i).cloned().unwrap_or_default(),
-                                    caret: (i == cur_line).then_some(LineCaret {
-                                        col: cur_col,
-                                        block: mode != Mode::Insert,
-                                    }),
-                                    selection: highlight
-                                        .and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi)),
-                                    scroll_x: scroll_x.clone(),
+                                .map(|i| {
+                                    // Relative mode is hybrid: cursor line shows its
+                                    // absolute number, others the distance to it.
+                                    let gutter = (line_numbers != LineNumbers::Off).then(|| {
+                                        let n = match line_numbers {
+                                            LineNumbers::Relative if i != cur_line => {
+                                                i.abs_diff(cur_line)
+                                            }
+                                            _ => i + 1,
+                                        };
+                                        let color = if i == cur_line {
+                                            theme.foreground
+                                        } else {
+                                            theme.muted
+                                        };
+                                        (format!(" {n:>num_width$}  ").into(), color)
+                                    });
+                                    LineElement {
+                                        text: line_text(&rope, i).into(),
+                                        spans: spans.get(i).cloned().unwrap_or_default(),
+                                        caret: (i == cur_line).then_some(LineCaret {
+                                            col: cur_col,
+                                            block: mode != Mode::Insert,
+                                        }),
+                                        selection: highlight
+                                            .and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi)),
+                                        scroll_x: scroll_x.clone(),
+                                        gutter,
+                                    }
                                 })
                                 .collect()
                         })
@@ -774,10 +799,16 @@ struct LineElement {
     /// Shared horizontal scroll offset. The cursor line writes it (prepaint),
     /// every line reads it (paint) — see `Editor::scroll_x`.
     scroll_x: Rc<Cell<Pixels>>,
+    /// Pre-formatted line-number string and its color. `None` when the gutter is
+    /// off. Painted at a fixed left position; the text is shifted right past it.
+    gutter: Option<(SharedString, Hsla)>,
 }
 
 struct LinePrepaint {
     shaped: ShapedLine,
+    /// Shaped line-number gutter and its width; `None` when the gutter is off.
+    gutter: Option<ShapedLine>,
+    gutter_w: Pixels,
     /// `(x within the line, width)` of the selection quad; `None` if unselected.
     selection: Option<(Pixels, Pixels)>,
     /// `(x within the line, width)` of the caret quad; `None` off the cursor line.
@@ -838,6 +869,15 @@ impl Element for LineElement {
         // cursor moves; the caret below is an overlay that re-shapes nothing.
         let theme = *cx.global::<Theme>();
         let runs = spans_to_runs(&self.text, &self.spans, &font, fg, &theme);
+        // Shape the line-number gutter (if any). It sits at a fixed left position
+        // and never scrolls, so the text below is shifted right by its width.
+        let gutter = self.gutter.as_ref().map(|(text, color)| {
+            let runs = [run(&font, text.len(), *color)];
+            window
+                .text_system()
+                .shape_line(text.clone(), font_size, &runs, None)
+        });
+        let gutter_w = gutter.as_ref().map_or(Pixels::ZERO, |g| g.width);
         let shaped = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
@@ -853,7 +893,7 @@ impl Element for LineElement {
                 // offset back to 0 on its own.
                 // ponytail: margin ≈ 2 chars; no mouse-wheel/`zh`/`zl` scroll yet.
                 let margin = font_size * 2.;
-                let viewport = bounds.size.width;
+                let viewport = bounds.size.width - gutter_w;
                 let mut s = self.scroll_x.get();
                 if x < s + margin {
                     s = x - margin;
@@ -899,6 +939,8 @@ impl Element for LineElement {
 
         LinePrepaint {
             shaped,
+            gutter,
+            gutter_w,
             selection,
             caret,
             caret_glyph,
@@ -916,12 +958,22 @@ impl Element for LineElement {
         cx: &mut App,
     ) {
         let line_height = window.line_height();
-        // Shift everything left by the horizontal scroll offset, then clip to the
-        // line's box so left-overflow doesn't bleed onto the sidebar and
-        // right-overflow stops at the pane edge.
-        let ox = bounds.origin.x - self.scroll_x.get();
         let theme = *cx.global::<Theme>();
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        // The gutter sits flush left and never scrolls; paint it first, outside
+        // the text's clip so scrolled text can't bleed over it.
+        if let Some(gutter) = &prepaint.gutter {
+            let _ = gutter.paint(bounds.origin, line_height, window, cx);
+        }
+        // Text starts past the gutter and shifts left by the horizontal scroll
+        // offset; clip to the area right of the gutter so left-overflow stops at
+        // the gutter and right-overflow stops at the pane edge.
+        let text_origin_x = bounds.origin.x + prepaint.gutter_w;
+        let ox = text_origin_x - self.scroll_x.get();
+        let text_bounds = Bounds::new(
+            point(text_origin_x, bounds.origin.y),
+            size(bounds.size.width - prepaint.gutter_w, bounds.size.height),
+        );
+        window.with_content_mask(Some(ContentMask { bounds: text_bounds }), |window| {
             // Selection highlight sits under everything; then the caret quad, the
             // line, and the inverted caret glyph on top so it reads dark against
             // the accent block.

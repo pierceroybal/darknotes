@@ -14,6 +14,10 @@ font_family = "DejaVu Sans Mono"
 font_size   = 15
 tab_width    = 2   # spaces inserted for Tab
 
+# Line-number gutter: "off" (default), "absolute", or "relative". "relative" is
+# hybrid — the cursor line shows its absolute number, others the distance to it.
+line_numbers = "off"
+
 [keymap]
 # Insert-mode key sequence that acts as <Esc> (e.g. "jf"). Disabled by default —
 # uncomment to enable. <Esc> always exits regardless.
