@@ -162,15 +162,8 @@ impl Editor {
         }
     }
 
-    fn open_index(&mut self, i: usize, window: &mut Window) {
-        let Some(path) = self.vault.files.get(i).cloned() else {
-            return;
-        };
-        self.load(open_or_empty(&path), Some(i), window);
-    }
-
-    /// Open a file by path (sidebar click / Enter), pointing `current` at its
-    /// flat-list index so the open-file highlight and `Ctrl-N`/`Ctrl-P` track it.
+    /// Open a file by path (sidebar click / Enter / switcher), pointing `current`
+    /// at its flat-list index so the open-file highlight tracks it.
     fn open_path(&mut self, path: PathBuf, window: &mut Window) {
         let idx = self.vault.files.iter().position(|f| f == &path);
         self.load(open_or_empty(&path), idx, window);
@@ -236,16 +229,6 @@ impl Editor {
         self.load(Document::new(""), None, window);
     }
 
-    fn open_relative(&mut self, delta: isize, window: &mut Window) {
-        let n = self.vault.files.len();
-        if n == 0 {
-            return;
-        }
-        let cur = self.current.unwrap_or(0) as isize;
-        let next = (cur + delta).rem_euclid(n as isize) as usize;
-        self.open_index(next, window);
-    }
-
     /// Open the fuzzy switcher over a snapshot of the current vault files.
     fn open_switcher(&mut self) {
         let root = self.vault.root.clone();
@@ -268,7 +251,7 @@ impl Editor {
 
     /// Keystrokes while the switcher is open. Mirrors `vim::command_key`: printable
     /// chars extend the query, Backspace trims it, Esc cancels, Enter opens the
-    /// pick; `Up`/`Down` (and `Ctrl-P`/`Ctrl-N`) move the highlight.
+    /// pick; `Up`/`Down` (and `Ctrl-J`/`Ctrl-K`) move the highlight.
     fn switcher_key(&mut self, ev: &KeyDownEvent, window: &mut Window) {
         let m = ev.keystroke.modifiers;
         match ev.keystroke.key.as_str() {
@@ -292,8 +275,8 @@ impl Editor {
             }
             "down" => self.move_switcher(1),
             "up" => self.move_switcher(-1),
-            "n" if m.control => self.move_switcher(1),
-            "p" if m.control => self.move_switcher(-1),
+            "j" if m.control => self.move_switcher(1),
+            "k" if m.control => self.move_switcher(-1),
             _ if !m.control && !m.alt && !m.platform => {
                 if let Some(s) = ev.keystroke.key_char.clone() {
                     if let Some(sw) = self.switcher.as_mut() {
@@ -467,18 +450,11 @@ impl Editor {
             return;
         }
 
-        // App-level shortcuts. Ctrl-P opens the fuzzy switcher; Ctrl-S mirrors
-        // `:w`. ponytail: Ctrl-N next-file cycling is a stopgap, retire it once
-        // the switcher covers navigation.
+        // App-level shortcuts. Ctrl-P opens the fuzzy switcher; Ctrl-S mirrors `:w`.
         if m.control && !m.alt && !m.platform {
             match ev.keystroke.key.as_str() {
                 "s" => {
                     self.save(None);
-                    cx.notify();
-                    return;
-                }
-                "n" => {
-                    self.open_relative(1, window);
                     cx.notify();
                     return;
                 }
