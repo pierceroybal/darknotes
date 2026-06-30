@@ -48,6 +48,14 @@ pub enum Motion {
     FileEnd,
 }
 
+impl Motion {
+    /// Line-wise vertical moves, which track the goal column instead of the
+    /// caret's live column.
+    fn is_vertical(self) -> bool {
+        matches!(self, Motion::LineUp | Motion::LineDown)
+    }
+}
+
 /// The unnamed register: text from the last delete/yank, replayed by `p`/`P`.
 /// `linewise` (from `dd`/`yy`) pastes on new lines; charwise pastes inline.
 #[derive(Clone, Default)]
@@ -80,6 +88,10 @@ pub struct Document {
     /// States before each change (`u` pops); `redo` is the inverse (`Ctrl-R`).
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
+    /// Vim's "want" column for vertical motion. `j`/`k` aim for it (clamped to
+    /// each line), so passing through short lines doesn't truncate the column.
+    /// Any horizontal move or edit resets it to the actual column.
+    goal_col: usize,
 }
 
 impl Document {
@@ -92,6 +104,7 @@ impl Document {
             register: Register::default(),
             undo: Vec::new(),
             redo: Vec::new(),
+            goal_col: 0,
         }
     }
 
@@ -112,6 +125,7 @@ impl Document {
             register: Register::default(),
             undo: Vec::new(),
             redo: Vec::new(),
+            goal_col: 0,
         })
     }
 
@@ -147,6 +161,7 @@ impl Document {
 
     fn set_caret(&mut self, at: usize) {
         self.selections[0] = Selection::caret(at);
+        self.goal_col = self.line_col_of(at).1;
     }
 
     pub fn insert(&mut self, text: &str) {
@@ -225,14 +240,24 @@ impl Document {
 
     pub fn move_motion(&mut self, m: Motion, count: usize) {
         let target = self.motion_target(m, self.caret(), count);
-        self.set_caret(target);
+        // Vertical motion preserves the goal column; set_caret would reset it.
+        if m.is_vertical() {
+            self.selections[0] = Selection::caret(target);
+        } else {
+            self.set_caret(target);
+        }
     }
 
     /// Visual mode: move the selection's head, leaving the anchor fixed so the
     /// span grows/shrinks.
     pub fn extend_motion(&mut self, m: Motion, count: usize) {
         let head = self.selections[0].head;
-        self.selections[0].head = self.motion_target(m, head, count);
+        let target = self.motion_target(m, head, count);
+        self.selections[0].head = target;
+        // Mirror move_motion: vertical keeps the goal column, else it's redefined.
+        if !m.is_vertical() {
+            self.goal_col = self.line_col_of(target).1;
+        }
     }
 
     /// Collapse the primary selection to a bare caret at its head (leaving visual).
@@ -457,13 +482,13 @@ impl Document {
                 self.rope.line_to_char(line) + (col + count).min(max)
             }
             Motion::LineUp => {
-                let (line, col) = self.line_col_of(from);
-                self.offset_in_line(line.saturating_sub(count), col)
+                let (line, _) = self.line_col_of(from);
+                self.offset_in_line(line.saturating_sub(count), self.goal_col)
             }
             Motion::LineDown => {
-                let (line, col) = self.line_col_of(from);
+                let (line, _) = self.line_col_of(from);
                 let last = self.rope.len_lines().saturating_sub(1);
-                self.offset_in_line((line + count).min(last), col)
+                self.offset_in_line((line + count).min(last), self.goal_col)
             }
             Motion::LineStart => {
                 let (line, _) = self.line_col_of(from);
@@ -628,6 +653,21 @@ mod tests {
         d.move_motion(Motion::CharRight, 5);
         d.move_motion(Motion::LineDown, 1);
         assert_eq!(d.caret_line_col(), (1, 2));
+    }
+
+    #[test]
+    fn vertical_move_keeps_goal_column_past_short_line() {
+        // Col 4, down through empty line, down to a long line → lands back at 4.
+        let mut d = Document::new("abcdef\n\nuvwxyz");
+        d.move_motion(Motion::CharRight, 4);
+        d.move_motion(Motion::LineDown, 1);
+        assert_eq!(d.caret_line_col(), (1, 0)); // clamped to empty line
+        d.move_motion(Motion::LineDown, 1);
+        assert_eq!(d.caret_line_col(), (2, 4)); // goal column restored
+        // A horizontal move redefines the goal column.
+        d.move_motion(Motion::CharLeft, 2);
+        d.move_motion(Motion::LineUp, 2);
+        assert_eq!(d.caret_line_col(), (0, 2));
     }
 
     #[test]
