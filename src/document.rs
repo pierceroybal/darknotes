@@ -2,6 +2,8 @@ use ropey::Rope;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::markdown::{self, ListContinuation};
+
 /// A caret or selection, in absolute char offsets. `anchor == head` is a bare
 /// caret. Plural in `Document` from day one so multi-cursor / helix
 /// selection-first land without a rewrite. Phase 2 still keeps exactly one.
@@ -152,6 +154,26 @@ impl Document {
         self.rope.insert(at, text);
         self.dirty = true;
         self.set_caret(at + text.chars().count());
+    }
+
+    /// Smart newline: continue a markdown list when the caret's line is a list
+    /// item, else a plain newline. The list prefix lands at the caret, so the
+    /// text after it follows the new marker (splitting an item mid-line works).
+    /// `clear_empty` (Enter, not `o`) erases the marker of an empty item rather
+    /// than repeating it — the way out of a list.
+    pub fn insert_newline(&mut self, clear_empty: bool) {
+        let (line, _) = self.line_col_of(self.caret());
+        let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
+        match markdown::list_continuation(&text) {
+            ListContinuation::Item { empty, .. } if empty && clear_empty => {
+                let start = self.rope.line_to_char(line);
+                self.rope.remove(start..start + self.line_len_chars(line));
+                self.dirty = true;
+                self.set_caret(start);
+            }
+            ListContinuation::Item { prefix, .. } => self.insert(&format!("\n{prefix}")),
+            ListContinuation::Plain => self.insert("\n"),
+        }
     }
 
     /// Backspace: remove the char before the caret (crosses lines).
@@ -707,6 +729,32 @@ mod tests {
         assert_eq!(d.rope.to_string(), "hello");
         d.redo();
         assert_eq!(d.rope.to_string(), "ello");
+    }
+
+    #[test]
+    fn smart_newline_continues_and_clears_lists() {
+        // Continue a bullet: caret at EOL of "- foo", Enter → new "- " below.
+        let mut d = Document::new("- foo");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true);
+        assert_eq!(d.rope.to_string(), "- foo\n- ");
+        assert_eq!(d.caret_line_col(), (1, 2));
+
+        // Enter on an empty item clears the marker (exits the list).
+        d.insert_newline(true);
+        assert_eq!(d.rope.to_string(), "- foo\n");
+
+        // `o`-style newline (clear_empty=false) keeps the empty marker instead.
+        let mut d = Document::new("- ");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(false);
+        assert_eq!(d.rope.to_string(), "- \n- ");
+
+        // A non-list line just splits.
+        let mut d = Document::new("plain");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true);
+        assert_eq!(d.rope.to_string(), "plain\n");
     }
 
     #[test]

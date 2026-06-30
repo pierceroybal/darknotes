@@ -21,6 +21,10 @@ pub enum Action {
     /// Collapse the selection back to a caret (leaving visual mode).
     CollapseSelection,
     InsertText(String),
+    /// A newline that continues a markdown list (Enter, `o`). `clear_empty` (Enter
+    /// only) drops the marker of an empty item instead of repeating it; the editor
+    /// owns the list logic since the grammar can't see buffer text.
+    Newline { clear_empty: bool },
     DeleteBackward,
     DeleteForward,
     Undo,
@@ -53,6 +57,7 @@ impl Action {
                 | Action::DeleteSelection { .. }
                 | Action::Paste { .. }
                 | Action::InsertText(..)
+                | Action::Newline { .. }
                 | Action::DeleteBackward
                 | Action::DeleteForward
         )
@@ -273,7 +278,7 @@ impl Vim {
             ("a", true) => self.enter_insert(vec![Action::Move(Motion::LineEnd, 1)]),
             ("o", false) => self.enter_insert(vec![
                 Action::Move(Motion::LineEnd, 1),
-                Action::InsertText("\n".into()),
+                Action::Newline { clear_empty: false },
             ]),
             ("o", true) => self.enter_insert(vec![
                 Action::Move(Motion::LineStart, 1),
@@ -437,7 +442,7 @@ impl Vim {
             "down" => out.push(Action::Move(Motion::LineDown, 1)),
             "backspace" => out.push(Action::DeleteBackward),
             "delete" => out.push(Action::DeleteForward),
-            "enter" => out.push(Action::InsertText("\n".into())),
+            "enter" => out.push(Action::Newline { clear_empty: true }),
             // Opinionated: a markdown buffer has no literal tabs — Tab inserts
             // `tab_width` spaces. Shift-Tab is left unhandled, reserved for dedent.
             "tab" if !m.shift => out.push(Action::InsertText(self.tab.clone())),

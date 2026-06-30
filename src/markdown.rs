@@ -156,6 +156,37 @@ fn list_marker(trimmed: &str) -> Option<usize> {
     None
 }
 
+/// How a smart newline should treat the line under the caret. The vim grammar
+/// can't see buffer text, so list continuation is decided here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListContinuation {
+    /// Not a list item — a plain newline.
+    Plain,
+    /// A list item. `prefix` (indent + marker + space) carries onto the next
+    /// line; `empty` means the item had no content, so the caller may clear the
+    /// marker instead of repeating it.
+    Item { prefix: String, empty: bool },
+}
+
+/// Decide how Enter / `o` continues a markdown list from `line` (newline
+/// stripped). Ordered markers increment (`1.` → `2.`); unordered repeat the
+/// bullet. Checkbox state isn't modeled, so `- [ ]` continues as a plain bullet.
+pub fn list_continuation(line: &str) -> ListContinuation {
+    let trimmed = line.trim_start();
+    let Some(marker_len) = list_marker(trimmed) else {
+        return ListContinuation::Plain;
+    };
+    let indent = &line[..line.len() - trimmed.len()];
+    let marker = &trimmed[..marker_len];
+    // Content past the marker and its single trailing space (all ASCII so far).
+    let empty = trimmed[marker_len + 1..].trim().is_empty();
+    let next = match marker[..marker_len - 1].parse::<u64>() {
+        Ok(n) => format!("{}{}", n + 1, &marker[marker_len - 1..]), // ordered: bump number
+        Err(_) => marker.to_string(),                               // unordered: repeat bullet
+    };
+    ListContinuation::Item { prefix: format!("{indent}{next} "), empty }
+}
+
 /// Single left-to-right pass for inline `code` and `**strong**`, emitting a
 /// `Marker` for each delimiter and the kind for the inner text. Backtick code is
 /// matched first so `**` inside it stays literal. ASCII delimiters only, so
@@ -347,6 +378,26 @@ mod tests {
         assert!(spans[1].iter().any(|s| s.kind == SpanKind::CodeFence));
         assert!(spans[2].iter().any(|s| s.kind == SpanKind::CodeText));
         assert!(spans[3].iter().any(|s| s.kind == SpanKind::CodeFence));
+    }
+
+    #[test]
+    fn list_continuation_cases() {
+        use ListContinuation::*;
+        assert_eq!(list_continuation("plain text"), Plain);
+        assert_eq!(
+            list_continuation("  - item"),
+            Item { prefix: "  - ".into(), empty: false }
+        );
+        // Ordered markers increment and keep their punctuation.
+        assert_eq!(
+            list_continuation("3) item"),
+            Item { prefix: "4) ".into(), empty: false }
+        );
+        // An empty item is flagged so Enter can clear it.
+        assert_eq!(
+            list_continuation("- "),
+            Item { prefix: "- ".into(), empty: true }
+        );
     }
 
     #[test]

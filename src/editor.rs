@@ -397,6 +397,7 @@ impl Editor {
             Action::YankLines(n) => self.doc.yank_lines(n),
             Action::Paste { after } => self.doc.paste(after),
             Action::InsertText(s) => self.doc.insert(&s),
+            Action::Newline { clear_empty } => self.doc.insert_newline(clear_empty),
             Action::DeleteBackward => self.doc.delete_backward(),
             Action::DeleteForward => self.doc.delete_forward(),
             Action::Undo => self.doc.undo(),
