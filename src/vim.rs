@@ -10,6 +10,9 @@ pub enum Action {
     Move(Motion, usize),
     DeleteMotion(Motion, usize),
     DeleteLines(usize),
+    /// `dj`/`dk`: linewise delete of the caret's line plus `count` adjacent
+    /// lines (`up` = `dk`).
+    DeleteLinesVertical { count: usize, up: bool },
     DeleteCharUnder(usize),
     YankMotion(Motion, usize),
     YankLines(usize),
@@ -57,6 +60,7 @@ impl Action {
             self,
             Action::DeleteMotion(..)
                 | Action::DeleteLines(..)
+                | Action::DeleteLinesVertical { .. }
                 | Action::DeleteCharUnder(..)
                 | Action::DeleteSelection { .. }
                 | Action::Paste { .. }
@@ -531,6 +535,16 @@ impl Vim {
                 Op::Yank => vec![Action::YankMotion(spec.motion, count)],
                 Op::Change => self.enter_insert(vec![Action::DeleteMotion(spec.motion, count)]),
             },
+            // `dj`/`dk`: the line motion isn't an op-target (charwise would be
+            // surprising), so handle it here as a linewise delete. `yj`/`cj` etc.
+            // would join this arm when wanted.
+            Some(spec) if matches!(spec.motion, Motion::LineUp | Motion::LineDown) => match op {
+                Op::Delete => vec![Action::DeleteLinesVertical {
+                    count,
+                    up: matches!(spec.motion, Motion::LineUp),
+                }],
+                _ => vec![],
+            },
             _ => vec![], // unsupported target → abort the operator
         }
     }
@@ -635,6 +649,22 @@ mod tests {
         let mut v = vim();
         v.on_key(&k("d"));
         assert_eq!(v.on_key(&k("w")), vec![Action::DeleteMotion(Motion::WordForward, 1)]);
+    }
+
+    #[test]
+    fn dj_dk_delete_adjacent_lines() {
+        let mut v = vim();
+        v.on_key(&k("d"));
+        assert_eq!(
+            v.on_key(&k("j")),
+            vec![Action::DeleteLinesVertical { count: 1, up: false }]
+        );
+        v.on_key(&k("2"));
+        v.on_key(&k("d"));
+        assert_eq!(
+            v.on_key(&k("k")),
+            vec![Action::DeleteLinesVertical { count: 2, up: true }]
+        );
     }
 
     #[test]

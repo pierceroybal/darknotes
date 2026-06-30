@@ -341,6 +341,36 @@ impl Document {
         self.set_caret(start.min(self.rope.len_chars()));
     }
 
+    /// `dj`/`dk`: delete the caret's line plus `count` lines in a direction
+    /// (`up` = `dk`), linewise. A no-op when there's no line in that direction —
+    /// vim treats `dj` on the last line and `dk` on the first as a failed motion
+    /// rather than deleting the lone line.
+    pub fn delete_lines_dir(&mut self, count: usize, up: bool) {
+        let count = count.max(1);
+        let (line, _) = self.line_col_of(self.caret());
+        let last = self.rope.len_lines().saturating_sub(1);
+        if (up && line == 0) || (!up && line == last) {
+            return;
+        }
+        let (first, last_del) = if up {
+            (line.saturating_sub(count), line)
+        } else {
+            (line, (line + count).min(last))
+        };
+        let start = self.rope.line_to_char(first);
+        let end = if last_del >= last {
+            self.rope.len_chars()
+        } else {
+            self.rope.line_to_char(last_del + 1)
+        };
+        if start < end {
+            self.set_register(self.rope.slice(start..end).to_string(), true);
+            self.rope.remove(start..end);
+            self.dirty = true;
+        }
+        self.set_caret(start.min(self.rope.len_chars()));
+    }
+
     /// `x`: delete `count` chars at the caret, not past end-of-line.
     pub fn delete_char_under(&mut self, count: usize) {
         let from = self.caret();
@@ -700,6 +730,35 @@ mod tests {
         let mut d = Document::new("a\nb\nc");
         d.delete_lines(2);
         assert_eq!(d.rope.to_string(), "c");
+    }
+
+    #[test]
+    fn dj_dk_delete_adjacent_lines() {
+        // dj: current line + the one below.
+        let mut d = Document::new("a\nb\nc\nd");
+        d.move_motion(Motion::LineDown, 1); // line "b"
+        d.delete_lines_dir(1, false);
+        assert_eq!(d.rope.to_string(), "a\nd");
+
+        // dk: current line + the one above.
+        let mut d = Document::new("a\nb\nc\nd");
+        d.move_motion(Motion::LineDown, 2); // line "c"
+        d.delete_lines_dir(1, true);
+        assert_eq!(d.rope.to_string(), "a\nd");
+
+        // Count: 2dj deletes the line plus two below.
+        let mut d = Document::new("a\nb\nc\nd");
+        d.delete_lines_dir(2, false);
+        assert_eq!(d.rope.to_string(), "d");
+
+        // dj on the last line / dk on the first are no-ops (no line to join).
+        let mut d = Document::new("a\nb");
+        d.move_motion(Motion::LineDown, 1); // last line
+        d.delete_lines_dir(1, false);
+        assert_eq!(d.rope.to_string(), "a\nb");
+        d.move_motion(Motion::FileStart, 1); // first line
+        d.delete_lines_dir(1, true);
+        assert_eq!(d.rope.to_string(), "a\nb");
     }
 
     #[test]

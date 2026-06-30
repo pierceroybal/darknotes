@@ -392,6 +392,7 @@ impl Editor {
             Action::CollapseSelection => self.doc.collapse_selection(),
             Action::DeleteMotion(m, n) => self.doc.delete_motion(m, n),
             Action::DeleteLines(n) => self.doc.delete_lines(n),
+            Action::DeleteLinesVertical { count, up } => self.doc.delete_lines_dir(count, up),
             Action::DeleteCharUnder(n) => self.doc.delete_char_under(n),
             Action::YankMotion(m, n) => self.doc.yank_motion(m, n),
             Action::YankLines(n) => self.doc.yank_lines(n),
