@@ -176,6 +176,33 @@ impl Document {
         }
     }
 
+    /// Insert-mode Tab (`dedent` = Shift-Tab). On a list item, Tab shifts the
+    /// whole line right by `width` spaces and Shift-Tab outdents it — so a bullet
+    /// nests regardless of caret column, the caret riding with the content. Off a
+    /// list item, Tab inserts `width` spaces at the caret; Shift-Tab still trims
+    /// leading whitespace.
+    pub fn indent(&mut self, width: usize, dedent: bool) {
+        let caret = self.caret();
+        let (line, col) = self.line_col_of(caret);
+        let start = self.rope.line_to_char(line);
+        let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
+
+        if dedent {
+            let lead = text.chars().take_while(|&c| c == ' ').count().min(width);
+            if lead > 0 {
+                self.rope.remove(start..start + lead);
+                self.dirty = true;
+                self.set_caret(start + col.saturating_sub(lead));
+            }
+        } else if markdown::is_list_item(&text) {
+            self.rope.insert(start, &" ".repeat(width));
+            self.dirty = true;
+            self.set_caret(caret + width);
+        } else {
+            self.insert(&" ".repeat(width));
+        }
+    }
+
     /// Backspace: remove the char before the caret (crosses lines).
     pub fn delete_backward(&mut self) {
         let at = self.caret();
@@ -755,6 +782,27 @@ mod tests {
         d.move_motion(Motion::LineEnd, 1);
         d.insert_newline(true);
         assert_eq!(d.rope.to_string(), "plain\n");
+    }
+
+    #[test]
+    fn smart_tab_shifts_list_lines() {
+        // Tab anywhere on a bullet shifts the whole line; the caret rides along.
+        let mut d = Document::new("- foo");
+        d.move_motion(Motion::LineEnd, 1); // caret at col 5
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "  - foo");
+        assert_eq!(d.caret_line_col(), (0, 7));
+
+        // Shift-Tab outdents.
+        d.indent(2, true);
+        assert_eq!(d.rope.to_string(), "- foo");
+        assert_eq!(d.caret_line_col(), (0, 5));
+
+        // Off a list item, Tab inserts at the caret instead of shifting the line.
+        let mut d = Document::new("foo");
+        d.move_motion(Motion::CharRight, 1);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "f  oo");
     }
 
     #[test]

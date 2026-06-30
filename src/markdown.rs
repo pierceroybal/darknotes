@@ -156,6 +156,12 @@ fn list_marker(trimmed: &str) -> Option<usize> {
     None
 }
 
+/// Whether `line` (newline stripped) is a markdown list item — smart-tab uses
+/// this to decide whether Tab shifts the whole line or inserts at the caret.
+pub fn is_list_item(line: &str) -> bool {
+    list_marker(line.trim_start()).is_some()
+}
+
 /// How a smart newline should treat the line under the caret. The vim grammar
 /// can't see buffer text, so list continuation is decided here.
 #[derive(Clone, Debug, PartialEq, Eq)]

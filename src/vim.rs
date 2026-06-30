@@ -25,6 +25,10 @@ pub enum Action {
     /// only) drops the marker of an empty item instead of repeating it; the editor
     /// owns the list logic since the grammar can't see buffer text.
     Newline { clear_empty: bool },
+    /// Insert-mode Tab (`dedent` = Shift-Tab). On a list item the editor shifts
+    /// the whole line; off one, Tab inserts `width` spaces. The width travels in
+    /// the action since the grammar owns the tab setting.
+    Tab { width: usize, dedent: bool },
     DeleteBackward,
     DeleteForward,
     Undo,
@@ -58,6 +62,7 @@ impl Action {
                 | Action::Paste { .. }
                 | Action::InsertText(..)
                 | Action::Newline { .. }
+                | Action::Tab { .. }
                 | Action::DeleteBackward
                 | Action::DeleteForward
         )
@@ -111,8 +116,8 @@ pub struct Vim {
     pending: Pending,
     /// The `:` command line being typed, valid only in `Mode::Command`.
     command: String,
-    /// Spaces inserted for a Tab (markdown has no literal tabs).
-    tab: String,
+    /// Tab width in spaces (markdown has no literal tabs).
+    tab_width: usize,
     /// Insert-mode key sequence that leaves insert mode (`<Esc>`); empty = off.
     insert_exit: Vec<char>,
     /// `timeoutlen` (ms): how long the editor waits for the sequence to finish
@@ -130,7 +135,7 @@ impl Vim {
             count: None,
             pending: Pending::None,
             command: String::new(),
-            tab: " ".repeat(tab_width),
+            tab_width,
             insert_exit: insert_exit.chars().collect(),
             timeoutlen,
             exit_buf: Vec::new(),
@@ -443,9 +448,11 @@ impl Vim {
             "backspace" => out.push(Action::DeleteBackward),
             "delete" => out.push(Action::DeleteForward),
             "enter" => out.push(Action::Newline { clear_empty: true }),
-            // Opinionated: a markdown buffer has no literal tabs — Tab inserts
-            // `tab_width` spaces. Shift-Tab is left unhandled, reserved for dedent.
-            "tab" if !m.shift => out.push(Action::InsertText(self.tab.clone())),
+            // A markdown buffer has no literal tabs. On a list line the editor
+            // shifts the whole line; elsewhere Tab inserts `tab_width` spaces.
+            // Shift-Tab dedents.
+            "tab" if !m.shift => out.push(Action::Tab { width: self.tab_width, dedent: false }),
+            "tab" if m.shift => out.push(Action::Tab { width: self.tab_width, dedent: true }),
             _ => {}
         }
         out
@@ -750,10 +757,19 @@ mod tests {
     }
 
     #[test]
-    fn tab_inserts_two_spaces() {
+    fn tab_and_shift_tab_emit_tab_action() {
         let mut v = vim();
         v.on_key(&k("i"));
-        assert_eq!(v.on_key(&named("tab")), vec![Action::InsertText("  ".into())]);
+        assert_eq!(
+            v.on_key(&named("tab")),
+            vec![Action::Tab { width: 2, dedent: false }]
+        );
+        let shift_tab = Keystroke {
+            key: "tab".into(),
+            key_char: None,
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&shift_tab), vec![Action::Tab { width: 2, dedent: true }]);
     }
 
     #[test]

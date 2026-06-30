@@ -398,6 +398,7 @@ impl Editor {
             Action::Paste { after } => self.doc.paste(after),
             Action::InsertText(s) => self.doc.insert(&s),
             Action::Newline { clear_empty } => self.doc.insert_newline(clear_empty),
+            Action::Tab { width, dedent } => self.doc.indent(width, dedent),
             Action::DeleteBackward => self.doc.delete_backward(),
             Action::DeleteForward => self.doc.delete_forward(),
             Action::Undo => self.doc.undo(),
