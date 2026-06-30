@@ -5,12 +5,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, fill, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
+    div, fill, hsla, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
     ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle, FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
     MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task, TextRun,
     UniformListScrollHandle, Window,
 };
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as NucleoConfig, Matcher};
 
 use crate::config::{Config, LineNumbers};
 use crate::document::Document;
@@ -28,6 +30,20 @@ const WELCOME: &str =
 enum Pane {
     Editor,
     Sidebar,
+}
+
+/// The open fuzzy file switcher — a modal over the editor. While `Some`, keys
+/// route here (like `Pane::Sidebar`); the query filters the vault file list via
+/// nucleo and `Enter` opens the highlighted pick.
+struct Switcher {
+    query: String,
+    /// `(display, real path)` for every vault file, built once on open. Display
+    /// is the vault-relative path with `.md` dropped — what we match and show.
+    by_display: Vec<(String, PathBuf)>,
+    /// Matches as display strings, best-first; equals `by_display` order when the
+    /// query is empty.
+    results: Vec<String>,
+    selected: usize,
 }
 
 /// The app's main view. Owns the open `Document`, the `Vim` grammar, and the
@@ -78,6 +94,10 @@ pub struct Editor {
     /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
     /// buffered lead keys as text.
     exit_timer: Option<Task<()>>,
+    /// Open fuzzy file switcher, or `None`. Routes keys when `Some`.
+    switcher: Option<Switcher>,
+    /// Drives the switcher results list scroll (scroll-to-selected).
+    switcher_scroll: UniformListScrollHandle,
 }
 
 impl Editor {
@@ -137,6 +157,8 @@ impl Editor {
             line_numbers: config.line_numbers,
             render_markdown: config.render_markdown,
             exit_timer: None,
+            switcher: None,
+            switcher_scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -224,6 +246,138 @@ impl Editor {
         self.open_index(next, window);
     }
 
+    /// Open the fuzzy switcher over a snapshot of the current vault files.
+    fn open_switcher(&mut self) {
+        let root = self.vault.root.clone();
+        let by_display: Vec<(String, PathBuf)> = self
+            .vault
+            .files
+            .iter()
+            .map(|p| (rel_display(&root, p), p.clone()))
+            .collect();
+        let results = by_display.iter().map(|(d, _)| d.clone()).collect();
+        self.switcher = Some(Switcher { query: String::new(), by_display, results, selected: 0 });
+    }
+
+    fn refilter_switcher(&mut self) {
+        if let Some(sw) = self.switcher.as_mut() {
+            sw.results = filter_paths(&sw.query, &sw.by_display);
+            sw.selected = 0; // a new query invalidates the old highlight
+        }
+    }
+
+    /// Keystrokes while the switcher is open. Mirrors `vim::command_key`: printable
+    /// chars extend the query, Backspace trims it, Esc cancels, Enter opens the
+    /// pick; `Up`/`Down` (and `Ctrl-P`/`Ctrl-N`) move the highlight.
+    fn switcher_key(&mut self, ev: &KeyDownEvent, window: &mut Window) {
+        let m = ev.keystroke.modifiers;
+        match ev.keystroke.key.as_str() {
+            "escape" => self.switcher = None,
+            "enter" => {
+                // take() drops the switcher borrow before open_path mutates self.
+                let path = self.switcher.take().and_then(|sw| {
+                    sw.results.get(sw.selected).and_then(|c| {
+                        sw.by_display.iter().find(|(d, _)| d == c).map(|(_, p)| p.clone())
+                    })
+                });
+                if let Some(path) = path {
+                    self.open_path(path, window); // refocuses the editor
+                }
+            }
+            "backspace" => {
+                if let Some(sw) = self.switcher.as_mut() {
+                    sw.query.pop();
+                }
+                self.refilter_switcher();
+            }
+            "down" => self.move_switcher(1),
+            "up" => self.move_switcher(-1),
+            "n" if m.control => self.move_switcher(1),
+            "p" if m.control => self.move_switcher(-1),
+            _ if !m.control && !m.alt && !m.platform => {
+                if let Some(s) = ev.keystroke.key_char.clone() {
+                    if let Some(sw) = self.switcher.as_mut() {
+                        sw.query.push_str(&s);
+                    }
+                    self.refilter_switcher();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_switcher(&mut self, delta: isize) {
+        if let Some(sw) = self.switcher.as_mut() {
+            let n = sw.results.len();
+            if n == 0 {
+                return;
+            }
+            sw.selected = (sw.selected as isize + delta).clamp(0, n as isize - 1) as usize;
+        }
+    }
+
+    /// The fuzzy-switcher overlay: a scrim + centered panel (query line + results
+    /// list). `None` when the switcher is closed.
+    fn render_switcher(&self, theme: &Theme) -> Option<impl IntoElement> {
+        let sw = self.switcher.as_ref()?;
+        let theme = *theme;
+        let query = sw.query.clone();
+        let selected = sw.selected;
+        let results = sw.results.clone(); // moved into the list closure
+        let count = results.len();
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.))
+                .bg(hsla(0., 0., 0., 0.4)) // scrim
+                .child(
+                    div()
+                        .w(px(640.))
+                        .h(px(420.)) // fixed so the list has a box to scroll in
+                        .flex()
+                        .flex_col()
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.accent)
+                        .rounded_md()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(theme.foreground)
+                                .child(format!("> {query}")),
+                        )
+                        .child(
+                            uniform_list("switcher", count, move |range, _win, _cx| {
+                                range
+                                    .map(|i| {
+                                        let (bg, fg) = if i == selected {
+                                            (
+                                                theme.sidebar_cursor_background,
+                                                theme.sidebar_active_foreground,
+                                            )
+                                        } else {
+                                            (theme.background, theme.foreground)
+                                        };
+                                        div()
+                                            .px_2()
+                                            .bg(bg)
+                                            .text_color(fg)
+                                            .child(results[i].clone())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .track_scroll(self.switcher_scroll.clone())
+                            .flex_1(),
+                        ),
+                ),
+        )
+    }
+
     /// Navigate the sidebar tree (`Pane::Sidebar`): `j`/`k` move the cursor over
     /// visible rows, `l`/Enter toggles a folder or opens a file, `h` collapses an
     /// open folder or jumps to the parent folder, Escape returns.
@@ -264,6 +418,15 @@ impl Editor {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.message = None; // a fresh keystroke clears the previous result
+
+        // The fuzzy switcher is modal: while open it swallows every key (Ctrl-W
+        // included), so route before any other handling.
+        if self.switcher.is_some() {
+            self.switcher_key(ev, window);
+            cx.notify();
+            return;
+        }
+
         let m = &ev.keystroke.modifiers;
         let key = ev.keystroke.key.as_str();
 
@@ -304,8 +467,9 @@ impl Editor {
             return;
         }
 
-        // App-level shortcuts. ponytail: Ctrl-N/P file-cycling is a stopgap until
-        // a fuzzy switcher lands; Ctrl-S mirrors `:w`.
+        // App-level shortcuts. Ctrl-P opens the fuzzy switcher; Ctrl-S mirrors
+        // `:w`. ponytail: Ctrl-N next-file cycling is a stopgap, retire it once
+        // the switcher covers navigation.
         if m.control && !m.alt && !m.platform {
             match ev.keystroke.key.as_str() {
                 "s" => {
@@ -319,7 +483,7 @@ impl Editor {
                     return;
                 }
                 "p" => {
-                    self.open_relative(-1, window);
+                    self.open_switcher();
                     cx.notify();
                     return;
                 }
@@ -537,6 +701,29 @@ fn open_or_empty(path: &Path) -> Document {
     })
 }
 
+/// Vault-relative path of `path`, `.md` dropped, forward-slashed — the switcher
+/// match key and label (e.g. `projects/ideas`).
+fn rel_display(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.with_extension("").to_string_lossy().replace('\\', "/")
+}
+
+/// Filter `items` by `query`, returning matching display strings best-first.
+/// Empty query passes everything through in original order.
+fn filter_paths(query: &str, items: &[(String, PathBuf)]) -> Vec<String> {
+    if query.is_empty() {
+        return items.iter().map(|(d, _)| d.clone()).collect();
+    }
+    // ponytail: fresh Matcher per keystroke (a few scratch allocs); cache it on
+    // Switcher if a 10k-note vault ever stutters.
+    let mut matcher = Matcher::new(NucleoConfig::DEFAULT.match_paths());
+    Pattern::parse(query, CaseMatching::Smart, Normalization::Smart)
+        .match_list(items.iter().map(|(d, _)| d.as_str()), &mut matcher)
+        .into_iter()
+        .map(|(s, _)| s.to_string())
+        .collect()
+}
+
 /// Mark every folder between the vault `root` and `path` as expanded, so a
 /// nested file's row is visible. `root` itself isn't a row, so it's excluded.
 fn expand_ancestors(root: &Path, path: &Path, set: &mut HashSet<PathBuf>) {
@@ -592,6 +779,12 @@ impl Render for Editor {
             self.last_selected = self.selected;
         }
 
+        // Keep the switcher highlight on screen. scroll_to_item no-ops while the
+        // item is visible, so this only fires when arrowing past the viewport.
+        if let Some(sw) = &self.switcher {
+            self.switcher_scroll.scroll_to_item(sw.selected, ScrollStrategy::Center);
+        }
+
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
         // ponytail: full re-scan each render (≈ per keystroke). Markdown docs are
@@ -640,6 +833,7 @@ impl Render for Editor {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
             .size_full()
+            .relative() // positioning context for the switcher overlay
             .flex()
             .bg(theme.background)
             .text_color(theme.foreground)
@@ -780,6 +974,7 @@ impl Render for Editor {
                             .child(bar),
                     ),
             )
+            .children(self.render_switcher(&theme))
     }
 }
 
@@ -1125,8 +1320,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_bytes, resolve};
-    use std::path::Path;
+    use super::{caret_bytes, filter_paths, rel_display, resolve};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn resolve_roots_relative_names_and_defaults_md() {
@@ -1145,5 +1340,28 @@ mod tests {
         assert_eq!(caret_bytes("aé", 1), (1, Some(3)));
         assert_eq!(caret_bytes("aé", 2), (3, None));
         assert_eq!(caret_bytes("", 0), (0, None));
+    }
+
+    #[test]
+    fn fuzzy_filter_ranks_and_passes_through() {
+        let items = vec![
+            ("projects/ideas".to_string(), PathBuf::from("/v/projects/ideas.md")),
+            ("archive/old".to_string(), PathBuf::from("/v/archive/old.md")),
+            ("daily/today".to_string(), PathBuf::from("/v/daily/today.md")),
+        ];
+        // a subsequence match ranks first
+        assert_eq!(
+            filter_paths("idea", &items).first().map(String::as_str),
+            Some("projects/ideas")
+        );
+        // empty query returns everything, original order
+        assert_eq!(filter_paths("", &items).len(), 3);
+    }
+
+    #[test]
+    fn rel_display_strips_root_and_md() {
+        let root = Path::new("/v");
+        assert_eq!(rel_display(root, Path::new("/v/sub/note.md")), "sub/note");
+        assert_eq!(rel_display(root, Path::new("/v/notes.v2.md")), "notes.v2");
     }
 }

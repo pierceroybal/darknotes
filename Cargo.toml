@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 gpui = "0.2"
+nucleo-matcher = "0.3"
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
