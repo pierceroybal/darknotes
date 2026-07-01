@@ -30,3 +30,13 @@ render_markdown = true
 # How long (ms) to wait for the sequence to finish before the lead key is typed
 # as text. Vim's default is 1000; ~150 feels snappier for jf-style exits.
 timeoutlen = 1000
+
+[search]
+# `/` (and `?` backward) in-document search, plain-text match. Option names are
+# vim's; ignorecase and incsearch default on (stock vim ships them off).
+ignorecase = true   # match case-insensitively
+smartcase  = true   # …unless the query contains an uppercase letter
+hlsearch   = false  # keep all matches of the last search highlighted (:noh clears);
+                    # off = matches light up only while the search prompt is open
+incsearch  = true   # jump to the nearest match while typing the query
+wrapscan   = true   # searches wrap around the ends of the file

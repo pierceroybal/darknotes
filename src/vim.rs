@@ -41,6 +41,11 @@ pub enum Action {
     /// A submitted `:` command line (without the leading colon). The editor,
     /// not the grammar, decides what `w`/`q`/… mean.
     ExecuteCommand(String),
+    /// A submitted search (`/` = forward, `?` = backward). An empty query
+    /// repeats the last search. The editor owns matching and the search state.
+    Search { query: String, backward: bool },
+    /// `n`/`N`: jump to the next/previous match of the last search.
+    SearchNext { reverse: bool, count: usize },
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -118,8 +123,11 @@ pub struct Vim {
     pub mode: Mode,
     count: Option<usize>,
     pending: Pending,
-    /// The `:` command line being typed, valid only in `Mode::Command`.
+    /// The `:`/`/`/`?` line being typed, valid only in `Mode::Command`.
     command: String,
+    /// Which prompt `Mode::Command` is serving: `:` (ex command), `/` (search
+    /// forward), or `?` (search backward). Decides what Enter emits.
+    prompt: char,
     /// Tab width in spaces (markdown has no literal tabs).
     tab_width: usize,
     /// Insert-mode key sequence that leaves insert mode (`<Esc>`); empty = off.
@@ -139,6 +147,7 @@ impl Vim {
             count: None,
             pending: Pending::None,
             command: String::new(),
+            prompt: ':',
             tab_width,
             insert_exit: insert_exit.chars().collect(),
             timeoutlen,
@@ -172,9 +181,15 @@ impl Vim {
         self.exit_buf.drain(..).collect()
     }
 
-    /// The text typed after `:` so far (for rendering the command line).
+    /// The text typed after the prompt char so far (for rendering the command
+    /// line and incremental search).
     pub fn command_line(&self) -> &str {
         &self.command
+    }
+
+    /// Which prompt `Mode::Command` is serving (`:`, `/`, or `?`).
+    pub fn prompt(&self) -> char {
+        self.prompt
     }
 
     pub fn on_key(&mut self, ks: &Keystroke) -> Vec<Action> {
@@ -308,12 +323,15 @@ impl Vim {
                 self.mode = Mode::VisualLine;
                 vec![]
             }
-            (":", _) => {
+            (":", _) | ("/", _) | ("?", _) => {
                 self.count = None;
                 self.command.clear();
+                self.prompt = key.chars().next().unwrap();
                 self.mode = Mode::Command;
                 vec![]
             }
+            ("n", false) => vec![Action::SearchNext { reverse: false, count: self.take_count() }],
+            ("n", true) => vec![Action::SearchNext { reverse: true, count: self.take_count() }],
             _ => {
                 self.count = None;
                 vec![]
@@ -331,9 +349,14 @@ impl Vim {
             }
             "enter" => {
                 self.mode = Mode::Normal;
-                vec![Action::ExecuteCommand(std::mem::take(&mut self.command))]
+                let text = std::mem::take(&mut self.command);
+                if self.prompt == ':' {
+                    vec![Action::ExecuteCommand(text)]
+                } else {
+                    vec![Action::Search { query: text, backward: self.prompt == '?' }]
+                }
             }
-            // Backspacing past the colon exits command mode.
+            // Backspacing past the prompt char exits command mode.
             "backspace" => {
                 if self.command.is_empty() {
                     self.mode = Mode::Normal;
@@ -947,6 +970,73 @@ mod tests {
         v.on_key(&k("j"));
         assert_eq!(v.on_key(&k("j")), vec![Action::InsertText("j".into())]);
         assert!(v.exit_pending());
+    }
+
+    #[test]
+    fn search_prompt_buffers_and_submits() {
+        let mut v = vim();
+        assert!(v.on_key(&k("/")).is_empty());
+        assert_eq!(v.mode, Mode::Command);
+        assert_eq!(v.prompt(), '/');
+        v.on_key(&k("f"));
+        v.on_key(&k("o"));
+        assert_eq!(v.command_line(), "fo");
+        assert_eq!(
+            v.on_key(&named("enter")),
+            vec![Action::Search { query: "fo".into(), backward: false }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn question_mark_searches_backward() {
+        let mut v = vim();
+        v.on_key(&k("?"));
+        assert_eq!(v.prompt(), '?');
+        v.on_key(&k("x"));
+        assert_eq!(
+            v.on_key(&named("enter")),
+            vec![Action::Search { query: "x".into(), backward: true }]
+        );
+    }
+
+    #[test]
+    fn search_prompt_escape_cancels() {
+        let mut v = vim();
+        v.on_key(&k("/"));
+        v.on_key(&k("q"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert_eq!(v.mode, Mode::Normal);
+        assert_eq!(v.command_line(), "");
+    }
+
+    #[test]
+    fn colon_after_search_is_still_a_command() {
+        // The prompt char must reset when `:` reopens command mode.
+        let mut v = vim();
+        v.on_key(&k("/"));
+        v.on_key(&named("escape"));
+        v.on_key(&k(":"));
+        v.on_key(&k("w"));
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ExecuteCommand("w".into())]);
+    }
+
+    #[test]
+    fn n_and_capital_n_repeat_search() {
+        let mut v = vim();
+        assert_eq!(
+            v.on_key(&k("n")),
+            vec![Action::SearchNext { reverse: false, count: 1 }]
+        );
+        assert_eq!(
+            v.on_key(&shift("n", "N")),
+            vec![Action::SearchNext { reverse: true, count: 1 }]
+        );
+        v.on_key(&k("3"));
+        assert_eq!(
+            v.on_key(&k("n")),
+            vec![Action::SearchNext { reverse: false, count: 3 }]
+        );
     }
 
     #[test]

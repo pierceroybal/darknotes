@@ -159,6 +159,16 @@ impl Document {
         self.selections[0].head
     }
 
+    /// Absolute char offset of the primary caret.
+    pub fn caret_offset(&self) -> usize {
+        self.caret()
+    }
+
+    /// Place the caret at an absolute char offset, clamped to the buffer.
+    pub fn jump_to(&mut self, at: usize) {
+        self.set_caret(at.min(self.rope.len_chars()));
+    }
+
     fn set_caret(&mut self, at: usize) {
         self.selections[0] = Selection::caret(at);
         self.goal_col = self.line_col_of(at).1;

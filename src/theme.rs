@@ -12,6 +12,9 @@ pub struct Theme {
     /// so the character reads as a cutout against the accent.
     pub accent: Hsla,
     pub selection: Hsla,
+    /// Background quad under search matches (hlsearch/incsearch); text color is
+    /// untouched, so it must keep `foreground` readable.
+    pub search_match: Hsla,
     pub sidebar_background: Hsla,
     /// Inactive sidebar row text.
     pub sidebar_foreground: Hsla,
@@ -51,6 +54,9 @@ impl Theme {
             foreground: rgb(0xcccccc).into(),
             accent: rgb(0xffcc00).into(),
             selection: rgb(0x264f78).into(),
+            // Muted olive — yellow family reads as "search" without colliding
+            // with the brighter accent caret sitting on the current match.
+            search_match: rgb(0x54491f).into(),
             sidebar_background: rgb(0x141414).into(),
             sidebar_foreground: rgb(0x9a9a9a).into(),
             sidebar_active_foreground: rgb(0xffffff).into(),
@@ -73,6 +79,7 @@ impl Theme {
             // still reads against it on a light field.
             accent: rgb(0xc77800).into(),
             selection: rgb(0xb3d4fc).into(),
+            search_match: rgb(0xffe28a).into(),
             sidebar_background: rgb(0xf0f0ee).into(),
             sidebar_foreground: rgb(0x6b6b6b).into(),
             sidebar_active_foreground: rgb(0x1a1a1a).into(),

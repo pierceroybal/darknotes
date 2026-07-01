@@ -274,29 +274,37 @@ pub fn flatten(line_len: usize, spans: &[Span]) -> Vec<Segment> {
 pub struct Concealed {
     pub text: String,
     pub segments: Vec<Segment>,
-    // ponytail: no source-byte map yet. Per-block reveal (showing source only for
-    // the element under the caret) needs one; it's emitted from this same walk —
-    // record, per kept byte, the source offset it came from.
+    /// Display byte each source byte lands at (`source_len + 1` entries; the
+    /// last maps one-past-end). Bytes of dropped markers collapse to the point
+    /// of removal, so source-coordinate spans (selection/search highlights)
+    /// can be remapped onto the display text.
+    pub map: Vec<usize>,
 }
 
-/// Drop `Marker` segments from a flattened line, returning the concealed text and
-/// the segments that survive. Boundaries fall on char boundaries (markers are all
-/// ASCII), so slicing `text` is safe. The cursor line renders from source
-/// instead, so this byte shift never reaches caret math.
+/// Drop `Marker` segments from a flattened line, returning the concealed text,
+/// the segments that survive, and the source→display byte map. Boundaries fall
+/// on char boundaries (markers are all ASCII), so slicing `text` is safe. The
+/// cursor line renders from source instead, so this byte shift never reaches
+/// caret math.
 pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
     let mut out_text = String::with_capacity(text.len());
     let mut out_segments = Vec::with_capacity(segments.len());
+    let mut map = Vec::with_capacity(text.len() + 1);
     let mut byte = 0;
     for seg in segments {
         let end = byte + seg.len;
         let slice = &text[byte..end];
         if seg.kind != Some(SpanKind::Marker) || keep_marker(slice) {
+            map.extend((0..seg.len).map(|i| out_text.len() + i));
             out_text.push_str(slice);
             out_segments.push(*seg);
+        } else {
+            map.extend(std::iter::repeat(out_text.len()).take(seg.len));
         }
         byte = end;
     }
-    Concealed { text: out_text, segments: out_segments }
+    map.push(out_text.len());
+    Concealed { text: out_text, segments: out_segments, map }
 }
 
 /// List bullets, ordered-list numbers, and the blockquote bar stay visible when
@@ -370,6 +378,14 @@ mod tests {
         assert_eq!(c.text, "hi there");
         // Segments still cover the concealed text exactly — the shape_line rule.
         assert_eq!(c.segments.iter().map(|s| s.len).sum::<usize>(), c.text.len());
+        // Map: kept bytes land at their display positions, dropped marker bytes
+        // collapse to the removal point. "## **hi** there" → "hi there".
+        assert_eq!(c.map.len(), line.len() + 1);
+        assert_eq!(c.map[0], 0); // dropped '#'
+        assert_eq!(c.map[5], 0); // 'h'
+        assert_eq!(c.map[9], 2); // ' ' after the closing `**`
+        assert_eq!(c.map[10], 3); // 't'
+        assert_eq!(c.map[line.len()], c.text.len());
     }
 
     #[test]

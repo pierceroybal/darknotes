@@ -14,7 +14,7 @@ use gpui::{
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher};
 
-use crate::config::{Config, LineNumbers};
+use crate::config::{Config, LineNumbers, Search as SearchConfig};
 use crate::document::Document;
 use crate::markdown::{self, Segment, SpanKind};
 use crate::theme::Theme;
@@ -44,6 +44,21 @@ struct Switcher {
     /// query is empty.
     results: Vec<String>,
     selected: usize,
+}
+
+/// The last search and the live prompt state. Lives on the editor, not the
+/// document — like vim's search register it spans buffer switches.
+#[derive(Default)]
+struct SearchState {
+    /// Last submitted query (the `n`/`N` target); empty = no search yet.
+    query: String,
+    /// Direction of the last search; `n` follows it, `N` reverses it.
+    backward: bool,
+    /// hlsearch is lit; `:noh` clears it until the next search or `n`/`N`.
+    hl: bool,
+    /// Caret when the `/`/`?` prompt opened — `Some` only while it's open.
+    /// Incremental jumps preview from here; cancelling restores to it.
+    origin: Option<usize>,
 }
 
 /// The app's main view. Owns the open `Document`, the `Vim` grammar, and the
@@ -98,6 +113,10 @@ pub struct Editor {
     switcher: Option<Switcher>,
     /// Drives the switcher results list scroll (scroll-to-selected).
     switcher_scroll: UniformListScrollHandle,
+    /// `/`-search state (`/`, `?`, `n`, `N`, hlsearch).
+    search: SearchState,
+    /// Search options from config (ignorecase, hlsearch, …).
+    search_cfg: SearchConfig,
 }
 
 impl Editor {
@@ -159,6 +178,8 @@ impl Editor {
             exit_timer: None,
             switcher: None,
             switcher_scroll: UniformListScrollHandle::new(),
+            search: SearchState::default(),
+            search_cfg: config.search,
         }
     }
 
@@ -186,6 +207,9 @@ impl Editor {
         self.doc = doc;
         self.vim.reset(); // clears transient state, keeps config (tab/keymap)
         self.exit_timer = None;
+        // A mid-prompt buffer switch (Ctrl-P) must not restore a stale caret
+        // into the new buffer. The query itself survives — vim search is global.
+        self.search.origin = None;
         self.current = current;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top); // a fresh buffer starts at the top
         self.last_line = 0;
@@ -487,6 +511,9 @@ impl Editor {
         for action in actions {
             self.apply(action, window, cx);
         }
+        // After the actions: a submitted search has consumed `origin` in apply,
+        // so a leftover origin on prompt close means the prompt was cancelled.
+        self.sync_search_prompt(mode_before);
         self.arm_exit_timer(cx);
         // Mode (hence caret style) can change with no action, so always notify.
         cx.notify();
@@ -556,6 +583,99 @@ impl Editor {
                 self.scroll.scroll_to_item_strict(line, strategy);
             }
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
+            Action::Search { query, backward } => self.do_search(query, backward),
+            Action::SearchNext { reverse, count } => self.search_next(reverse, count),
+        }
+    }
+
+    /// A submitted `/`/`?` query. An empty query repeats the last search in the
+    /// new direction. The jump starts from where the prompt opened — incsearch
+    /// may have dragged the caret elsewhere while typing.
+    fn do_search(&mut self, query: String, backward: bool) {
+        let origin = self.search.origin.take().unwrap_or_else(|| self.doc.caret_offset());
+        if !query.is_empty() {
+            self.search.query = query;
+        }
+        if self.search.query.is_empty() {
+            self.message = Some("E35: No previous regular expression".into());
+            return;
+        }
+        self.search.backward = backward;
+        self.search.hl = true;
+        self.doc.jump_to(origin);
+        self.find_and_jump(backward, 1);
+    }
+
+    /// `n`/`N`: repeat the last search; `reverse` flips its stored direction.
+    fn search_next(&mut self, reverse: bool, count: usize) {
+        if self.search.query.is_empty() {
+            self.message = Some("E35: No previous regular expression".into());
+            return;
+        }
+        self.search.hl = true; // `n` after `:noh` re-lights the matches
+        self.find_and_jump(self.search.backward != reverse, count);
+    }
+
+    /// Jump `count` matches from the caret, honoring wrapscan, with vim's wrap
+    /// and not-found messages. The caret stays put when nothing is found.
+    fn find_and_jump(&mut self, backward: bool, count: usize) {
+        let q = &self.search.query;
+        let matches = find_matches(&self.doc.rope, q, search_sensitive(q, &self.search_cfg));
+        let mut at = self.doc.caret_offset();
+        let mut wrapped = false;
+        for _ in 0..count.max(1) {
+            match next_match(&matches, at, backward, self.search_cfg.wrapscan) {
+                Some((i, w)) => {
+                    at = matches[i].0;
+                    wrapped |= w;
+                }
+                None => {
+                    self.message = Some(if matches.is_empty() {
+                        format!("E486: Pattern not found: {q}")
+                    } else if backward {
+                        format!("E384: search hit TOP without match for: {q}")
+                    } else {
+                        format!("E385: search hit BOTTOM without match for: {q}")
+                    });
+                    return;
+                }
+            }
+        }
+        self.doc.jump_to(at);
+        if wrapped {
+            self.message = Some(if backward {
+                "search hit TOP, continuing at BOTTOM".into()
+            } else {
+                "search hit BOTTOM, continuing at TOP".into()
+            });
+        }
+    }
+
+    /// Track the search-prompt lifecycle around each key: capture the caret
+    /// when `/`/`?` opens, live-preview the nearest match while typing
+    /// (incsearch), restore the caret on cancel. A submitted search lands via
+    /// `apply`, which consumes `origin` before this runs.
+    fn sync_search_prompt(&mut self, mode_before: Mode) {
+        let in_prompt = self.vim.mode == Mode::Command && self.vim.prompt() != ':';
+        if in_prompt {
+            if mode_before != Mode::Command {
+                self.search.origin = Some(self.doc.caret_offset());
+            }
+            if self.search_cfg.incsearch {
+                let origin = self.search.origin.unwrap_or(0);
+                let q = self.vim.command_line();
+                let jump = (!q.is_empty())
+                    .then(|| {
+                        let matches =
+                            find_matches(&self.doc.rope, q, search_sensitive(q, &self.search_cfg));
+                        next_match(&matches, origin, self.vim.prompt() == '?', self.search_cfg.wrapscan)
+                            .map(|(i, _)| matches[i].0)
+                    })
+                    .flatten();
+                self.doc.jump_to(jump.unwrap_or(origin)); // no match → sit at origin
+            }
+        } else if let Some(origin) = self.search.origin.take() {
+            self.doc.jump_to(origin); // Esc / backspace-past-prompt cancelled
         }
     }
 
@@ -629,6 +749,8 @@ impl Editor {
         match cmd {
             "" => {}
             "w" => self.save(None),
+            // Unlight search highlights until the next search / `n` / `N`.
+            "noh" | "nohl" | "nohlsearch" => self.search.hl = false,
             "enew" => self.enew(false, window),
             "enew!" => self.enew(true, window),
             "q" => {
@@ -776,8 +898,26 @@ impl Render for Editor {
         let highlight: Option<(usize, usize)> =
             mode.is_visual().then(|| self.doc.selection_span(mode == Mode::VisualLine));
 
+        // Search matches to paint: the pending query while a search prompt is
+        // open (incsearch preview), else the last submitted one while hlsearch
+        // is lit. ponytail: full re-scan per render, same precedent as the
+        // markdown parse above; cache on a doc revision if it bites.
+        let prompt_open = mode == Mode::Command && self.vim.prompt() != ':';
+        let q = if prompt_open && self.search_cfg.incsearch {
+            self.vim.command_line().to_string()
+        } else if !prompt_open && self.search_cfg.hlsearch && self.search.hl {
+            self.search.query.clone()
+        } else {
+            String::new()
+        };
+        let search_ranges = if q.is_empty() {
+            Vec::new()
+        } else {
+            find_matches(&rope, &q, search_sensitive(&q, &self.search_cfg))
+        };
+
         let bar = if mode == Mode::Command {
-            format!(":{}", self.vim.command_line())
+            format!("{}{}", self.vim.prompt(), self.vim.command_line())
         } else if let Some(msg) = self.message.clone() {
             msg
         } else {
@@ -916,12 +1056,28 @@ impl Render for Editor {
                                     let text = line_text(&rope, i);
                                     let line_spans = spans.get(i).map_or(&[][..], Vec::as_slice);
                                     let segs = markdown::flatten(text.len(), line_spans);
-                                    let (text, segments) = if render_markdown && i != cur_line {
-                                        let c = markdown::conceal(&text, &segs);
-                                        (c.text, c.segments)
-                                    } else {
-                                        (text, segs)
-                                    };
+                                    // Highlights land in source columns; a concealed
+                                    // line remaps them through the conceal map so they
+                                    // track the display text, not where the source was.
+                                    let selection =
+                                        highlight.and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi));
+                                    let search: Vec<Highlight> = search_ranges
+                                        .iter()
+                                        .filter_map(|&(lo, hi)| line_highlight(&rope, i, lo, hi))
+                                        .collect();
+                                    let (text, segments, selection, search) =
+                                        if render_markdown && i != cur_line {
+                                            let c = markdown::conceal(&text, &segs);
+                                            let selection =
+                                                selection.and_then(|h| remap_highlight(h, &text, &c));
+                                            let search = search
+                                                .into_iter()
+                                                .filter_map(|h| remap_highlight(h, &text, &c))
+                                                .collect();
+                                            (c.text, c.segments, selection, search)
+                                        } else {
+                                            (text, segs, selection, search)
+                                        };
                                     LineElement {
                                         text: text.into(),
                                         segments,
@@ -929,8 +1085,8 @@ impl Render for Editor {
                                             col: cur_col,
                                             block: mode != Mode::Insert,
                                         }),
-                                        selection: highlight
-                                            .and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi)),
+                                        selection,
+                                        search,
                                         scroll_x: scroll_x.clone(),
                                         gutter,
                                     }
@@ -984,8 +1140,13 @@ struct LineElement {
     segments: Vec<Segment>,
     /// `Some` only on the cursor line.
     caret: Option<LineCaret>,
-    /// `Some` when part of this line falls inside the visual selection.
+    /// `Some` when part of this line falls inside the visual selection. Columns
+    /// index this element's `text` — concealed lines get spans already remapped
+    /// through the conceal map.
     selection: Option<Highlight>,
+    /// Search-match column spans within this line (hlsearch/incsearch), in the
+    /// same (possibly concealed) coordinates as `selection`.
+    search: Vec<Highlight>,
     /// Shared horizontal scroll offset. The cursor line writes it (prepaint),
     /// every line reads it (paint) — see `Editor::scroll_x`.
     scroll_x: Rc<Cell<Pixels>>,
@@ -1001,6 +1162,8 @@ struct LinePrepaint {
     gutter_w: Pixels,
     /// `(x within the line, width)` of the selection quad; `None` if unselected.
     selection: Option<(Pixels, Pixels)>,
+    /// `(x within the line, width)` of each search-match quad.
+    search: Vec<(Pixels, Pixels)>,
     /// `(x within the line, width)` of the caret quad; `None` off the cursor line.
     caret: Option<(Pixels, Pixels)>,
     /// Block caret only: the glyph under the caret, repainted dark over the
@@ -1127,11 +1290,24 @@ impl Element for LineElement {
             (x0, width)
         });
 
+        // Search matches never cover the newline (`to_eol` is always false), so
+        // both edges resolve through the shaped line like the selection above.
+        let search = self
+            .search
+            .iter()
+            .map(|h| {
+                let x0 = shaped.x_for_index(caret_bytes(&self.text, h.start_col).0);
+                let x1 = shaped.x_for_index(caret_bytes(&self.text, h.end_col).0);
+                (x0, x1 - x0)
+            })
+            .collect();
+
         LinePrepaint {
             shaped,
             gutter,
             gutter_w,
             selection,
+            search,
             caret,
             caret_glyph,
         }
@@ -1164,9 +1340,16 @@ impl Element for LineElement {
             size(bounds.size.width - prepaint.gutter_w, bounds.size.height),
         );
         window.with_content_mask(Some(ContentMask { bounds: text_bounds }), |window| {
-            // Selection highlight sits under everything; then the caret quad, the
-            // line, and the inverted caret glyph on top so it reads dark against
-            // the accent block.
+            // Paint order, bottom-up: search-match quads, selection highlight,
+            // caret quad, the line, and the inverted caret glyph on top so it
+            // reads dark against the accent block.
+            for &(x, width) in &prepaint.search {
+                let origin = point(ox + x, bounds.origin.y);
+                window.paint_quad(fill(
+                    Bounds::new(origin, size(width, line_height)),
+                    theme.search_match,
+                ));
+            }
             if let Some((x, width)) = prepaint.selection {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
@@ -1297,6 +1480,86 @@ fn line_highlight(rope: &ropey::Rope, i: usize, lo: usize, hi: usize) -> Option<
     })
 }
 
+/// Remap a source-column highlight onto a concealed line: char col → source
+/// byte, through the conceal map, → display char col. `None` when the span was
+/// entirely concealed away (nothing visible to highlight).
+fn remap_highlight(h: Highlight, source: &str, c: &markdown::Concealed) -> Option<Highlight> {
+    let d0 = c.map[caret_bytes(source, h.start_col).0];
+    let d1 = c.map[caret_bytes(source, h.end_col).0];
+    if d0 >= d1 && !h.to_eol {
+        return None;
+    }
+    Some(Highlight {
+        start_col: c.text[..d0].chars().count(),
+        end_col: c.text[..d1].chars().count(),
+        to_eol: h.to_eol,
+    })
+}
+
+/// Count-preserving case fold for search: a char's first lowercase char. Full
+/// `to_lowercase()` can change char counts (ß→ss), which would corrupt the
+/// char-offset math that matches share with `Document`.
+fn fold(c: char, sensitive: bool) -> char {
+    if sensitive {
+        c
+    } else {
+        c.to_lowercase().next().unwrap_or(c)
+    }
+}
+
+/// Whether `query` matches case-sensitively under the config: sensitive unless
+/// `ignorecase`, except `smartcase` re-sensitizes an uppercase-bearing query.
+fn search_sensitive(query: &str, cfg: &SearchConfig) -> bool {
+    !cfg.ignorecase || (cfg.smartcase && query.chars().any(char::is_uppercase))
+}
+
+/// Every match of `query` as absolute char ranges `[start, end)`, scanned per
+/// line (a literal one-line query can't span newlines). Overlapping matches
+/// step by one char, like vim.
+// ponytail: naive O(chars × query) window scan; notes-sized docs make it cheap.
+// A folded-copy + memmem search if a profile ever says otherwise.
+fn find_matches(rope: &ropey::Rope, query: &str, sensitive: bool) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = query.chars().map(|c| fold(c, sensitive)).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..rope.len_lines() {
+        let start = rope.line_to_char(i);
+        // The trailing '\n' rides along harmlessly — the needle never has one.
+        let hay: Vec<char> = rope.line(i).chars().map(|c| fold(c, sensitive)).collect();
+        for j in 0..hay.len().saturating_sub(needle.len() - 1) {
+            if hay[j..j + needle.len()] == needle[..] {
+                out.push((start + j, start + j + needle.len()));
+            }
+        }
+    }
+    out
+}
+
+/// Index into `matches` of the nearest match starting strictly after `from`
+/// (strictly before, when `backward`), wrapping around if `wrap`; the second
+/// value reports that it wrapped. Strictness is what makes `n` on a match
+/// start jump to the *next* one.
+fn next_match(
+    matches: &[(usize, usize)],
+    from: usize,
+    backward: bool,
+    wrap: bool,
+) -> Option<(usize, bool)> {
+    if backward {
+        match matches.iter().rposition(|&(s, _)| s < from) {
+            Some(i) => Some((i, false)),
+            None => (wrap && !matches.is_empty()).then(|| (matches.len() - 1, true)),
+        }
+    } else {
+        match matches.iter().position(|&(s, _)| s > from) {
+            Some(i) => Some((i, false)),
+            None => (wrap && !matches.is_empty()).then_some((0, true)),
+        }
+    }
+}
+
 /// `(byte offset of char column `col`, byte offset just past the char under it)`.
 /// The second is `None` at or past end-of-line, where no char sits under the caret.
 fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
@@ -1314,9 +1577,14 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_bytes, filter_paths, rel_display, resolve, segment_style};
-    use crate::markdown::SpanKind;
+    use super::{
+        caret_bytes, filter_paths, find_matches, next_match, rel_display, remap_highlight,
+        resolve, search_sensitive, segment_style, Highlight,
+    };
+    use crate::config::Search as SearchConfig;
+    use crate::markdown::{self, SpanKind};
     use gpui::Hsla;
+    use ropey::Rope;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1365,6 +1633,73 @@ mod tests {
         );
         // empty query returns everything, original order
         assert_eq!(filter_paths("", &items).len(), 3);
+    }
+
+    #[test]
+    fn find_matches_folds_case_and_counts_chars() {
+        // Offsets are char-based: 'é' is one char, two bytes.
+        let rope = Rope::from_str("Foo fOO\néfoo\n");
+        assert_eq!(find_matches(&rope, "foo", false), vec![(0, 3), (4, 7), (9, 12)]);
+        // Sensitive keeps only the exact-case match.
+        assert_eq!(find_matches(&rope, "foo", true), vec![(9, 12)]);
+        // Overlapping matches step by one; the empty query matches nothing.
+        let rope = Rope::from_str("aaaa");
+        assert_eq!(find_matches(&rope, "aa", true), vec![(0, 2), (1, 3), (2, 4)]);
+        assert!(find_matches(&rope, "", true).is_empty());
+    }
+
+    #[test]
+    fn search_sensitive_matrix() {
+        let cfg = |ignorecase, smartcase| SearchConfig {
+            ignorecase,
+            smartcase,
+            ..Default::default()
+        };
+        assert!(search_sensitive("foo", &cfg(false, false))); // ignorecase off
+        assert!(!search_sensitive("foo", &cfg(true, false)));
+        assert!(!search_sensitive("foo", &cfg(true, true))); // all-lower stays loose
+        assert!(search_sensitive("Foo", &cfg(true, true))); // uppercase re-sensitizes
+        assert!(!search_sensitive("Foo", &cfg(true, false))); // …only with smartcase
+    }
+
+    #[test]
+    fn highlight_remaps_onto_concealed_text() {
+        let line = "**templates** more";
+        let segs = markdown::flatten(line.len(), &markdown::parse(&Rope::from_str(line))[0]);
+        let c = markdown::conceal(line, &segs);
+        assert_eq!(c.text, "templates more");
+        // "templates" sits at source cols 2..11; concealed it starts the line.
+        let h = Highlight { start_col: 2, end_col: 11, to_eol: false };
+        let r = remap_highlight(h, line, &c).unwrap();
+        assert_eq!((r.start_col, r.end_col), (0, 9));
+        // A span entirely inside a dropped marker has nothing visible left.
+        let h = Highlight { start_col: 0, end_col: 2, to_eol: false };
+        assert!(remap_highlight(h, line, &c).is_none());
+
+        // Display columns are chars, not bytes, on multibyte lines.
+        let line = "**é** x";
+        let segs = markdown::flatten(line.len(), &markdown::parse(&Rope::from_str(line))[0]);
+        let c = markdown::conceal(line, &segs);
+        assert_eq!(c.text, "é x");
+        let h = Highlight { start_col: 2, end_col: 3, to_eol: false }; // the é
+        let r = remap_highlight(h, line, &c).unwrap();
+        assert_eq!((r.start_col, r.end_col), (0, 1));
+    }
+
+    #[test]
+    fn next_match_is_strict_and_wraps() {
+        let m = [(0, 2), (5, 7), (10, 12)];
+        // Strictly after: sitting on a match start jumps to the next one.
+        assert_eq!(next_match(&m, 0, false, true), Some((1, false)));
+        assert_eq!(next_match(&m, 6, false, true), Some((2, false)));
+        // Past the last: wrap around or fail.
+        assert_eq!(next_match(&m, 10, false, true), Some((0, true)));
+        assert_eq!(next_match(&m, 10, false, false), None);
+        // Backward mirrors it.
+        assert_eq!(next_match(&m, 10, true, true), Some((1, false)));
+        assert_eq!(next_match(&m, 0, true, true), Some((2, true)));
+        assert_eq!(next_match(&m, 0, true, false), None);
+        assert_eq!(next_match(&[], 0, false, true), None);
     }
 
     #[test]

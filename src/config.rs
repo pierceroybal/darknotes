@@ -37,6 +37,7 @@ pub struct Config {
     /// cursor is on, which shows full source.
     pub render_markdown: bool,
     pub keymap: Keymap,
+    pub search: Search,
 }
 
 /// Line-number gutter mode. `relative` is hybrid: the cursor line shows its
@@ -60,6 +61,39 @@ pub struct Keymap {
     pub timeoutlen: u64,
 }
 
+/// `/`-search behavior (vim option names). Defaults are notes-friendly:
+/// ignorecase/incsearch on (vim ships them off); hlsearch off like vim, so
+/// matches light up only while the search prompt is open.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Search {
+    /// Case-insensitive matching (vim 'ignorecase').
+    pub ignorecase: bool,
+    /// With `ignorecase`: an uppercase char in the query makes that search
+    /// case-sensitive (vim 'smartcase').
+    pub smartcase: bool,
+    /// Highlight every match of the last search; `:noh` clears until the next
+    /// search (vim 'hlsearch').
+    pub hlsearch: bool,
+    /// Jump to the nearest match live while the query is being typed
+    /// (vim 'incsearch').
+    pub incsearch: bool,
+    /// Searches wrap around the ends of the file (vim 'wrapscan').
+    pub wrapscan: bool,
+}
+
+impl Default for Search {
+    fn default() -> Self {
+        Self {
+            ignorecase: true,
+            smartcase: true,
+            hlsearch: false,
+            incsearch: true,
+            wrapscan: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -71,6 +105,7 @@ impl Default for Config {
             line_numbers: LineNumbers::Off,
             render_markdown: true,
             keymap: Keymap::default(),
+            search: Search::default(),
         }
     }
 }
@@ -157,6 +192,23 @@ mod tests {
         // Unspecified keys keep their defaults.
         assert_eq!(c.font_family, Config::default().font_family);
         assert_eq!(c.keymap.timeoutlen, 1000);
+    }
+
+    #[test]
+    fn search_section_overrides_and_defaults() {
+        let c: Config = toml::from_str(
+            r#"
+            [search]
+            ignorecase = false
+        "#,
+        )
+        .unwrap();
+        assert!(!c.search.ignorecase);
+        // Unspecified search keys keep their defaults.
+        assert!(c.search.smartcase);
+        assert!(!c.search.hlsearch); // off: highlight only while the prompt is open
+        assert!(c.search.incsearch);
+        assert!(c.search.wrapscan);
     }
 
     #[test]
