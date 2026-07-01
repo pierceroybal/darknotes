@@ -556,6 +556,7 @@ impl Editor {
             }
             Action::DeleteSelection { linewise } => self.doc.delete_selection(linewise),
             Action::YankSelection { linewise } => self.doc.yank_selection(linewise),
+            Action::IndentSelection { width, dedent } => self.doc.indent_selection(width, dedent),
             Action::CollapseSelection => self.doc.collapse_selection(),
             Action::DeleteMotion(m, n) => self.doc.delete_motion(m, n),
             Action::DeleteLines(n) => self.doc.delete_lines(n),

@@ -21,6 +21,9 @@ pub enum Action {
     /// Visual-mode `d`/`x`/`y` over the current selection.
     DeleteSelection { linewise: bool },
     YankSelection { linewise: bool },
+    /// Visual `>`/`<`: shift every selected line by `width` spaces (a count
+    /// multiplies the width, vim's `2>`).
+    IndentSelection { width: usize, dedent: bool },
     /// Collapse the selection back to a caret (leaving visual mode).
     CollapseSelection,
     InsertText(String),
@@ -68,6 +71,7 @@ impl Action {
                 | Action::DeleteLinesVertical { .. }
                 | Action::DeleteCharUnder(..)
                 | Action::DeleteSelection { .. }
+                | Action::IndentSelection { .. }
                 | Action::Paste { .. }
                 | Action::InsertText(..)
                 | Action::Newline { .. }
@@ -425,6 +429,11 @@ impl Vim {
                 self.count = None;
                 self.mode = Mode::Normal;
                 return vec![Action::YankSelection { linewise: line }];
+            }
+            (">", _) | ("<", _) => {
+                let width = self.tab_width * self.take_count();
+                self.mode = Mode::Normal;
+                return vec![Action::IndentSelection { width, dedent: key == "<" }];
             }
             _ => {}
         }
@@ -881,6 +890,27 @@ mod tests {
         assert_eq!(
             v.on_key(&k("d")),
             vec![Action::DeleteSelection { linewise: true }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn visual_indent_returns_to_normal() {
+        // `>` indents by tab_width and leaves visual; a count multiplies (`2<`).
+        let mut v = vim();
+        v.on_key(&shift("v", "V"));
+        assert_eq!(
+            v.on_key(&shift(">", ">")),
+            vec![Action::IndentSelection { width: 2, dedent: false }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+
+        let mut v = vim();
+        v.on_key(&shift("v", "V"));
+        v.on_key(&k("2"));
+        assert_eq!(
+            v.on_key(&shift("<", "<")),
+            vec![Action::IndentSelection { width: 4, dedent: true }]
         );
         assert_eq!(v.mode, Mode::Normal);
     }

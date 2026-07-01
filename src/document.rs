@@ -320,6 +320,37 @@ impl Document {
         self.set_caret(start.min(self.rope.len_chars()));
     }
 
+    /// Visual `>`/`<`: shift every selected line right by `width` spaces, or
+    /// left by up to `width` leading spaces (`dedent`). Empty lines stay put
+    /// (vim behavior). Drops the caret on the first line's first non-blank,
+    /// collapsing the selection.
+    pub fn indent_selection(&mut self, width: usize, dedent: bool) {
+        let r = self.selections[0].range();
+        let l0 = self.rope.char_to_line(r.start);
+        let l1 = self.rope.char_to_line(r.end);
+        // Bottom-up so earlier lines' char offsets stay valid mid-edit.
+        for line in (l0..=l1).rev() {
+            let start = self.rope.line_to_char(line);
+            if self.line_len_chars(line) == 0 {
+                continue;
+            }
+            if dedent {
+                let lead =
+                    self.rope.line(line).chars().take_while(|&c| c == ' ').count().min(width);
+                if lead > 0 {
+                    self.rope.remove(start..start + lead);
+                    self.dirty = true;
+                }
+            } else {
+                self.rope.insert(start, &" ".repeat(width));
+                self.dirty = true;
+            }
+        }
+        let text: String = self.rope.line(l0).chars().filter(|&c| c != '\n').collect();
+        let nb = text.chars().take_while(|c| c.is_whitespace()).count();
+        self.set_caret(self.offset_in_line(l0, nb.min(text.chars().count().saturating_sub(1))));
+    }
+
     /// `d{motion}`: delete the char range the motion sweeps over.
     pub fn delete_motion(&mut self, m: Motion, count: usize) {
         let from = self.caret();
@@ -912,6 +943,24 @@ mod tests {
         d.move_motion(Motion::CharRight, 1);
         d.indent(2, false);
         assert_eq!(d.rope.to_string(), "f  oo");
+    }
+
+    #[test]
+    fn indent_selection_shifts_lines_uniformly() {
+        // Mixed depths both shift by one width; the empty line is untouched.
+        let mut d = Document::new("- a\n  - b\n\n- c");
+        d.extend_motion(Motion::LineDown, 3);
+        d.indent_selection(2, false);
+        assert_eq!(d.rope.to_string(), "  - a\n    - b\n\n  - c");
+        // Caret collapses to the first line's first non-blank.
+        assert_eq!(d.caret_line_col(), (0, 2));
+
+        // Dedent trims up to width per line; the shallowest line hits col 0.
+        let mut d = Document::new("- a\n    - b");
+        d.extend_motion(Motion::LineDown, 1);
+        d.indent_selection(2, true);
+        assert_eq!(d.rope.to_string(), "- a\n  - b");
+        assert_eq!(d.caret_line_col(), (0, 0));
     }
 
     #[test]
