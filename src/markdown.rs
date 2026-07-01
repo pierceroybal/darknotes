@@ -299,11 +299,16 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
     Concealed { text: out_text, segments: out_segments }
 }
 
-/// List bullets and the blockquote bar stay visible when rendering — they're
-/// structural prefixes with no rendered substitute yet, so concealing them would
-/// orphan the content. Heading `#`, `**`, and backticks are dropped.
+/// List bullets, ordered-list numbers, and the blockquote bar stay visible when
+/// rendering — they're structural prefixes with no rendered substitute yet, so
+/// concealing them would orphan the content. Heading `#`, `**`, and backticks
+/// are dropped.
 fn keep_marker(marker: &str) -> bool {
+    let b = marker.as_bytes();
     matches!(marker, "-" | "*" | "+" | ">")
+        || (b.len() > 1
+            && matches!(b[b.len() - 1], b'.' | b')')
+            && b[..b.len() - 1].iter().all(u8::is_ascii_digit))
 }
 
 fn priority(k: SpanKind) -> u8 {
@@ -369,7 +374,7 @@ mod tests {
 
     #[test]
     fn conceal_keeps_list_and_quote_markers() {
-        for line in ["- item", "> quote"] {
+        for line in ["- item", "> quote", "1. first", "2) second"] {
             let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
             assert_eq!(conceal(line, &segs).text, line);
         }
