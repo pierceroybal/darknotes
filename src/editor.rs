@@ -1242,7 +1242,7 @@ fn segment_style(
     let Some(kind) = kind else { return normal };
     match kind {
         SpanKind::Heading(_) => (theme.heading, FontWeight::BOLD, FontStyle::Normal, None),
-        SpanKind::Strong => (fg, FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Strong => (strong_color(fg), FontWeight::BOLD, FontStyle::Normal, None),
         SpanKind::Code | SpanKind::CodeText | SpanKind::CodeFence => {
             (theme.code, FontWeight::NORMAL, FontStyle::Normal, Some(theme.code_bg))
         }
@@ -1252,6 +1252,24 @@ fn segment_style(
         }
         SpanKind::ListItem => normal,
     }
+}
+
+// ponytail: gpui's `layout_line` (text_system.rs) infers "same font" from
+// "same decoration" (color/underline/strikethrough) and merges adjacent runs
+// on that basis without checking weight — so a Strong run flanked by same-`fg`
+// text (exactly what concealment produces once the differently-colored `**`
+// marker is dropped) gets folded into the surrounding regular-weight run and
+// silently loses its bold. Nudging alpha by an imperceptible amount keeps the
+// two runs "different" so gpui resolves the bold font instead of assuming it's
+// unchanged. Remove this workaround (and the color nudge it does) whichever
+// comes first: (1) `LineElement` switches its shaping call from `shape_line`
+// to `shape_text` — likely when line wrapping is implemented, since
+// `shape_text`'s `process_line` already resolves fonts per-run correctly and
+// this bug can't occur there; or (2) a gpui upgrade fixes `layout_line` to
+// compare fonts directly instead of inferring sameness from decoration
+// (reported upstream to zed-industries/zed).
+fn strong_color(fg: Hsla) -> Hsla {
+    Hsla { a: (fg.a - 0.001).max(0.0), ..fg }
 }
 
 /// Text of line `i` without its trailing newline.
@@ -1296,8 +1314,23 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{caret_bytes, filter_paths, rel_display, resolve};
+    use super::{caret_bytes, filter_paths, rel_display, resolve, segment_style};
+    use crate::markdown::SpanKind;
+    use gpui::Hsla;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn strong_color_differs_from_plain_text() {
+        // Strong must not share an exact color with plain body text: gpui's
+        // layout_line treats equal-decoration adjacent runs as equal-font and
+        // merges them, dropping bold weight when concealment leaves Strong
+        // flanked by plain `fg` text (see `strong_color`'s doc comment).
+        let fg: Hsla = gpui::rgb(0xcccccc).into();
+        let theme = crate::theme::Theme::by_name("dark").unwrap();
+        let (strong_color, _, _, _) = segment_style(Some(SpanKind::Strong), fg, &theme);
+        let (plain_color, _, _, _) = segment_style(None, fg, &theme);
+        assert_ne!(strong_color, plain_color);
+    }
 
     #[test]
     fn resolve_roots_relative_names_and_defaults_md() {
