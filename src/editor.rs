@@ -12,7 +12,7 @@ use gpui::{
     UniformListScrollHandle, Window,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config as NucleoConfig, Matcher};
+use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
 use crate::config::{Config, LineNumbers, Search as SearchConfig};
 use crate::document::Document;
@@ -32,17 +32,26 @@ enum Pane {
     Sidebar,
 }
 
-/// The open fuzzy file switcher — a modal over the editor. While `Some`, keys
-/// route here (like `Pane::Sidebar`); the query filters the vault file list via
-/// nucleo and `Enter` opens the highlighted pick.
-struct Switcher {
+/// What a picker row resolves to on Enter. New picker kinds add a variant
+/// (jump-to-heading → `Line(usize)`).
+enum PickItem {
+    File(PathBuf),
+    /// A registry command, by `Command::name`.
+    Command(&'static str),
+}
+
+/// The open fuzzy picker (file switcher / command palette) — a modal over the
+/// editor. While `Some`, keys route here (like `Pane::Sidebar`); the query
+/// filters `items` via nucleo and `Enter` acts on the highlighted pick.
+struct Picker {
+    /// Query-line prefix: `"> "` for files, `": "` for commands.
+    title: &'static str,
+    /// `(display, payload)` for every candidate, built once on open.
+    items: Vec<(String, PickItem)>,
     query: String,
-    /// `(display, real path)` for every vault file, built once on open. Display
-    /// is the vault-relative path with `.md` dropped — what we match and show.
-    by_display: Vec<(String, PathBuf)>,
-    /// Matches as display strings, best-first; equals `by_display` order when the
-    /// query is empty.
-    results: Vec<String>,
+    /// Matches as indices into `items`, best-first; every index, in order,
+    /// when the query is empty.
+    results: Vec<usize>,
     selected: usize,
 }
 
@@ -109,10 +118,10 @@ pub struct Editor {
     /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
     /// buffered lead keys as text.
     exit_timer: Option<Task<()>>,
-    /// Open fuzzy file switcher, or `None`. Routes keys when `Some`.
-    switcher: Option<Switcher>,
-    /// Drives the switcher results list scroll (scroll-to-selected).
-    switcher_scroll: UniformListScrollHandle,
+    /// Open fuzzy picker, or `None`. Routes keys when `Some`.
+    picker: Option<Picker>,
+    /// Drives the picker results list scroll (scroll-to-selected).
+    picker_scroll: UniformListScrollHandle,
     /// `/`-search state (`/`, `?`, `n`, `N`, hlsearch).
     search: SearchState,
     /// Search options from config (ignorecase, hlsearch, …).
@@ -176,8 +185,8 @@ impl Editor {
             line_numbers: config.line_numbers,
             render_markdown: config.render_markdown,
             exit_timer: None,
-            switcher: None,
-            switcher_scroll: UniformListScrollHandle::new(),
+            picker: None,
+            picker_scroll: UniformListScrollHandle::new(),
             search: SearchState::default(),
             search_cfg: config.search,
         }
@@ -276,84 +285,103 @@ impl Editor {
         self.load(Document::new(""), None, window);
     }
 
-    /// Open the fuzzy switcher over a snapshot of the current vault files.
-    fn open_switcher(&mut self) {
+    /// Open the fuzzy file picker over a snapshot of the current vault files.
+    /// Display is the vault-relative path with `.md` dropped.
+    fn open_file_picker(&mut self) {
         let root = self.vault.root.clone();
-        let by_display: Vec<(String, PathBuf)> = self
+        let items: Vec<(String, PickItem)> = self
             .vault
             .files
             .iter()
-            .map(|p| (rel_display(&root, p), p.clone()))
+            .map(|p| (rel_display(&root, p), PickItem::File(p.clone())))
             .collect();
-        let results = by_display.iter().map(|(d, _)| d.clone()).collect();
-        self.switcher = Some(Switcher { query: String::new(), by_display, results, selected: 0 });
+        let results = (0..items.len()).collect();
+        self.picker = Some(Picker { title: "> ", items, query: String::new(), results, selected: 0 });
     }
 
-    fn refilter_switcher(&mut self) {
-        if let Some(sw) = self.switcher.as_mut() {
-            sw.results = filter_paths(&sw.query, &sw.by_display);
-            sw.selected = 0; // a new query invalidates the old highlight
+    /// Open the command palette: every registry command, its primary ex alias
+    /// appended to the display so typing `:w`-style names finds it too.
+    fn open_command_palette(&mut self) {
+        let items: Vec<(String, PickItem)> = COMMANDS
+            .iter()
+            .map(|c| {
+                let display = match c.ex.first() {
+                    Some(ex) => format!("{}  :{}", c.name, ex),
+                    None => c.name.to_string(),
+                };
+                (display, PickItem::Command(c.name))
+            })
+            .collect();
+        let results = (0..items.len()).collect();
+        self.picker = Some(Picker { title: ": ", items, query: String::new(), results, selected: 0 });
+    }
+
+    fn refilter_picker(&mut self) {
+        if let Some(p) = self.picker.as_mut() {
+            p.results = filter_items(&p.query, &p.items);
+            p.selected = 0; // a new query invalidates the old highlight
         }
     }
 
-    /// Keystrokes while the switcher is open. Mirrors `vim::command_key`: printable
-    /// chars extend the query, Backspace trims it, Esc cancels, Enter opens the
+    /// Keystrokes while the picker is open. Mirrors `vim::command_key`: printable
+    /// chars extend the query, Backspace trims it, Esc cancels, Enter acts on the
     /// pick; `Up`/`Down` (and `Ctrl-J`/`Ctrl-K`) move the highlight.
-    fn switcher_key(&mut self, ev: &KeyDownEvent, window: &mut Window) {
+    fn picker_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = ev.keystroke.modifiers;
         match ev.keystroke.key.as_str() {
-            "escape" => self.switcher = None,
+            "escape" => self.picker = None,
             "enter" => {
-                // take() drops the switcher borrow before open_path mutates self.
-                let path = self.switcher.take().and_then(|sw| {
-                    sw.results.get(sw.selected).and_then(|c| {
-                        sw.by_display.iter().find(|(d, _)| d == c).map(|(_, p)| p.clone())
-                    })
-                });
-                if let Some(path) = path {
-                    self.open_path(path, window); // refocuses the editor
+                // take() drops the picker borrow before the pick mutates self.
+                if let Some(mut p) = self.picker.take() {
+                    if let Some(&idx) = p.results.get(p.selected) {
+                        match p.items.swap_remove(idx).1 {
+                            PickItem::File(path) => self.open_path(path, window), // refocuses the editor
+                            PickItem::Command(name) => self.run_picked_command(name, window, cx),
+                        }
+                    }
                 }
             }
             "backspace" => {
-                if let Some(sw) = self.switcher.as_mut() {
-                    sw.query.pop();
+                if let Some(p) = self.picker.as_mut() {
+                    p.query.pop();
                 }
-                self.refilter_switcher();
+                self.refilter_picker();
             }
-            "down" => self.move_switcher(1),
-            "up" => self.move_switcher(-1),
-            "j" if m.control => self.move_switcher(1),
-            "k" if m.control => self.move_switcher(-1),
+            "down" => self.move_picker(1),
+            "up" => self.move_picker(-1),
+            "j" if m.control => self.move_picker(1),
+            "k" if m.control => self.move_picker(-1),
             _ if !m.control && !m.alt && !m.platform => {
                 if let Some(s) = ev.keystroke.key_char.clone() {
-                    if let Some(sw) = self.switcher.as_mut() {
-                        sw.query.push_str(&s);
+                    if let Some(p) = self.picker.as_mut() {
+                        p.query.push_str(&s);
                     }
-                    self.refilter_switcher();
+                    self.refilter_picker();
                 }
             }
             _ => {}
         }
     }
 
-    fn move_switcher(&mut self, delta: isize) {
-        if let Some(sw) = self.switcher.as_mut() {
-            let n = sw.results.len();
+    fn move_picker(&mut self, delta: isize) {
+        if let Some(p) = self.picker.as_mut() {
+            let n = p.results.len();
             if n == 0 {
                 return;
             }
-            sw.selected = (sw.selected as isize + delta).clamp(0, n as isize - 1) as usize;
+            p.selected = (p.selected as isize + delta).clamp(0, n as isize - 1) as usize;
         }
     }
 
-    /// The fuzzy-switcher overlay: a scrim + centered panel (query line + results
-    /// list). `None` when the switcher is closed.
-    fn render_switcher(&self, theme: &Theme) -> Option<impl IntoElement> {
-        let sw = self.switcher.as_ref()?;
+    /// The fuzzy-picker overlay: a scrim + centered panel (query line + results
+    /// list). `None` when the picker is closed.
+    fn render_picker(&self, theme: &Theme) -> Option<impl IntoElement> {
+        let p = self.picker.as_ref()?;
         let theme = *theme;
-        let query = sw.query.clone();
-        let selected = sw.selected;
-        let results = sw.results.clone(); // moved into the list closure
+        let prompt = format!("{}{}", p.title, p.query);
+        let selected = p.selected;
+        // Resolved display rows, moved into the list closure.
+        let results: Vec<String> = p.results.iter().map(|&i| p.items[i].0.clone()).collect();
         let count = results.len();
         Some(
             div()
@@ -379,10 +407,10 @@ impl Editor {
                                 .px_2()
                                 .py_1()
                                 .text_color(theme.foreground)
-                                .child(format!("> {query}")),
+                                .child(prompt),
                         )
                         .child(
-                            uniform_list("switcher", count, move |range, _win, _cx| {
+                            uniform_list("picker", count, move |range, _win, _cx| {
                                 range
                                     .map(|i| {
                                         let (bg, fg) = if i == selected {
@@ -401,7 +429,7 @@ impl Editor {
                                     })
                                     .collect::<Vec<_>>()
                             })
-                            .track_scroll(self.switcher_scroll.clone())
+                            .track_scroll(self.picker_scroll.clone())
                             .flex_1(),
                         ),
                 ),
@@ -449,10 +477,10 @@ impl Editor {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.message = None; // a fresh keystroke clears the previous result
 
-        // The fuzzy switcher is modal: while open it swallows every key (Ctrl-W
+        // The fuzzy picker is modal: while open it swallows every key (Ctrl-W
         // included), so route before any other handling.
-        if self.switcher.is_some() {
-            self.switcher_key(ev, window);
+        if self.picker.is_some() {
+            self.picker_key(ev, window, cx);
             cx.notify();
             return;
         }
@@ -486,25 +514,25 @@ impl Editor {
             return;
         }
 
-        // App-level shortcuts. Ctrl-P opens the fuzzy switcher; Ctrl-S mirrors `:w`.
+        // App-level shortcuts, dispatched through the command registry.
+        // Ctrl-Shift-P is the command palette; platforms differ on whether a
+        // shifted chord reports as "p"+shift or "P", so accept both.
         if m.control && !m.alt && !m.platform {
-            match ev.keystroke.key.as_str() {
-                "s" => {
-                    self.save(None);
-                    cx.notify();
-                    return;
-                }
-                "p" => {
-                    self.open_switcher();
-                    cx.notify();
-                    return;
-                }
-                "r" => {
-                    self.doc.redo();
-                    cx.notify();
-                    return;
-                }
-                _ => {}
+            if (key == "p" && m.shift) || key == "P" {
+                self.open_command_palette();
+                cx.notify();
+                return;
+            }
+            let name = match key {
+                "s" => Some("save"),
+                "p" => Some("open-file"),
+                "r" => Some("redo"),
+                _ => None,
+            };
+            if let Some(name) = name {
+                self.run_command(name, window, cx);
+                cx.notify();
+                return;
             }
         }
         // Checkpoint undo once per undoable unit: before a mutating normal-mode
@@ -742,45 +770,136 @@ impl Editor {
         });
     }
 
-    /// Run a submitted `:` command. `:e`/`:enew` and `:q` refuse on unsaved
-    /// changes (vim E37); a trailing `!` overrides; `:wq`/`:x` quit only if the
-    /// save actually succeeded.
+    /// Run a submitted `:` command: parse `(name, bang, arg)`, look up the
+    /// registry entry by ex alias, dispatch. An arg to a command that takes
+    /// none (`:q x`) is not that command → E492, like the unknown case.
     fn exec_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
         let cmd = cmd.trim();
-        if let Some(name) = cmd.strip_prefix("w ") {
-            self.save(Some(name.trim()));
+        if cmd.is_empty() {
             return;
         }
-        if let Some(name) = cmd.strip_prefix("e! ") {
-            self.edit(name.trim(), true, window);
-            return;
-        }
-        if let Some(name) = cmd.strip_prefix("e ") {
-            self.edit(name.trim(), false, window);
-            return;
-        }
-        match cmd {
-            "" => {}
-            "w" => self.save(None),
-            // Unlight search highlights until the next search / `n` / `N`.
-            "noh" | "nohl" | "nohlsearch" => self.search.hl = false,
-            "enew" => self.enew(false, window),
-            "enew!" => self.enew(true, window),
-            "q" => {
-                if self.may_discard(false) {
-                    cx.quit();
-                }
+        let (name, bang, arg) = parse_ex(cmd);
+        match COMMANDS.iter().find(|c| c.ex.contains(&name)) {
+            Some(c) if c.takes_arg || arg.is_none() => {
+                let args = CmdArgs { bang, arg: arg.map(str::to_string) };
+                (c.run)(self, &args, window, cx);
             }
-            "q!" => cx.quit(),
-            "wq" | "x" => {
-                self.save(None);
-                if !self.doc.is_dirty() {
-                    cx.quit();
-                }
-            }
-            other => self.message = Some(format!("E492: Not an editor command: {other}")),
+            _ => self.message = Some(format!("E492: Not an editor command: {cmd}")),
         }
     }
+
+    /// Dispatch a registry command by `name` (Ctrl-chords), with no bang and
+    /// no arg. Unknown names are a bug, not user input; ignored.
+    fn run_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
+            (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx);
+        }
+    }
+
+    /// A palette pick. `takes_arg` commands have no argument yet, so they
+    /// pre-fill the ex prompt (`:e `) instead of running; the rest run directly.
+    fn run_picked_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = COMMANDS.iter().find(|c| c.name == name) else { return };
+        match c.ex.first() {
+            Some(ex) if c.takes_arg => self.vim.start_command(&format!("{ex} ")),
+            _ => (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx),
+        }
+    }
+}
+
+/// A named editor command: one registry, three front doors (`:` line, palette,
+/// Ctrl-chords).
+struct Command {
+    /// Palette display and primary dispatch name.
+    name: &'static str,
+    /// Ex-line aliases (`:w`, `:write`); empty = palette/chord-only.
+    ex: &'static [&'static str],
+    /// Accepts a `:cmd {name}` argument. From the palette these pre-fill the
+    /// ex prompt rather than run, since there's no argument to pass yet.
+    takes_arg: bool,
+    /// Thin call into an `Editor` method. All handlers take the full signature
+    /// even where `Window`/`Context` go unused, so the table stays uniform.
+    run: fn(&mut Editor, &CmdArgs, &mut Window, &mut Context<Editor>),
+}
+
+struct CmdArgs {
+    bang: bool,
+    arg: Option<String>,
+}
+
+const COMMANDS: &[Command] = &[
+    Command {
+        name: "save",
+        ex: &["w", "write"],
+        takes_arg: true,
+        run: |ed, a, _win, _cx| ed.save(a.arg.as_deref()),
+    },
+    Command {
+        name: "edit",
+        ex: &["e", "edit"],
+        takes_arg: true,
+        run: |ed, a, win, _cx| ed.edit(a.arg.as_deref().unwrap_or(""), a.bang, win),
+    },
+    Command {
+        name: "enew",
+        ex: &["enew"],
+        takes_arg: false,
+        run: |ed, a, win, _cx| ed.enew(a.bang, win),
+    },
+    Command {
+        name: "quit",
+        ex: &["q", "quit"],
+        takes_arg: false,
+        run: |ed, a, _win, cx| {
+            if ed.may_discard(a.bang) {
+                cx.quit();
+            }
+        },
+    },
+    Command {
+        name: "write-quit",
+        ex: &["wq", "x"],
+        takes_arg: false,
+        // Save first; quit only if the save actually stuck (it can fail).
+        run: |ed, _a, _win, cx| {
+            ed.save(None);
+            if !ed.doc.is_dirty() {
+                cx.quit();
+            }
+        },
+    },
+    Command {
+        name: "nohlsearch",
+        ex: &["noh", "nohl", "nohlsearch"],
+        takes_arg: false,
+        // Unlight search highlights until the next search / `n` / `N`.
+        run: |ed, _a, _win, _cx| ed.search.hl = false,
+    },
+    Command {
+        name: "open-file",
+        ex: &[],
+        takes_arg: false,
+        run: |ed, _a, _win, _cx| ed.open_file_picker(),
+    },
+    Command {
+        name: "redo",
+        ex: &[],
+        takes_arg: false,
+        run: |ed, _a, _win, _cx| ed.doc.redo(),
+    },
+];
+
+/// Split a trimmed ex line into `(name, bang, arg)`: the name runs to the
+/// first space, a trailing `!` on it sets bang (`q!`, `e! x`), the remainder —
+/// trimmed — is the arg (`None` when empty).
+fn parse_ex(cmd: &str) -> (&str, bool, Option<&str>) {
+    let (head, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    let (name, bang) = match head.strip_suffix('!') {
+        Some(n) => (n, true),
+        None => (head, false),
+    };
+    let rest = rest.trim();
+    (name, bang, (!rest.is_empty()).then_some(rest))
 }
 
 /// Bare names get a `.md` extension; anything with an extension is left alone.
@@ -819,20 +938,28 @@ fn rel_display(root: &Path, path: &Path) -> String {
     rel.with_extension("").to_string_lossy().replace('\\', "/")
 }
 
-/// Filter `items` by `query`, returning matching display strings best-first.
-/// Empty query passes everything through in original order.
-fn filter_paths(query: &str, items: &[(String, PathBuf)]) -> Vec<String> {
+/// Filter `items` by `query`, returning matching indices best-first (indices,
+/// not displays, so duplicate display strings can't mispick). Empty query
+/// passes every index through in original order.
+fn filter_items(query: &str, items: &[(String, PickItem)]) -> Vec<usize> {
     if query.is_empty() {
-        return items.iter().map(|(d, _)| d.clone()).collect();
+        return (0..items.len()).collect();
     }
     // ponytail: fresh Matcher per keystroke (a few scratch allocs); cache it on
-    // Switcher if a 10k-note vault ever stutters.
+    // Picker if a 10k-note vault ever stutters.
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT.match_paths());
-    Pattern::parse(query, CaseMatching::Smart, Normalization::Smart)
-        .match_list(items.iter().map(|(d, _)| d.as_str()), &mut matcher)
-        .into_iter()
-        .map(|(s, _)| s.to_string())
-        .collect()
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buf = Vec::new();
+    let mut scored: Vec<(u32, usize)> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (d, _))| {
+            pattern.score(Utf32Str::new(d, &mut buf), &mut matcher).map(|s| (s, i))
+        })
+        .collect();
+    // Best score first; ties keep original item order.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Mark every folder between the vault `root` and `path` as expanded, so a
@@ -890,10 +1017,10 @@ impl Render for Editor {
             self.last_selected = self.selected;
         }
 
-        // Keep the switcher highlight on screen. scroll_to_item no-ops while the
+        // Keep the picker highlight on screen. scroll_to_item no-ops while the
         // item is visible, so this only fires when arrowing past the viewport.
-        if let Some(sw) = &self.switcher {
-            self.switcher_scroll.scroll_to_item(sw.selected, ScrollStrategy::Center);
+        if let Some(p) = &self.picker {
+            self.picker_scroll.scroll_to_item(p.selected, ScrollStrategy::Center);
         }
 
         let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
@@ -1119,7 +1246,7 @@ impl Render for Editor {
                             .child(bar),
                     ),
             )
-            .children(self.render_switcher(&theme))
+            .children(self.render_picker(&theme))
     }
 }
 
@@ -1591,8 +1718,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, filter_paths, find_matches, next_match, rel_display, remap_highlight,
-        resolve, search_sensitive, segment_style, Highlight,
+        caret_bytes, filter_items, find_matches, next_match, parse_ex, rel_display,
+        remap_highlight, resolve, search_sensitive, segment_style, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -1635,17 +1762,25 @@ mod tests {
     #[test]
     fn fuzzy_filter_ranks_and_passes_through() {
         let items = vec![
-            ("projects/ideas".to_string(), PathBuf::from("/v/projects/ideas.md")),
-            ("archive/old".to_string(), PathBuf::from("/v/archive/old.md")),
-            ("daily/today".to_string(), PathBuf::from("/v/daily/today.md")),
+            ("projects/ideas".to_string(), PickItem::File(PathBuf::from("/v/projects/ideas.md"))),
+            ("archive/old".to_string(), PickItem::File(PathBuf::from("/v/archive/old.md"))),
+            ("daily/today".to_string(), PickItem::File(PathBuf::from("/v/daily/today.md"))),
         ];
         // a subsequence match ranks first
-        assert_eq!(
-            filter_paths("idea", &items).first().map(String::as_str),
-            Some("projects/ideas")
-        );
-        // empty query returns everything, original order
-        assert_eq!(filter_paths("", &items).len(), 3);
+        assert_eq!(filter_items("idea", &items).first(), Some(&0));
+        // empty query returns every index, original order
+        assert_eq!(filter_items("", &items), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_ex_splits_name_bang_arg() {
+        assert_eq!(parse_ex("w"), ("w", false, None));
+        assert_eq!(parse_ex("w x"), ("w", false, Some("x")));
+        assert_eq!(parse_ex("e! notes"), ("e", true, Some("notes")));
+        assert_eq!(parse_ex("q!"), ("q", true, None));
+        // extra inner whitespace trims off the arg
+        assert_eq!(parse_ex("e!  x"), ("e", true, Some("x")));
+        assert_eq!(parse_ex("nohlsearch"), ("nohlsearch", false, None));
     }
 
     #[test]

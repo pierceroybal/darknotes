@@ -196,6 +196,16 @@ impl Vim {
         self.prompt
     }
 
+    /// Enter the `:` prompt with `prefill` already typed — a palette pick that
+    /// still needs an argument (e.g. `:e `) hands the line to the user here.
+    pub fn start_command(&mut self, prefill: &str) {
+        self.count = None;
+        self.command.clear();
+        self.command.push_str(prefill);
+        self.prompt = ':';
+        self.mode = Mode::Command;
+    }
+
     pub fn on_key(&mut self, ks: &Keystroke) -> Vec<Action> {
         match self.mode {
             Mode::Insert => self.insert_key(ks),
