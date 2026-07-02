@@ -1085,6 +1085,19 @@ impl Render for Editor {
         let row_count = rows.len();
         let entity = cx.entity();
 
+        // Blank phantom lines past EOF give the list overscroll room, vim-style:
+        // `zz`/`zt` keep working near the bottom of the file, and the wheel can
+        // scroll until the last real line sits at the top of the viewport. Sized
+        // from the previous frame's viewport height (zero before first layout).
+        let line_h = px(self.font_size * 22.0 / 15.0);
+        let overscroll = self
+            .scroll
+            .0
+            .borrow()
+            .last_item_size
+            .map_or(0, |s| (s.item.height / line_h).ceil() as usize)
+            .saturating_sub(1);
+
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
@@ -1099,7 +1112,7 @@ impl Render for Editor {
             // at the 15px default); expose it as its own config key only if asked.
             .font_family(self.font_family.clone())
             .text_size(px(self.font_size))
-            .line_height(px(self.font_size * 22.0 / 15.0))
+            .line_height(line_h)
             .child(
                 uniform_list("sidebar", row_count, move |range, _win, _cx| {
                     range
@@ -1171,9 +1184,21 @@ impl Render for Editor {
                     .flex()
                     .flex_col()
                     .child(
-                        uniform_list("lines", line_count, move |range, _win, _cx| {
+                        uniform_list("lines", line_count + overscroll, move |range, _win, _cx| {
                             range
                                 .map(|i| {
+                                    // Phantom overscroll line past EOF: blank, no gutter.
+                                    if i >= line_count {
+                                        return LineElement {
+                                            text: "".into(),
+                                            segments: Vec::new(),
+                                            caret: None,
+                                            selection: None,
+                                            search: Vec::new(),
+                                            scroll_x: scroll_x.clone(),
+                                            gutter: None,
+                                        };
+                                    }
                                     // Relative mode is hybrid: cursor line shows its
                                     // absolute number, others the distance to it.
                                     let gutter = (line_numbers != LineNumbers::Off).then(|| {
