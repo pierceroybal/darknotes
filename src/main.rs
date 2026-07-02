@@ -1,6 +1,7 @@
 mod config;
 mod document;
 mod editor;
+mod keymap;
 mod markdown;
 mod theme;
 mod vault;

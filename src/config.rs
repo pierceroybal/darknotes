@@ -2,14 +2,8 @@
 //! `config.toml`. Durable prefs only — machine-owned restore state (open
 //! buffers, cursor, scroll) belongs in a separate `session.json`, never here,
 //! so churning state can't clobber a hand-edited file's comments.
-//!
-//! Extending the keymap: today only `insert_exit` is configurable (the one
-//! binding asked for). A general `[keymap]` remap table — arbitrary
-//! key-sequence → named command — waits on the command registry (see
-//! `docs/foundation.md` Foundation 1). When that lands, add a `bindings` map
-//! here and resolve names against the registry; `insert_exit` becomes one
-//! entry rather than its own field.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -51,14 +45,23 @@ pub enum LineNumbers {
     Relative,
 }
 
+/// User key bindings, resolved by `keymap::Resolver` before the built-in vim
+/// grammar. Each table maps a key sequence — whitespace-separated gpui
+/// keystrokes (`"ctrl-s"`, `"space f"`, `"j k"`) — to a registry command name.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Keymap {
-    /// Insert-mode key sequence that acts as `<Esc>` (e.g. `"jk"`). Empty = off.
-    pub insert_exit: String,
-    /// Milliseconds to wait for the sequence to complete before its lead key is
-    /// inserted as literal text (vim's `timeoutlen`).
+    /// Milliseconds to wait for a partially-typed multi-key binding before its
+    /// buffered keys are handled as ordinary input (vim's `timeoutlen`).
     pub timeoutlen: u64,
+    /// Bindings live in every editor mode (the Ctrl-chord layer). A binding on
+    /// the same keys as a built-in default (`ctrl-s`, `ctrl-p`, `ctrl-shift-p`,
+    /// `ctrl-r`) shadows it.
+    pub global: BTreeMap<String, String>,
+    /// Bindings live only in vim normal mode (e.g. `"space f" = "open-file"`).
+    pub normal: BTreeMap<String, String>,
+    /// Bindings live only in insert mode (e.g. `"j k" = "normal-mode"`).
+    pub insert: BTreeMap<String, String>,
 }
 
 /// `/`-search behavior (vim option names). Defaults are notes-friendly:
@@ -112,7 +115,12 @@ impl Default for Config {
 
 impl Default for Keymap {
     fn default() -> Self {
-        Self { insert_exit: String::new(), timeoutlen: 1000 }
+        Self {
+            timeoutlen: 1000,
+            global: BTreeMap::new(),
+            normal: BTreeMap::new(),
+            insert: BTreeMap::new(),
+        }
     }
 }
 
@@ -182,13 +190,13 @@ mod tests {
         let c: Config = toml::from_str(
             r#"
             tab_width = 4
-            [keymap]
-            insert_exit = "jk"
+            [keymap.insert]
+            "j k" = "normal-mode"
         "#,
         )
         .unwrap();
         assert_eq!(c.tab_width, 4);
-        assert_eq!(c.keymap.insert_exit, "jk");
+        assert_eq!(c.keymap.insert.get("j k").map(String::as_str), Some("normal-mode"));
         // Unspecified keys keep their defaults.
         assert_eq!(c.font_family, Config::default().font_family);
         assert_eq!(c.keymap.timeoutlen, 1000);
@@ -216,7 +224,7 @@ mod tests {
         let c: Config = toml::from_str("").unwrap();
         assert_eq!(c.tab_width, 2);
         assert_eq!(c.theme, "dark");
-        assert!(c.keymap.insert_exit.is_empty());
+        assert!(c.keymap.insert.is_empty());
     }
 
     #[test]

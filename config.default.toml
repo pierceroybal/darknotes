@@ -24,12 +24,28 @@ line_numbers = "off"
 render_markdown = true
 
 [keymap]
-# Insert-mode key sequence that acts as <Esc> (e.g. "jf"). Disabled by default —
-# uncomment to enable. <Esc> always exits regardless.
-# insert_exit = "jf"
-# How long (ms) to wait for the sequence to finish before the lead key is typed
-# as text. Vim's default is 1000; ~150 feels snappier for jf-style exits.
+# How long (ms) a partially-typed multi-key binding waits for its next key
+# before the typed keys are handled as ordinary input. Vim's default is 1000;
+# ~150 feels snappier for jk-style insert exits.
 timeoutlen = 1000
+
+# Bindings map a key sequence to a command name (browse the command palette,
+# Ctrl-Shift-P, for the full list: save, open-file, command-palette, redo,
+# quit, normal-mode, focus-sidebar, …). A sequence is whitespace-separated
+# keystrokes, each [ctrl-][alt-][shift-]key: "ctrl-s", "space f", "j k".
+#
+# [keymap.global] — live in every mode. These are the built-in defaults;
+# binding the same keys overrides them:
+#   "ctrl-s"       = "save"
+#   "ctrl-p"       = "open-file"
+#   "ctrl-shift-p" = "command-palette"
+#   "ctrl-r"       = "redo"
+#
+# [keymap.normal] — vim normal mode only. Space is free (the de-facto leader):
+#   "space f" = "open-file"
+#
+# [keymap.insert] — insert mode only. E.g. jk-to-escape:
+#   "j k" = "normal-mode"
 
 [search]
 # `/` (and `?` backward) in-document search, plain-text match. Option names are

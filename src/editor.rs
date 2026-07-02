@@ -1,3 +1,5 @@
+mod command;
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -7,15 +9,17 @@ use std::time::Duration;
 use gpui::{
     div, fill, hsla, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
     ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle, FontWeight,
-    GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, LayoutId, MouseButton,
-    MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task, TextRun,
-    UniformListScrollHandle, Window,
+    GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
+    MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
+    TextRun, UniformListScrollHandle, Window,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 
 use crate::config::{Config, LineNumbers, Search as SearchConfig};
 use crate::document::Document;
+use crate::keymap::{Ctx, Resolver};
+use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use crate::markdown::{self, Segment, SpanKind};
 use crate::theme::Theme;
 use crate::vault::Vault;
@@ -114,10 +118,15 @@ pub struct Editor {
     line_numbers: LineNumbers,
     /// Hide markdown syntax markers on non-cursor lines, from config.
     render_markdown: bool,
-    /// Pending insert-exit timeout. Held so it stays alive; dropping/replacing it
-    /// cancels the timer (gpui cancels a dropped `Task`). On fire it flushes the
-    /// buffered lead keys as text.
-    exit_timer: Option<Task<()>>,
+    /// Keymap bindings (defaults + `[keymap.*]` config), resolved per keystroke
+    /// before the vim grammar.
+    keymap: Resolver,
+    /// `timeoutlen` (ms) for partially-typed multi-key bindings, from config.
+    timeoutlen: u64,
+    /// Pending binding-sequence timeout. Held so it stays alive; dropping or
+    /// replacing it cancels the timer (gpui cancels a dropped `Task`). On fire
+    /// the buffered keys replay through the grammar as ordinary input.
+    seq_timer: Option<Task<()>>,
     /// Open fuzzy picker, or `None`. Routes keys when `Some`.
     picker: Option<Picker>,
     /// Drives the picker results list scroll (scroll-to-selected).
@@ -146,11 +155,9 @@ impl Editor {
                 None => (Document::new(WELCOME), None),
             },
         };
-        let vim = Vim::new(
-            config.tab_width,
-            &config.keymap.insert_exit,
-            config.keymap.timeoutlen,
-        );
+        let vim = Vim::new(config.tab_width);
+        let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        let keymap = Resolver::new(&config.keymap, DEFAULT_BINDINGS, &names);
         // Open the tree to the initial file and park the sidebar cursor on it.
         let mut expanded = HashSet::new();
         let selected = doc
@@ -184,7 +191,9 @@ impl Editor {
             font_size: config.font_size,
             line_numbers: config.line_numbers,
             render_markdown: config.render_markdown,
-            exit_timer: None,
+            keymap,
+            timeoutlen: config.keymap.timeoutlen,
+            seq_timer: None,
             picker: None,
             picker_scroll: UniformListScrollHandle::new(),
             search: SearchState::default(),
@@ -214,8 +223,9 @@ impl Editor {
     /// editor so keys keep flowing after a click or command.
     fn load(&mut self, doc: Document, current: Option<usize>, window: &mut Window) {
         self.doc = doc;
-        self.vim.reset(); // clears transient state, keeps config (tab/keymap)
-        self.exit_timer = None;
+        self.vim.reset(); // clears transient state, keeps config (tab width)
+        self.keymap.clear(); // a pending binding sequence dies with the buffer
+        self.seq_timer = None;
         // A mid-prompt buffer switch (Ctrl-P) must not restore a stale caret
         // into the new buffer. The query itself survives — vim search is global.
         self.search.origin = None;
@@ -514,32 +524,35 @@ impl Editor {
             return;
         }
 
-        // App-level shortcuts, dispatched through the command registry.
-        // Ctrl-Shift-P is the command palette; platforms differ on whether a
-        // shifted chord reports as "p"+shift or "P", so accept both.
-        if m.control && !m.alt && !m.platform {
-            if (key == "p" && m.shift) || key == "P" {
-                self.open_command_palette();
-                cx.notify();
-                return;
-            }
-            let name = match key {
-                "s" => Some("save"),
-                "p" => Some("open-file"),
-                "r" => Some("redo"),
-                _ => None,
-            };
-            if let Some(name) = name {
-                self.run_command(name, window, cx);
-                cx.notify();
-                return;
-            }
+        // The keymap layer: user/default bindings resolved before the vim
+        // grammar. Global bindings (Ctrl-chords) are live in every mode;
+        // normal/insert bindings gate on the vim mode. Keys no binding claims
+        // replay through the grammar unchanged.
+        let ctxs: &[Ctx] = match self.vim.mode {
+            Mode::Normal => &[Ctx::Global, Ctx::Normal],
+            Mode::Insert => &[Ctx::Global, Ctx::Insert],
+            _ => &[Ctx::Global],
+        };
+        let res = self.keymap.feed(ctxs, &ev.keystroke);
+        for ks in &res.replay {
+            self.feed_vim(ks, window, cx);
         }
+        if let Some(name) = res.command {
+            self.run_command(&name, window, cx);
+        }
+        self.arm_seq_timer(window, cx);
+        // Mode (hence caret style) can change with no action, so always notify.
+        cx.notify();
+    }
+
+    /// One keystroke through the vim grammar: checkpoint policy, action
+    /// application, search-prompt bookkeeping.
+    fn feed_vim(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) {
         // Checkpoint undo once per undoable unit: before a mutating normal-mode
         // command, or on entering insert (the whole insert session coalesces
         // into that one checkpoint).
         let mode_before = self.vim.mode;
-        let actions = self.vim.on_key(&ev.keystroke);
+        let actions = self.vim.on_key(ks);
         let entering_insert = mode_before == Mode::Normal && self.vim.mode == Mode::Insert;
         // Checkpoint a single undoable unit. Insert-mode edits are excluded so the
         // whole session coalesces into the entering-insert checkpoint; everything
@@ -554,29 +567,26 @@ impl Editor {
         // After the actions: a submitted search has consumed `origin` in apply,
         // so a leftover origin on prompt close means the prompt was cancelled.
         self.sync_search_prompt(mode_before);
-        self.arm_exit_timer(cx);
-        // Mode (hence caret style) can change with no action, so always notify.
-        cx.notify();
     }
 
-    /// (Re)arm the insert-exit timeout while a sequence lead key is buffered, or
-    /// cancel it once the buffer resolves. Each lead key restarts the clock
-    /// (vim's per-key `timeoutlen`); on fire, the buffered keys are inserted as
-    /// literal text. Replacing/clearing the stored `Task` cancels the prior one.
-    fn arm_exit_timer(&mut self, cx: &mut Context<Self>) {
-        if !self.vim.exit_pending() {
-            self.exit_timer = None;
+    /// (Re)arm the sequence timeout while binding lead keys are buffered, or
+    /// cancel it once the buffer resolves. Each key restarts the clock (vim's
+    /// per-key `timeoutlen`); on fire, the buffered keys replay through the
+    /// grammar as ordinary input (in insert mode: typed as literal text).
+    /// Replacing/clearing the stored `Task` cancels the prior one.
+    fn arm_seq_timer(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.keymap.pending() {
+            self.seq_timer = None;
             return;
         }
-        let dur = Duration::from_millis(self.vim.timeoutlen());
-        self.exit_timer = Some(cx.spawn(async move |this, cx| {
+        let dur = Duration::from_millis(self.timeoutlen);
+        self.seq_timer = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(dur).await;
-            this.update(cx, |this, cx| {
-                let text = this.vim.flush_pending_exit();
-                if !text.is_empty() {
-                    this.doc.insert(&text);
-                    cx.notify();
+            this.update_in(cx, |this, window, cx| {
+                for ks in this.keymap.flush() {
+                    this.feed_vim(&ks, window, cx);
                 }
+                cx.notify();
             })
             .ok();
         }));
@@ -805,101 +815,6 @@ impl Editor {
             _ => (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx),
         }
     }
-}
-
-/// A named editor command: one registry, three front doors (`:` line, palette,
-/// Ctrl-chords).
-struct Command {
-    /// Palette display and primary dispatch name.
-    name: &'static str,
-    /// Ex-line aliases (`:w`, `:write`); empty = palette/chord-only.
-    ex: &'static [&'static str],
-    /// Accepts a `:cmd {name}` argument. From the palette these pre-fill the
-    /// ex prompt rather than run, since there's no argument to pass yet.
-    takes_arg: bool,
-    /// Thin call into an `Editor` method. All handlers take the full signature
-    /// even where `Window`/`Context` go unused, so the table stays uniform.
-    run: fn(&mut Editor, &CmdArgs, &mut Window, &mut Context<Editor>),
-}
-
-struct CmdArgs {
-    bang: bool,
-    arg: Option<String>,
-}
-
-const COMMANDS: &[Command] = &[
-    Command {
-        name: "save",
-        ex: &["w", "write"],
-        takes_arg: true,
-        run: |ed, a, _win, _cx| ed.save(a.arg.as_deref()),
-    },
-    Command {
-        name: "edit",
-        ex: &["e", "edit"],
-        takes_arg: true,
-        run: |ed, a, win, _cx| ed.edit(a.arg.as_deref().unwrap_or(""), a.bang, win),
-    },
-    Command {
-        name: "enew",
-        ex: &["enew"],
-        takes_arg: false,
-        run: |ed, a, win, _cx| ed.enew(a.bang, win),
-    },
-    Command {
-        name: "quit",
-        ex: &["q", "quit"],
-        takes_arg: false,
-        run: |ed, a, _win, cx| {
-            if ed.may_discard(a.bang) {
-                cx.quit();
-            }
-        },
-    },
-    Command {
-        name: "write-quit",
-        ex: &["wq", "x"],
-        takes_arg: false,
-        // Save first; quit only if the save actually stuck (it can fail).
-        run: |ed, _a, _win, cx| {
-            ed.save(None);
-            if !ed.doc.is_dirty() {
-                cx.quit();
-            }
-        },
-    },
-    Command {
-        name: "nohlsearch",
-        ex: &["noh", "nohl", "nohlsearch"],
-        takes_arg: false,
-        // Unlight search highlights until the next search / `n` / `N`.
-        run: |ed, _a, _win, _cx| ed.search.hl = false,
-    },
-    Command {
-        name: "open-file",
-        ex: &[],
-        takes_arg: false,
-        run: |ed, _a, _win, _cx| ed.open_file_picker(),
-    },
-    Command {
-        name: "redo",
-        ex: &[],
-        takes_arg: false,
-        run: |ed, _a, _win, _cx| ed.doc.redo(),
-    },
-];
-
-/// Split a trimmed ex line into `(name, bang, arg)`: the name runs to the
-/// first space, a trailing `!` on it sets bang (`q!`, `e! x`), the remainder —
-/// trimmed — is the arg (`None` when empty).
-fn parse_ex(cmd: &str) -> (&str, bool, Option<&str>) {
-    let (head, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
-    let (name, bang) = match head.strip_suffix('!') {
-        Some(n) => (n, true),
-        None => (head, false),
-    };
-    let rest = rest.trim();
-    (name, bang, (!rest.is_empty()).then_some(rest))
 }
 
 /// Bare names get a `.md` extension; anything with an extension is left alone.
@@ -1743,8 +1658,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, filter_items, find_matches, next_match, parse_ex, rel_display,
-        remap_highlight, resolve, search_sensitive, segment_style, Highlight, PickItem,
+        caret_bytes, filter_items, find_matches, next_match, rel_display, remap_highlight,
+        resolve, search_sensitive, segment_style, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -1795,17 +1710,6 @@ mod tests {
         assert_eq!(filter_items("idea", &items).first(), Some(&0));
         // empty query returns every index, original order
         assert_eq!(filter_items("", &items), vec![0, 1, 2]);
-    }
-
-    #[test]
-    fn parse_ex_splits_name_bang_arg() {
-        assert_eq!(parse_ex("w"), ("w", false, None));
-        assert_eq!(parse_ex("w x"), ("w", false, Some("x")));
-        assert_eq!(parse_ex("e! notes"), ("e", true, Some("notes")));
-        assert_eq!(parse_ex("q!"), ("q", true, None));
-        // extra inner whitespace trims off the arg
-        assert_eq!(parse_ex("e!  x"), ("e", true, Some("x")));
-        assert_eq!(parse_ex("nohlsearch"), ("nohlsearch", false, None));
     }
 
     #[test]

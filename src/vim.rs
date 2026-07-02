@@ -134,18 +134,10 @@ pub struct Vim {
     prompt: char,
     /// Tab width in spaces (markdown has no literal tabs).
     tab_width: usize,
-    /// Insert-mode key sequence that leaves insert mode (`<Esc>`); empty = off.
-    insert_exit: Vec<char>,
-    /// `timeoutlen` (ms): how long the editor waits for the sequence to finish
-    /// before flushing the buffered lead keys as text.
-    timeoutlen: u64,
-    /// Buffered lead keys of an in-progress `insert_exit` match (a proper prefix
-    /// of it). The editor arms a timeout whenever this is non-empty.
-    exit_buf: Vec<char>,
 }
 
 impl Vim {
-    pub fn new(tab_width: usize, insert_exit: &str, timeoutlen: u64) -> Self {
+    pub fn new(tab_width: usize) -> Self {
         Self {
             mode: Mode::Normal,
             count: None,
@@ -153,36 +145,16 @@ impl Vim {
             command: String::new(),
             prompt: ':',
             tab_width,
-            insert_exit: insert_exit.chars().collect(),
-            timeoutlen,
-            exit_buf: Vec::new(),
         }
     }
 
-    /// Reset transient editing state on a buffer switch, keeping config (tab
-    /// width, the insert-exit sequence, timeoutlen).
+    /// Reset transient editing state on a buffer switch, keeping config
+    /// (tab width).
     pub fn reset(&mut self) {
         self.mode = Mode::Normal;
         self.count = None;
         self.pending = Pending::None;
         self.command.clear();
-        self.exit_buf.clear();
-    }
-
-    /// `true` while the start of the insert-exit sequence is buffered, awaiting
-    /// completion or a timeout flush — the editor arms its timer on this.
-    pub fn exit_pending(&self) -> bool {
-        !self.exit_buf.is_empty()
-    }
-
-    pub fn timeoutlen(&self) -> u64 {
-        self.timeoutlen
-    }
-
-    /// Insert-exit timeout fired: surrender the buffered lead keys as literal
-    /// text. Idempotent — empty once drained.
-    pub fn flush_pending_exit(&mut self) -> String {
-        self.exit_buf.drain(..).collect()
     }
 
     /// The text typed after the prompt char so far (for rendering the command
@@ -463,89 +435,34 @@ impl Vim {
 
     fn insert_key(&mut self, ks: &Keystroke) -> Vec<Action> {
         let m = &ks.modifiers;
-        let key = ks.key.as_str();
 
-        // Plain printable input drives the insert-exit matcher: a single char may
-        // extend a pending sequence, complete it (→ leave insert), or break it.
+        // Plain printable input (jk-style exit sequences are the keymap
+        // layer's job, resolved in the editor before keys reach the grammar).
         if !m.control && !m.platform && !m.alt {
             if let Some(s) = &ks.key_char {
-                if s.chars().count() == 1 {
-                    return self.feed_insert_char(s.chars().next().unwrap());
-                }
-                // Multi-char input (IME, etc.) can't be part of the sequence.
-                let mut out = self.flush_exit_buf();
-                out.push(Action::InsertText(s.clone()));
-                return out;
+                return vec![Action::InsertText(s.clone())];
             }
         }
 
-        // Any other key ends a pending sequence: flush the buffered keys as text,
-        // then handle the key itself.
-        let mut out = self.flush_exit_buf();
-        match key {
+        match ks.key.as_str() {
             "escape" => {
                 self.mode = Mode::Normal;
-                out.push(Action::Move(Motion::CharLeft, 1)); // vim nudges left on exit
+                vec![Action::Move(Motion::CharLeft, 1)] // vim nudges left on exit
             }
-            "left" => out.push(Action::Move(Motion::CharLeft, 1)),
-            "right" => out.push(Action::Move(Motion::CharRight, 1)),
-            "up" => out.push(Action::Move(Motion::LineUp, 1)),
-            "down" => out.push(Action::Move(Motion::LineDown, 1)),
-            "backspace" => out.push(Action::DeleteBackward),
-            "delete" => out.push(Action::DeleteForward),
-            "enter" => out.push(Action::Newline { clear_empty: true }),
+            "left" => vec![Action::Move(Motion::CharLeft, 1)],
+            "right" => vec![Action::Move(Motion::CharRight, 1)],
+            "up" => vec![Action::Move(Motion::LineUp, 1)],
+            "down" => vec![Action::Move(Motion::LineDown, 1)],
+            "backspace" => vec![Action::DeleteBackward],
+            "delete" => vec![Action::DeleteForward],
+            "enter" => vec![Action::Newline { clear_empty: true }],
             // A markdown buffer has no literal tabs. On a list line the editor
             // shifts the whole line; elsewhere Tab inserts `tab_width` spaces.
             // Shift-Tab dedents.
-            "tab" if !m.shift => out.push(Action::Tab { width: self.tab_width, dedent: false }),
-            "tab" if m.shift => out.push(Action::Tab { width: self.tab_width, dedent: true }),
-            _ => {}
+            "tab" if !m.shift => vec![Action::Tab { width: self.tab_width, dedent: false }],
+            "tab" if m.shift => vec![Action::Tab { width: self.tab_width, dedent: true }],
+            _ => vec![],
         }
-        out
-    }
-
-    /// Run one printable char through the insert-exit matcher. With no sequence
-    /// configured it's a plain insert. Otherwise a char that extends the match
-    /// is buffered (completing it leaves insert mode, emitting nothing); a char
-    /// that breaks the match flushes the buffer, then either starts a fresh
-    /// match or inserts.
-    fn feed_insert_char(&mut self, ch: char) -> Vec<Action> {
-        if self.insert_exit.is_empty() {
-            return vec![Action::InsertText(ch.to_string())];
-        }
-        if self.insert_exit.get(self.exit_buf.len()) == Some(&ch) {
-            self.exit_buf.push(ch);
-            if self.exit_buf.len() == self.insert_exit.len() {
-                self.exit_buf.clear();
-                self.mode = Mode::Normal;
-                return vec![Action::Move(Motion::CharLeft, 1)];
-            }
-            return vec![]; // partial match; the editor arms the timeout
-        }
-        // ch doesn't extend the buffer — flush it, then judge ch on its own (it
-        // may itself begin a fresh match, e.g. the second `j` of `jj` after a
-        // broken `jk`).
-        let mut out = self.flush_exit_buf();
-        if self.insert_exit.first() == Some(&ch) {
-            self.exit_buf.push(ch);
-            if self.insert_exit.len() == 1 {
-                self.exit_buf.clear();
-                self.mode = Mode::Normal;
-                out.push(Action::Move(Motion::CharLeft, 1));
-            }
-        } else {
-            out.push(Action::InsertText(ch.to_string()));
-        }
-        out
-    }
-
-    /// Surrender buffered insert-exit lead keys as literal text (the sequence
-    /// broke or was interrupted). Empty when nothing is pending.
-    fn flush_exit_buf(&mut self) -> Vec<Action> {
-        if self.exit_buf.is_empty() {
-            return vec![];
-        }
-        vec![Action::InsertText(self.exit_buf.drain(..).collect())]
     }
 }
 
@@ -659,9 +576,9 @@ mod tests {
         Keystroke { key: key.into(), key_char: None, modifiers: Modifiers::default() }
     }
 
-    /// Default test grammar: 2-space tabs, no insert-exit sequence.
+    /// Default test grammar: 2-space tabs.
     fn vim() -> Vim {
-        Vim::new(2, "", 1000)
+        Vim::new(2)
     }
 
     #[test]
@@ -968,51 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_exit_sequence_leaves_insert() {
-        let mut v = Vim::new(2, "jk", 1000);
-        v.on_key(&k("i"));
-        assert!(v.on_key(&k("j")).is_empty()); // lead key buffered, nothing typed
-        assert!(v.exit_pending());
-        assert_eq!(v.on_key(&k("k")), vec![Action::Move(Motion::CharLeft, 1)]);
-        assert_eq!(v.mode, Mode::Normal);
-        assert!(!v.exit_pending());
-    }
-
-    #[test]
-    fn insert_exit_broken_flushes_lead_then_char() {
-        let mut v = Vim::new(2, "jk", 1000);
-        v.on_key(&k("i"));
-        v.on_key(&k("j"));
-        // `ju`: not the sequence — emit the buffered `j`, then `u`.
-        assert_eq!(
-            v.on_key(&k("u")),
-            vec![Action::InsertText("j".into()), Action::InsertText("u".into())]
-        );
-        assert_eq!(v.mode, Mode::Insert);
-    }
-
-    #[test]
-    fn insert_exit_timeout_flushes_lead() {
-        let mut v = Vim::new(2, "jk", 1000);
-        v.on_key(&k("i"));
-        v.on_key(&k("j"));
-        assert_eq!(v.flush_pending_exit(), "j");
-        assert_eq!(v.flush_pending_exit(), ""); // idempotent
-        assert!(!v.exit_pending());
-    }
-
-    #[test]
-    fn insert_exit_repeated_lead_char() {
-        // `jk` sequence: typing `jj` flushes the first `j`, then re-buffers the
-        // second as a fresh lead key.
-        let mut v = Vim::new(2, "jk", 1000);
-        v.on_key(&k("i"));
-        v.on_key(&k("j"));
-        assert_eq!(v.on_key(&k("j")), vec![Action::InsertText("j".into())]);
-        assert!(v.exit_pending());
-    }
-
-    #[test]
     fn search_prompt_buffers_and_submits() {
         let mut v = vim();
         assert!(v.on_key(&k("/")).is_empty());
@@ -1080,10 +952,9 @@ mod tests {
     }
 
     #[test]
-    fn insert_exit_disabled_inserts_immediately() {
-        let mut v = vim(); // no sequence configured
+    fn insert_mode_types_printables() {
+        let mut v = vim();
         v.on_key(&k("i"));
         assert_eq!(v.on_key(&k("j")), vec![Action::InsertText("j".into())]);
-        assert!(!v.exit_pending());
     }
 }
