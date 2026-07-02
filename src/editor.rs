@@ -213,7 +213,30 @@ impl Editor {
         self.current = current;
         self.scroll.scroll_to_item(0, ScrollStrategy::Top); // a fresh buffer starts at the top
         self.last_line = 0;
+        self.reveal_current();
         window.focus(&self.focus);
+    }
+
+    /// Reveal the open buffer's file in the sidebar: expand collapsed ancestors,
+    /// park the sidebar cursor on its row, and scroll it into view. A pathless
+    /// buffer (or one outside the vault) parks the cursor at the top.
+    fn reveal_current(&mut self) {
+        self.selected = 0;
+        if let Some(path) = self.doc.path().map(Path::to_path_buf) {
+            expand_ancestors(&self.vault.root, &path, &mut self.expanded);
+            if let Some(i) = self
+                .vault
+                .visible_rows(&self.expanded)
+                .iter()
+                .position(|r| r.path == path)
+            {
+                self.selected = i;
+            }
+        }
+        // Scrolled here (centered, no-op if already visible), so the render
+        // pass's edge-scroll must not fire again.
+        self.last_selected = self.selected;
+        self.sidebar_scroll.scroll_to_item(self.selected, ScrollStrategy::Center);
     }
 
     /// Guard before replacing the buffer: `true` if it's safe to discard, else
@@ -445,18 +468,7 @@ impl Editor {
             match key {
                 "h" => {
                     self.pane = Pane::Sidebar;
-                    // Reveal the open file and park the cursor on it.
-                    if let Some(path) = self.doc.path().map(Path::to_path_buf) {
-                        expand_ancestors(&self.vault.root, &path, &mut self.expanded);
-                        self.selected = self
-                            .vault
-                            .visible_rows(&self.expanded)
-                            .iter()
-                            .position(|r| r.path == path)
-                            .unwrap_or(0);
-                    } else {
-                        self.selected = 0;
-                    }
+                    self.reveal_current();
                 }
                 "l" => self.pane = Pane::Editor,
                 _ => {}
