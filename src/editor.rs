@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use gpui::{
     div, fill, hsla, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
-    ClipboardItem, ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle,
+    ClipboardItem, ContentMask, Context, Div, FocusHandle, Focusable, Font, FontId, FontStyle,
     FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
@@ -37,12 +37,24 @@ enum Pane {
     Sidebar,
 }
 
+/// One open buffer: a `Document` plus tab metadata.
+struct Buffer {
+    doc: Document,
+    /// VS Code-style preview tab: the next file open replaces this buffer
+    /// instead of adding a tab; the first edit commits it (clears the flag).
+    /// At most one preview buffer exists at a time.
+    preview: bool,
+}
+
 /// What a picker row resolves to on Enter. New picker kinds add a variant
 /// (jump-to-heading → `Line(usize)`).
 enum PickItem {
     File(PathBuf),
     /// A registry command, by `Command::name`.
     Command(&'static str),
+    /// An open buffer, by index into `Editor::buffers`. A raw index is safe:
+    /// the picker is modal, so the buffer list can't change while it's open.
+    Buffer(usize),
 }
 
 /// The open fuzzy picker (file switcher / command palette) — a modal over the
@@ -75,18 +87,21 @@ struct SearchState {
     origin: Option<usize>,
 }
 
-/// The app's main view. Owns the open `Document`, the `Vim` grammar, and the
+/// The app's main view. Owns the open `Buffer`s, the `Vim` grammar, and the
 /// `Vault` (folder of notes), and renders a file-tree sidebar beside the text.
 /// One entity holds everything so clicks and file-switch keys need no
 /// cross-entity plumbing. Splits (multiple editors under a workspace) are a
 /// later refactor.
 pub struct Editor {
-    doc: Document,
+    /// Open buffers, in tab order. Never empty; `active` indexes into it.
+    buffers: Vec<Buffer>,
+    active: usize,
+    /// Previously active buffer — the `Ctrl-6` / `:b #` target. Re-pointed
+    /// when a `:bd` shifts indices.
+    alternate: Option<usize>,
     vim: Vim,
     focus: FocusHandle,
     vault: Vault,
-    /// Index into `vault.files` of the open file, if it's one of them.
-    current: Option<usize>,
     /// Transient status-line message (command result/error); cleared each key.
     message: Option<String>,
     /// Pane that receives keystrokes (`Ctrl-W h`/`l` switches).
@@ -146,14 +161,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Self {
         let vault = Vault::scan(vault_root);
-        let (doc, current) = match initial {
-            Some(path) => {
-                let idx = vault.files.iter().position(|f| f == &path);
-                (open_or_empty(&path), idx)
-            }
+        let doc = match initial {
+            Some(path) => open_or_empty(&path),
             None => match vault.files.first() {
-                Some(first) => (open_or_empty(first), Some(0)),
-                None => (Document::new(WELCOME), None),
+                Some(first) => open_or_empty(first),
+                None => Document::new(WELCOME),
             },
         };
         let vim = Vim::new(config.tab_width);
@@ -173,7 +185,11 @@ impl Editor {
             })
             .unwrap_or(0);
         Self {
-            doc,
+            // The startup buffer is a preview like any other open: the first
+            // navigation replaces it, the first edit commits it.
+            buffers: vec![Buffer { doc, preview: true }],
+            active: 0,
+            alternate: None,
             vim,
             focus: cx.focus_handle(),
             vault,
@@ -181,7 +197,6 @@ impl Editor {
             expanded,
             sidebar_scroll: UniformListScrollHandle::new(),
             last_selected: selected,
-            current,
             message: None,
             pane: Pane::Editor,
             pending_window: false,
@@ -202,11 +217,22 @@ impl Editor {
         }
     }
 
-    /// Open a file by path (sidebar click / Enter / switcher), pointing `current`
-    /// at its flat-list index so the open-file highlight tracks it.
+    fn doc(&self) -> &Document {
+        &self.buffers[self.active].doc
+    }
+
+    fn doc_mut(&mut self) -> &mut Document {
+        &mut self.buffers[self.active].doc
+    }
+
+    /// Open a file by path (sidebar click / Enter / switcher / `:e`): switch
+    /// to its buffer if one is already open, else show it in the preview slot.
     fn open_path(&mut self, path: PathBuf, window: &mut Window) {
-        let idx = self.vault.files.iter().position(|f| f == &path);
-        self.load(open_or_empty(&path), idx, window);
+        if let Some(i) = self.buffers.iter().position(|b| b.doc.path() == Some(path.as_path())) {
+            self.activate(i, window);
+            return;
+        }
+        self.show_preview(open_or_empty(&path), window);
     }
 
     /// Expand or collapse a folder, then clamp the cursor — collapsing drops the
@@ -219,22 +245,49 @@ impl Editor {
         self.selected = self.selected.min(n.saturating_sub(1));
     }
 
-    /// Swap in `doc` as the open buffer: reset vim/scroll state, point `current`
-    /// at its vault index (`None` when it isn't a vault file), and refocus the
-    /// editor so keys keep flowing after a click or command.
-    fn load(&mut self, doc: Document, current: Option<usize>, window: &mut Window) {
-        self.doc = doc;
+    /// Make buffer `i` the active one: reset vim/keymap state, restore its
+    /// view, and refocus the editor so keys keep flowing after a click or
+    /// command. Leaves `alternate` untouched — `activate` (a user-facing
+    /// switch) records that.
+    fn switch_to(&mut self, i: usize, window: &mut Window) {
+        self.active = i;
         self.vim.reset(); // clears transient state, keeps config (tab width)
         self.keymap.clear(); // a pending binding sequence dies with the buffer
         self.seq_timer = None;
         // A mid-prompt buffer switch (Ctrl-P) must not restore a stale caret
         // into the new buffer. The query itself survives — vim search is global.
         self.search.origin = None;
-        self.current = current;
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top); // a fresh buffer starts at the top
-        self.last_line = 0;
+        // The scroll handle is shared across buffers and still holds the old
+        // offset; recenter on this buffer's own caret (kept on its Document).
+        let line = self.doc().caret_line_col().0;
+        self.scroll.scroll_to_item_strict(line, ScrollStrategy::Center);
+        self.last_line = line;
         self.reveal_current();
         window.focus(&self.focus);
+    }
+
+    /// Switch to buffer `i`, recording where we came from for `Ctrl-6`/`:b #`.
+    fn activate(&mut self, i: usize, window: &mut Window) {
+        if i != self.active {
+            self.alternate = Some(self.active);
+        }
+        self.switch_to(i, window);
+    }
+
+    /// Show `doc` in the preview slot: replace the existing preview buffer, or
+    /// append a new preview tab.
+    fn show_preview(&mut self, doc: Document, window: &mut Window) {
+        let buf = Buffer { doc, preview: true };
+        match self.buffers.iter().position(|b| b.preview) {
+            Some(i) => {
+                self.buffers[i] = buf;
+                self.activate(i, window);
+            }
+            None => {
+                self.buffers.push(buf);
+                self.activate(self.buffers.len() - 1, window);
+            }
+        }
     }
 
     /// Reveal the open buffer's file in the sidebar: expand collapsed ancestors,
@@ -242,7 +295,7 @@ impl Editor {
     /// buffer (or one outside the vault) parks the cursor at the top.
     fn reveal_current(&mut self) {
         self.selected = 0;
-        if let Some(path) = self.doc.path().map(Path::to_path_buf) {
+        if let Some(path) = self.doc().path().map(Path::to_path_buf) {
             expand_ancestors(&self.vault.root, &path, &mut self.expanded);
             if let Some(i) = self
                 .vault
@@ -259,11 +312,11 @@ impl Editor {
         self.sidebar_scroll.scroll_to_item(self.selected, ScrollStrategy::Center);
     }
 
-    /// Guard before replacing the buffer: `true` if it's safe to discard, else
-    /// sets the vim E37 message and returns `false`. `bang` (`:e!`/`:enew!`)
-    /// forces it through.
+    /// Guard before discarding the active buffer's changes (the in-place `:e`
+    /// reload): `true` if it's safe, else sets the vim E37 message and returns
+    /// `false`. `bang` (`:e!`) forces it through.
     fn may_discard(&mut self, bang: bool) -> bool {
-        if self.doc.is_dirty() && !bang {
+        if self.doc().is_dirty() && !bang {
             self.message = Some("E37: No write since last change (add ! to override)".into());
             false
         } else {
@@ -274,26 +327,132 @@ impl Editor {
     /// `:e {path}` — open `path` for editing. A nonexistent file opens as a
     /// blank buffer that `:w` creates (`Document::open` is vim-lazy). Relative
     /// names resolve under the vault root, so a new note lands in — and shows up
-    /// in — the vault. Refuses to abandon unsaved changes unless `bang` (`:e!`).
+    /// in — the vault. Opening lands in a buffer, so nothing is discarded — the
+    /// exception is `:e` on the already-open file, vim's reload-from-disk,
+    /// which drops unsaved changes only with `bang` (`:e!`).
     fn edit(&mut self, name: &str, bang: bool, window: &mut Window) {
         if name.is_empty() {
             self.message = Some("E32: No file name".into());
             return;
         }
-        if !self.may_discard(bang) {
+        let path = resolve(&self.vault.root, name);
+        if self.doc().path() == Some(path.as_path()) {
+            if !self.may_discard(bang) {
+                return;
+            }
+            // Reload in place: same tab (preview flag kept), fresh Document —
+            // the undo history goes with it, since it indexes the old text.
+            self.buffers[self.active].doc = open_or_empty(&path);
+            self.switch_to(self.active, window);
             return;
         }
-        let path = resolve(&self.vault.root, name);
-        let idx = self.vault.files.iter().position(|f| f == &path);
-        self.load(open_or_empty(&path), idx, window);
+        self.open_path(path, window);
     }
 
-    /// `:enew` — start a blank, unnamed buffer; name it on the first `:w {name}`.
-    fn enew(&mut self, bang: bool, window: &mut Window) {
-        if !self.may_discard(bang) {
+    /// `:enew` — a blank, unnamed buffer in the preview slot; name it on the
+    /// first `:w {name}`.
+    fn enew(&mut self, window: &mut Window) {
+        self.show_preview(Document::new(""), window);
+    }
+
+    /// Tab / `:b`-match display name: vault-relative path (`.md` dropped) for
+    /// pathed buffers, `[No Name]` for scratch.
+    fn buffer_display(&self, b: &Buffer) -> String {
+        b.doc
+            .path()
+            .map(|p| rel_display(&self.vault.root, p))
+            .unwrap_or_else(|| "[No Name]".into())
+    }
+
+    /// `:b {arg}` — switch buffer by tab number, `#` (alternate), or name.
+    fn buffer_switch(&mut self, arg: Option<&str>, window: &mut Window) {
+        let Some(arg) = arg else {
+            self.message = Some("E471: Argument required".into());
+            return;
+        };
+        if arg == "#" {
+            self.buffer_alternate(window);
             return;
         }
-        self.load(Document::new(""), None, window);
+        let names: Vec<String> = self.buffers.iter().map(|b| self.buffer_display(b)).collect();
+        match match_buffer(arg, &names) {
+            Ok(i) => self.activate(i, window),
+            Err(msg) => self.message = Some(msg),
+        }
+    }
+
+    /// `:bn` — cycle forward through the tabs, wrapping.
+    fn buffer_next(&mut self, window: &mut Window) {
+        self.activate((self.active + 1) % self.buffers.len(), window);
+    }
+
+    /// `:bp` — cycle backward through the tabs, wrapping.
+    fn buffer_prev(&mut self, window: &mut Window) {
+        let n = self.buffers.len();
+        self.activate((self.active + n - 1) % n, window);
+    }
+
+    /// `Ctrl-6` / `:b #` — bounce to the previously active buffer.
+    fn buffer_alternate(&mut self, window: &mut Window) {
+        match self.alternate {
+            Some(i) => self.activate(i, window),
+            None => self.message = Some("E23: No alternate file".into()),
+        }
+    }
+
+    /// Close tab `i` (`:bd` semantics): refuse while dirty unless `bang`. The
+    /// last tab is replaced by a scratch buffer — `buffers` is never empty.
+    fn close_buffer(&mut self, i: usize, bang: bool, window: &mut Window) {
+        if self.buffers[i].doc.is_dirty() && !bang {
+            self.message = Some("E89: No write since last change (add ! to override)".into());
+            return;
+        }
+        self.buffers.remove(i);
+        // The removal shifted every index above it; re-point (or drop) alternate.
+        self.alternate = match self.alternate {
+            Some(a) if a == i => None,
+            Some(a) if a > i => Some(a - 1),
+            other => other,
+        };
+        if self.buffers.is_empty() {
+            self.buffers.push(Buffer { doc: Document::new(""), preview: true });
+        }
+        if self.active == i {
+            // Closed the active tab: land on the next one (clamped). switch_to,
+            // not activate — the dead slot must not become the alternate.
+            self.switch_to(i.min(self.buffers.len() - 1), window);
+        } else if self.active > i {
+            self.active -= 1; // same buffer, shifted index
+        }
+    }
+
+    /// `:q`(`!`) — quit the app; refuses while any buffer has unsaved changes.
+    fn quit(&mut self, bang: bool, cx: &mut Context<Self>) {
+        if !bang {
+            if let Some(b) = self.buffers.iter().find(|b| b.doc.is_dirty()) {
+                let name = self.buffer_display(b);
+                self.message =
+                    Some(format!("E162: No write since last change for buffer \"{name}\""));
+                return;
+            }
+        }
+        cx.quit();
+    }
+
+    /// `:ls` — the open-buffer picker: tab number + display name (+ `[+]`).
+    fn open_buffer_picker(&mut self) {
+        let items: Vec<(String, PickItem)> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let dirty = if b.doc.is_dirty() { " [+]" } else { "" };
+                (format!("{}: {}{dirty}", i + 1, self.buffer_display(b)), PickItem::Buffer(i))
+            })
+            .collect();
+        let results = (0..items.len()).collect();
+        self.picker =
+            Some(Picker { title: "buf> ", items, query: String::new(), results, selected: 0 });
     }
 
     /// Open the fuzzy file picker over a snapshot of the current vault files.
@@ -348,6 +507,7 @@ impl Editor {
                         match p.items.swap_remove(idx).1 {
                             PickItem::File(path) => self.open_path(path, window), // refocuses the editor
                             PickItem::Command(name) => self.run_picked_command(name, window, cx),
+                            PickItem::Buffer(i) => self.activate(i, window),
                         }
                     }
                 }
@@ -445,6 +605,57 @@ impl Editor {
                         ),
                 ),
         )
+    }
+
+    /// The tab row above the editor: one tab per buffer, `{n}: {basename}`,
+    /// `[+]` when dirty, italic while a preview. Click switches; middle-click
+    /// closes (`:bd` semantics, no force).
+    fn render_tabline(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let theme = *theme;
+        let entity = cx.entity();
+        div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .bg(theme.status_background)
+            .children(self.buffers.iter().enumerate().map(|(i, b)| {
+                let name = b
+                    .doc
+                    .path()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "[No Name]".into());
+                let dirty = if b.doc.is_dirty() { " [+]" } else { "" };
+                // Active tab joins the buffer area's background; inactive tabs
+                // recede into the (status-colored) strip.
+                let (bg, fg) = if i == self.active {
+                    (theme.background, theme.foreground)
+                } else {
+                    (theme.status_background, theme.muted)
+                };
+                let switch = entity.clone();
+                let close = entity.clone();
+                div()
+                    .px_2()
+                    .min_w_0()
+                    .truncate() // a crowded tab row shrinks tabs, never the layout
+                    .bg(bg)
+                    .text_color(fg)
+                    .when(b.preview, |d| d.italic())
+                    .child(format!("{}: {name}{dirty}", i + 1))
+                    .on_mouse_up(MouseButton::Left, move |_ev: &MouseUpEvent, window, cx| {
+                        switch.update(cx, |this, cx| {
+                            this.activate(i, window);
+                            cx.notify();
+                        });
+                    })
+                    .on_mouse_up(MouseButton::Middle, move |_ev: &MouseUpEvent, window, cx| {
+                        close.update(cx, |this, cx| {
+                            this.close_buffer(i, false, window);
+                            cx.notify();
+                        });
+                    })
+            }))
     }
 
     /// Navigate the sidebar tree (`Pane::Sidebar`): `j`/`k` move the cursor over
@@ -560,7 +771,7 @@ impl Editor {
         // else (normal- and visual-mode mutations) gets its own.
         let mutates = mode_before != Mode::Insert && actions.iter().any(Action::mutates);
         if entering_insert || mutates {
-            self.doc.checkpoint();
+            self.doc_mut().checkpoint();
         }
         let wrote_register = actions.iter().any(Action::writes_register);
         for action in actions {
@@ -568,14 +779,14 @@ impl Editor {
         }
         // clipboard=unnamed: mirror every register write (yank/delete) out to
         // the system clipboard.
-        if wrote_register && !self.doc.register_text().is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.doc.register_text().to_owned()));
+        if wrote_register && !self.doc().register_text().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.doc().register_text().to_owned()));
         }
         // Normal mode disallows the caret one past the line's last char; the
         // shared motions/edits allow it (insert mode appends there), so snap
         // back at this choke point whenever a keystroke lands in normal mode.
         if self.vim.mode == Mode::Normal {
-            self.doc.clamp_caret_to_line();
+            self.doc_mut().clamp_caret_to_line();
         }
         // After the actions: a submitted search has consumed `origin` in apply,
         // so a leftover origin on prompt close means the prompt was cancelled.
@@ -612,45 +823,47 @@ impl Editor {
             // just moves the caret.
             Action::Move(m, n) => {
                 if self.vim.mode.is_visual() {
-                    self.doc.extend_motion(m, n);
+                    self.doc_mut().extend_motion(m, n);
                 } else {
-                    self.doc.move_motion(m, n);
+                    self.doc_mut().move_motion(m, n);
                 }
             }
-            Action::DeleteSelection { linewise } => self.doc.delete_selection(linewise),
-            Action::YankSelection { linewise } => self.doc.yank_selection(linewise),
-            Action::IndentSelection { width, dedent } => self.doc.indent_selection(width, dedent),
-            Action::CollapseSelection => self.doc.collapse_selection(),
-            Action::DeleteMotion(m, n) => self.doc.delete_motion(m, n),
-            Action::DeleteLines(n) => self.doc.delete_lines(n),
-            Action::DeleteLinesVertical { count, up } => self.doc.delete_lines_dir(count, up),
-            Action::DeleteCharUnder(n) => self.doc.delete_char_under(n),
-            Action::YankMotion(m, n) => self.doc.yank_motion(m, n),
-            Action::YankLines(n) => self.doc.yank_lines(n),
+            Action::DeleteSelection { linewise } => self.doc_mut().delete_selection(linewise),
+            Action::YankSelection { linewise } => self.doc_mut().yank_selection(linewise),
+            Action::IndentSelection { width, dedent } => {
+                self.doc_mut().indent_selection(width, dedent)
+            }
+            Action::CollapseSelection => self.doc_mut().collapse_selection(),
+            Action::DeleteMotion(m, n) => self.doc_mut().delete_motion(m, n),
+            Action::DeleteLines(n) => self.doc_mut().delete_lines(n),
+            Action::DeleteLinesVertical { count, up } => self.doc_mut().delete_lines_dir(count, up),
+            Action::DeleteCharUnder(n) => self.doc_mut().delete_char_under(n),
+            Action::YankMotion(m, n) => self.doc_mut().yank_motion(m, n),
+            Action::YankLines(n) => self.doc_mut().yank_lines(n),
             // clipboard=unnamed: an external copy supersedes the internal
             // register. Same content means the register was ours (we mirrored
             // it out), so keep its linewise flag; foreign text guesses linewise
             // from a trailing newline.
             Action::Paste { after } => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    if text != self.doc.register_text() {
+                    if text != self.doc().register_text() {
                         let linewise = text.ends_with('\n');
-                        self.doc.set_register(text, linewise);
+                        self.doc_mut().set_register(text, linewise);
                     }
                 }
-                self.doc.paste(after)
+                self.doc_mut().paste(after)
             }
-            Action::InsertText(s) => self.doc.insert(&s),
-            Action::Newline { clear_empty } => self.doc.insert_newline(clear_empty),
-            Action::Tab { width, dedent } => self.doc.indent(width, dedent),
-            Action::DeleteBackward => self.doc.delete_backward(),
-            Action::DeleteForward => self.doc.delete_forward(),
-            Action::Undo => self.doc.undo(),
+            Action::InsertText(s) => self.doc_mut().insert(&s),
+            Action::Newline { clear_empty } => self.doc_mut().insert_newline(clear_empty),
+            Action::Tab { width, dedent } => self.doc_mut().indent(width, dedent),
+            Action::DeleteBackward => self.doc_mut().delete_backward(),
+            Action::DeleteForward => self.doc_mut().delete_forward(),
+            Action::Undo => self.doc_mut().undo(),
             // `z` scroll commands don't move the caret, so the render auto-scroll
             // won't override this; `_strict` repositions the already-visible
             // cursor line (plain `scroll_to_item` no-ops when it's on screen).
             Action::Scroll(s) => {
-                let line = self.doc.caret_line_col().0;
+                let line = self.doc().caret_line_col().0;
                 let strategy = match s {
                     Scroll::Center => ScrollStrategy::Center,
                     Scroll::Top => ScrollStrategy::Top,
@@ -668,7 +881,7 @@ impl Editor {
     /// new direction. The jump starts from where the prompt opened — incsearch
     /// may have dragged the caret elsewhere while typing.
     fn do_search(&mut self, query: String, backward: bool) {
-        let origin = self.search.origin.take().unwrap_or_else(|| self.doc.caret_offset());
+        let origin = self.search.origin.take().unwrap_or_else(|| self.doc().caret_offset());
         if !query.is_empty() {
             self.search.query = query;
         }
@@ -678,7 +891,7 @@ impl Editor {
         }
         self.search.backward = backward;
         self.search.hl = true;
-        self.doc.jump_to(origin);
+        self.doc_mut().jump_to(origin);
         self.find_and_jump(backward, 1);
     }
 
@@ -696,8 +909,8 @@ impl Editor {
     /// and not-found messages. The caret stays put when nothing is found.
     fn find_and_jump(&mut self, backward: bool, count: usize) {
         let q = &self.search.query;
-        let matches = find_matches(&self.doc.rope, q, search_sensitive(q, &self.search_cfg));
-        let mut at = self.doc.caret_offset();
+        let matches = find_matches(&self.doc().rope, q, search_sensitive(q, &self.search_cfg));
+        let mut at = self.doc().caret_offset();
         let mut wrapped = false;
         for _ in 0..count.max(1) {
             match next_match(&matches, at, backward, self.search_cfg.wrapscan) {
@@ -717,7 +930,7 @@ impl Editor {
                 }
             }
         }
-        self.doc.jump_to(at);
+        self.doc_mut().jump_to(at);
         if wrapped {
             self.message = Some(if backward {
                 "search hit TOP, continuing at BOTTOM".into()
@@ -735,7 +948,7 @@ impl Editor {
         let in_prompt = self.vim.mode == Mode::Command && self.vim.prompt() != ':';
         if in_prompt {
             if mode_before != Mode::Command {
-                self.search.origin = Some(self.doc.caret_offset());
+                self.search.origin = Some(self.doc().caret_offset());
             }
             if self.search_cfg.incsearch {
                 let origin = self.search.origin.unwrap_or(0);
@@ -743,25 +956,21 @@ impl Editor {
                 let jump = (!q.is_empty())
                     .then(|| {
                         let matches =
-                            find_matches(&self.doc.rope, q, search_sensitive(q, &self.search_cfg));
+                            find_matches(&self.doc().rope, q, search_sensitive(q, &self.search_cfg));
                         next_match(&matches, origin, self.vim.prompt() == '?', self.search_cfg.wrapscan)
                             .map(|(i, _)| matches[i].0)
                     })
                     .flatten();
-                self.doc.jump_to(jump.unwrap_or(origin)); // no match → sit at origin
+                self.doc_mut().jump_to(jump.unwrap_or(origin)); // no match → sit at origin
             }
         } else if let Some(origin) = self.search.origin.take() {
-            self.doc.jump_to(origin); // Esc / backspace-past-prompt cancelled
+            self.doc_mut().jump_to(origin); // Esc / backspace-past-prompt cancelled
         }
     }
 
-    /// Re-read the vault from disk and re-point `current` at the open file.
-    /// A file saved outside the vault root simply won't be found (`current` →
-    /// `None`), which is correct — it isn't part of this vault.
+    /// Re-read the vault from disk (a save may have created a new file).
     fn rescan_vault(&mut self) {
         self.vault = Vault::scan(self.vault.root.clone());
-        let open = self.doc.path().map(Path::to_path_buf);
-        self.current = open.and_then(|p| self.vault.files.iter().position(|f| f == &p));
         // The tree may have shrunk; keep the sidebar cursor in range.
         let n = self.vault.visible_rows(&self.expanded).len();
         self.selected = self.selected.min(n.saturating_sub(1));
@@ -774,21 +983,25 @@ impl Editor {
             Some(name) => {
                 let path = resolve(&self.vault.root, name);
                 let display = path.display().to_string();
-                let r = self.doc.save_as(path).map(|()| display);
+                let r = self.doc_mut().save_as(path).map(|()| display);
                 if r.is_ok() {
-                    // A new file may now exist under the vault root — re-scan so
-                    // the sidebar shows it and `current` tracks the open file.
+                    // A new file may now exist under the vault root — re-scan
+                    // so the sidebar shows it.
                     self.rescan_vault();
                 }
                 r
             }
-            None => match self.doc.path().map(|p| p.display().to_string()) {
+            None => match self.doc().path().map(|p| p.display().to_string()) {
                 Some(display) => {
-                    let r = self.doc.save().map(|()| display);
-                    // A blank `:e`-created buffer isn't in the vault yet (it had
-                    // no file on disk); once written, re-scan so the sidebar
-                    // picks it up and `current` tracks it.
-                    if r.is_ok() && self.current.is_none() {
+                    // A buffer created by `:e {new}` has no file on disk yet, so
+                    // the vault listing doesn't know it; once the write lands,
+                    // re-scan so the sidebar picks it up.
+                    let known = self
+                        .doc()
+                        .path()
+                        .is_some_and(|p| self.vault.files.iter().any(|f| f == p));
+                    let r = self.doc_mut().save().map(|()| display);
+                    if r.is_ok() && !known {
                         self.rescan_vault();
                     }
                     r
@@ -799,6 +1012,10 @@ impl Editor {
                 }
             },
         };
+        if result.is_ok() {
+            // Saving pins a preview tab, edited or not (VS Code behavior).
+            self.buffers[self.active].preview = false;
+        }
         self.message = Some(match result {
             Ok(name) => format!("\"{name}\" written"),
             Err(e) => format!("save failed: {e}"),
@@ -878,6 +1095,44 @@ fn rel_display(root: &Path, path: &Path) -> String {
     rel.with_extension("").to_string_lossy().replace('\\', "/")
 }
 
+/// Resolve a `:b` argument against buffer display names (vault-relative, `.md`
+/// dropped): a 1-based tab number, an exact name/basename match, else a unique
+/// case-insensitive substring match. `#` (alternate) is handled by the caller.
+/// Numbers are tab positions, not vim's stable buffer ids — positions are what
+/// the tabline shows.
+fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
+    if let Ok(n) = arg.parse::<usize>() {
+        return if (1..=names.len()).contains(&n) {
+            Ok(n - 1)
+        } else {
+            Err(format!("E86: Buffer {n} does not exist"))
+        };
+    }
+    let exact: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.as_str() == arg || n.rsplit('/').next() == Some(arg))
+        .map(|(i, _)| i)
+        .collect();
+    match exact.as_slice() {
+        [i] => return Ok(*i),
+        [] => {}
+        _ => return Err(format!("E93: More than one match for {arg}")),
+    }
+    let needle = arg.to_lowercase();
+    let subs: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.to_lowercase().contains(&needle))
+        .map(|(i, _)| i)
+        .collect();
+    match subs.as_slice() {
+        [i] => Ok(*i),
+        [] => Err(format!("E94: No matching buffer for {arg}")),
+        _ => Err(format!("E93: More than one match for {arg}")),
+    }
+}
+
 /// Filter `items` by `query`, returning matching indices best-first (indices,
 /// not displays, so duplicate display strings can't mispick). Empty query
 /// passes every index through in original order.
@@ -923,8 +1178,15 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, _win: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Commit the preview tab on its first edit. render runs after every
+        // notify, so this catches every mutation path (keys, chords, palette
+        // picks, timer-replayed sequences) without instrumenting each one.
+        if self.doc().is_dirty() {
+            self.buffers[self.active].preview = false;
+        }
+
         let theme = *cx.global::<Theme>();
-        let (cur_line, cur_col) = self.doc.caret_line_col();
+        let (cur_line, cur_col) = self.doc().caret_line_col();
 
         // Keep the caret on screen, but only when it actually moved — so the
         // mouse wheel can scroll freely without snapping back every frame.
@@ -963,7 +1225,7 @@ impl Render for Editor {
             self.picker_scroll.scroll_to_item(p.selected, ScrollStrategy::Center);
         }
 
-        let rope = self.doc.rope.clone(); // ropey clone is cheap (shared, CoW)
+        let rope = self.doc().rope.clone(); // ropey clone is cheap (shared, CoW)
         let line_count = rope.len_lines();
         // ponytail: full re-scan each render (≈ per keystroke). Markdown docs are
         // small and it's a cheap char walk; cache on a doc revision if it bites.
@@ -976,7 +1238,7 @@ impl Render for Editor {
         let num_width = line_count.to_string().len().max(3);
         // The selected char-range to highlight, `None` outside visual mode.
         let highlight: Option<(usize, usize)> =
-            mode.is_visual().then(|| self.doc.selection_span(mode == Mode::VisualLine));
+            mode.is_visual().then(|| self.doc().selection_span(mode == Mode::VisualLine));
 
         // Search matches to paint: the pending query while a search prompt is
         // open (incsearch preview), else the last submitted one while hlsearch
@@ -1001,25 +1263,18 @@ impl Render for Editor {
         } else if let Some(msg) = self.message.clone() {
             msg
         } else {
-            let mode_label = match mode {
+            // The filename (and dirty flag) live in the tabline.
+            match mode {
                 Mode::Insert => "INSERT",
                 Mode::Visual => "VISUAL",
                 Mode::VisualLine => "VISUAL LINE",
                 _ => "NORMAL",
-            };
-            // Basename only — the sidebar shows the location. ponytail: drop this
-            // from the status line entirely once tabs/buffers display the basename.
-            let name = self
-                .doc
-                .path()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "[No Name]".to_string());
-            let dirty = if self.doc.is_dirty() { " [+]" } else { "" };
-            format!("{mode_label}  {name}{dirty}")
+            }
+            .to_string()
         };
 
-        let open_path = self.doc.path().map(Path::to_path_buf);
+        let open_path = self.doc().path().map(Path::to_path_buf);
+        let tabline = self.render_tabline(&theme, cx);
         let cursor = (self.pane == Pane::Sidebar).then_some(self.selected);
         let rows = self.vault.visible_rows(&self.expanded);
         let row_count = rows.len();
@@ -1123,6 +1378,7 @@ impl Render for Editor {
                     .h_full()
                     .flex()
                     .flex_col()
+                    .child(tabline)
                     .child(
                         uniform_list("lines", line_count + overscroll, move |range, _win, _cx| {
                             range
@@ -1683,8 +1939,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, filter_items, find_matches, next_match, rel_display, remap_highlight,
-        resolve, search_sensitive, segment_style, Highlight, PickItem,
+        caret_bytes, filter_items, find_matches, match_buffer, next_match, rel_display,
+        remap_highlight, resolve, search_sensitive, segment_style, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -1809,5 +2065,25 @@ mod tests {
         let root = Path::new("/v");
         assert_eq!(rel_display(root, Path::new("/v/sub/note.md")), "sub/note");
         assert_eq!(rel_display(root, Path::new("/v/notes.v2.md")), "notes.v2");
+    }
+
+    #[test]
+    fn match_buffer_number_exact_partial() {
+        let names: Vec<String> =
+            ["projects/ideas", "daily/today", "daily/ideas-old", "[No Name]"]
+                .map(String::from)
+                .into();
+        // 1-based tab numbers, range-checked.
+        assert_eq!(match_buffer("2", &names), Ok(1));
+        assert!(match_buffer("0", &names).unwrap_err().starts_with("E86"));
+        assert!(match_buffer("5", &names).unwrap_err().starts_with("E86"));
+        // Exact full name, then exact basename, win over substring hits.
+        assert_eq!(match_buffer("projects/ideas", &names), Ok(0));
+        assert_eq!(match_buffer("ideas", &names), Ok(0)); // basename beats "ideas-old" substring
+        assert_eq!(match_buffer("[No Name]", &names), Ok(3));
+        // Unique substring (case-insensitive) matches; ambiguous/missing error.
+        assert_eq!(match_buffer("TODAY", &names), Ok(1));
+        assert!(match_buffer("daily", &names).unwrap_err().starts_with("E93"));
+        assert!(match_buffer("nope", &names).unwrap_err().starts_with("E94"));
     }
 }

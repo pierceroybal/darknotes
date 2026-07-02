@@ -47,27 +47,60 @@ pub(super) const COMMANDS: &[Command] = &[
         name: "enew",
         ex: &["enew"],
         takes_arg: false,
-        run: |ed, a, win, _cx| ed.enew(a.bang, win),
+        run: |ed, _a, win, _cx| ed.enew(win),
+    },
+    Command {
+        name: "buffer",
+        ex: &["b", "bu", "buffer"],
+        takes_arg: true,
+        run: |ed, a, win, _cx| ed.buffer_switch(a.arg.as_deref(), win),
+    },
+    Command {
+        name: "buffer-next",
+        ex: &["bn", "bnext"],
+        takes_arg: false,
+        run: |ed, _a, win, _cx| ed.buffer_next(win),
+    },
+    Command {
+        name: "buffer-prev",
+        ex: &["bp", "bprev", "bprevious"],
+        takes_arg: false,
+        run: |ed, _a, win, _cx| ed.buffer_prev(win),
+    },
+    Command {
+        name: "buffer-delete",
+        ex: &["bd", "bdelete"],
+        takes_arg: false,
+        run: |ed, a, win, _cx| ed.close_buffer(ed.active, a.bang, win),
+    },
+    Command {
+        name: "buffer-alternate",
+        ex: &["b#"],
+        takes_arg: false,
+        run: |ed, _a, win, _cx| ed.buffer_alternate(win),
+    },
+    Command {
+        name: "buffer-picker",
+        ex: &["ls", "buffers"],
+        takes_arg: false,
+        run: |ed, _a, _win, _cx| ed.open_buffer_picker(),
     },
     Command {
         name: "quit",
         ex: &["q", "quit"],
         takes_arg: false,
-        run: |ed, a, _win, cx| {
-            if ed.may_discard(a.bang) {
-                cx.quit();
-            }
-        },
+        run: |ed, a, _win, cx| ed.quit(a.bang, cx),
     },
     Command {
         name: "write-quit",
         ex: &["wq", "x"],
         takes_arg: false,
-        // Save first; quit only if the save actually stuck (it can fail).
+        // Save first; quit only if the save stuck (it can fail) — and `quit`
+        // still refuses if some *other* buffer holds unsaved changes.
         run: |ed, _a, _win, cx| {
             ed.save(None);
-            if !ed.doc.is_dirty() {
-                cx.quit();
+            if !ed.doc().is_dirty() {
+                ed.quit(false, cx);
             }
         },
     },
@@ -88,7 +121,7 @@ pub(super) const COMMANDS: &[Command] = &[
         name: "redo",
         ex: &[],
         takes_arg: false,
-        run: |ed, _a, _win, _cx| ed.doc.redo(),
+        run: |ed, _a, _win, _cx| ed.doc_mut().redo(),
     },
     Command {
         name: "command-palette",
@@ -128,6 +161,12 @@ pub(super) const DEFAULT_BINDINGS: &[(Ctx, &str, &str)] = &[
     (Ctx::Global, "ctrl-p", "open-file"),
     (Ctx::Global, "ctrl-shift-p", "command-palette"),
     (Ctx::Global, "ctrl-r", "redo"),
+    // Vim's tab-cycle keys; the resolver buffers the lone `g` for timeoutlen,
+    // and an unmatched follow-up (`gg`) replays into the grammar unchanged.
+    (Ctx::Normal, "g t", "buffer-next"),
+    (Ctx::Normal, "g shift-t", "buffer-prev"),
+    // Vim's Ctrl-^ alternate-buffer toggle, on its US-layout key.
+    (Ctx::Global, "ctrl-6", "buffer-alternate"),
 ];
 
 /// Split a trimmed ex line into `(name, bang, arg)`: the name runs to the
