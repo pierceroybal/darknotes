@@ -564,6 +564,12 @@ impl Editor {
         for action in actions {
             self.apply(action, window, cx);
         }
+        // Normal mode disallows the caret one past the line's last char; the
+        // shared motions/edits allow it (insert mode appends there), so snap
+        // back at this choke point whenever a keystroke lands in normal mode.
+        if self.vim.mode == Mode::Normal {
+            self.doc.clamp_caret_to_line();
+        }
         // After the actions: a submitted search has consumed `origin` in apply,
         // so a leftover origin on prompt close means the prompt was cancelled.
         self.sync_search_prompt(mode_before);

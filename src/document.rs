@@ -435,9 +435,21 @@ impl Document {
             self.rope.remove(from..to);
             self.dirty = true;
         }
-        // Keep the caret on a real char of the (now shorter) line.
-        let last_col = self.line_len_chars(line).saturating_sub(1);
-        self.set_caret(start + (from - start).min(last_col));
+        // The caret stays at the deletion point — which may now be past the
+        // line's last char. `s` needs it there (insert continues at that spot);
+        // for `x` the editor snaps it back with the normal-mode clamp.
+        self.set_caret(from);
+    }
+
+    /// Snap a caret sitting one past the line's last char back onto it. Normal
+    /// mode disallows that column (insert mode needs it for appending), so the
+    /// editor calls this after every keystroke that lands in normal mode.
+    pub fn clamp_caret_to_line(&mut self) {
+        let (line, col) = self.line_col_of(self.caret());
+        let len = self.line_len_chars(line);
+        if col >= len && col > 0 {
+            self.set_caret(self.rope.line_to_char(line) + len - 1);
+        }
     }
 
     /// Stash text in the unnamed register. Linewise text is normalized to end in
@@ -869,6 +881,34 @@ mod tests {
         let mut d = Document::new("abc");
         d.delete_char_under(1);
         assert_eq!(d.rope.to_string(), "bc");
+    }
+
+    #[test]
+    fn delete_char_under_last_char_leaves_caret_at_line_end() {
+        // `s` on the last char: insert must continue where the char was
+        // (after "ab"), so the delete does not snap the caret back.
+        let mut d = Document::new("abc");
+        d.move_motion(Motion::LineEnd, 1);
+        d.clamp_caret_to_line(); // caret on 'c', as normal mode has it
+        d.delete_char_under(1);
+        assert_eq!(d.rope.to_string(), "ab");
+        assert_eq!(d.caret_line_col(), (0, 2));
+    }
+
+    #[test]
+    fn clamp_caret_to_line_snaps_past_end() {
+        // `$` targets one past the last char; normal mode snaps onto it.
+        let mut d = Document::new("hello\n");
+        d.move_motion(Motion::LineEnd, 1);
+        assert_eq!(d.caret_line_col(), (0, 5));
+        d.clamp_caret_to_line();
+        assert_eq!(d.caret_line_col(), (0, 4));
+        // No-op mid-line and on an empty line.
+        d.clamp_caret_to_line();
+        assert_eq!(d.caret_line_col(), (0, 4));
+        d.move_motion(Motion::LineDown, 1); // the empty last line
+        d.clamp_caret_to_line();
+        assert_eq!(d.caret_line_col(), (1, 0));
     }
 
     #[test]
