@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use gpui::{
     div, fill, hsla, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
-    ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle, FontWeight,
+    ClipboardItem, ContentMask, Context, FocusHandle, Focusable, Font, FontId, FontStyle,
+    FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
     TextRun, UniformListScrollHandle, Window,
@@ -561,8 +562,14 @@ impl Editor {
         if entering_insert || mutates {
             self.doc.checkpoint();
         }
+        let wrote_register = actions.iter().any(Action::writes_register);
         for action in actions {
             self.apply(action, window, cx);
+        }
+        // clipboard=unnamed: mirror every register write (yank/delete) out to
+        // the system clipboard.
+        if wrote_register && !self.doc.register_text().is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.doc.register_text().to_owned()));
         }
         // Normal mode disallows the caret one past the line's last char; the
         // shared motions/edits allow it (insert mode appends there), so snap
@@ -620,7 +627,19 @@ impl Editor {
             Action::DeleteCharUnder(n) => self.doc.delete_char_under(n),
             Action::YankMotion(m, n) => self.doc.yank_motion(m, n),
             Action::YankLines(n) => self.doc.yank_lines(n),
-            Action::Paste { after } => self.doc.paste(after),
+            // clipboard=unnamed: an external copy supersedes the internal
+            // register. Same content means the register was ours (we mirrored
+            // it out), so keep its linewise flag; foreign text guesses linewise
+            // from a trailing newline.
+            Action::Paste { after } => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    if text != self.doc.register_text() {
+                        let linewise = text.ends_with('\n');
+                        self.doc.set_register(text, linewise);
+                    }
+                }
+                self.doc.paste(after)
+            }
             Action::InsertText(s) => self.doc.insert(&s),
             Action::Newline { clear_empty } => self.doc.insert_newline(clear_empty),
             Action::Tab { width, dedent } => self.doc.indent(width, dedent),

@@ -452,9 +452,15 @@ impl Document {
         }
     }
 
+    /// Unnamed-register contents, for mirroring to the system clipboard.
+    pub fn register_text(&self) -> &str {
+        &self.register.text
+    }
+
     /// Stash text in the unnamed register. Linewise text is normalized to end in
     /// a newline so paste can treat it as whole lines regardless of EOF quirks.
-    fn set_register(&mut self, text: String, linewise: bool) {
+    /// Also the entry point for loading external (system-clipboard) text.
+    pub fn set_register(&mut self, text: String, linewise: bool) {
         let text = if linewise && !text.ends_with('\n') {
             format!("{text}\n")
         } else {

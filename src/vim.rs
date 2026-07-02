@@ -80,6 +80,23 @@ impl Action {
                 | Action::DeleteForward
         )
     }
+
+    /// Whether this action stores text in the unnamed register (deletes and
+    /// yanks). The editor mirrors the register to the system clipboard after
+    /// these, vim's `clipboard=unnamed`.
+    pub fn writes_register(&self) -> bool {
+        matches!(
+            self,
+            Action::DeleteMotion(..)
+                | Action::DeleteLines(..)
+                | Action::DeleteLinesVertical { .. }
+                | Action::DeleteCharUnder(..)
+                | Action::DeleteSelection { .. }
+                | Action::YankMotion(..)
+                | Action::YankLines(..)
+                | Action::YankSelection { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
