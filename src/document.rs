@@ -46,6 +46,10 @@ pub enum Motion {
     LineEnd,
     FileStart,
     FileEnd,
+    /// `t{char}`: forward to just before the count-th `char` on the caret's
+    /// line. The target offset is the found char itself — exclusive sweeps
+    /// (`ct`/`dt`) stop right before it. Not found → the motion fails.
+    TillChar(char),
 }
 
 impl Motion {
@@ -368,18 +372,23 @@ impl Document {
     pub fn delete_lines(&mut self, count: usize) {
         let (line, _) = self.line_col_of(self.caret());
         let start = self.rope.line_to_char(line);
-        let end_line = (line + count.max(1)).min(self.rope.len_lines());
-        let end = if end_line >= self.rope.len_lines() {
-            self.rope.len_chars()
+        let end_line = line + count.max(1);
+        // Deleting through the buffer's last line must also take the newline
+        // *before* the range: there is none after it, so leaving the previous
+        // one behind keeps a phantom empty last line (and on an already-empty
+        // last line the delete would remove nothing at all).
+        let (end, del_start) = if end_line >= self.rope.len_lines() {
+            (self.rope.len_chars(), start.saturating_sub(1))
         } else {
-            self.rope.line_to_char(end_line)
+            (self.rope.line_to_char(end_line), start)
         };
-        if start < end {
+        if del_start < end {
             self.set_register(self.rope.slice(start..end).to_string(), true);
-            self.rope.remove(start..end);
+            self.rope.remove(del_start..end);
             self.dirty = true;
         }
-        self.set_caret(start.min(self.rope.len_chars()));
+        let at = start.min(self.rope.len_chars());
+        self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
     }
 
     /// `dj`/`dk`: delete the caret's line plus `count` lines in a direction
@@ -399,17 +408,19 @@ impl Document {
             (line, (line + count).min(last))
         };
         let start = self.rope.line_to_char(first);
-        let end = if last_del >= last {
-            self.rope.len_chars()
+        // Same last-line rule as `delete_lines`: take the preceding newline.
+        let (end, del_start) = if last_del >= last {
+            (self.rope.len_chars(), start.saturating_sub(1))
         } else {
-            self.rope.line_to_char(last_del + 1)
+            (self.rope.line_to_char(last_del + 1), start)
         };
-        if start < end {
+        if del_start < end {
             self.set_register(self.rope.slice(start..end).to_string(), true);
-            self.rope.remove(start..end);
+            self.rope.remove(del_start..end);
             self.dirty = true;
         }
-        self.set_caret(start.min(self.rope.len_chars()));
+        let at = start.min(self.rope.len_chars());
+        self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
     }
 
     /// `x`: delete `count` chars at the caret, not past end-of-line.
@@ -595,6 +606,17 @@ impl Document {
                 }
                 p
             }
+            Motion::TillChar(ch) => {
+                let (line, col) = self.line_col_of(from);
+                self.rope
+                    .line(line)
+                    .chars()
+                    .enumerate()
+                    .skip(col + 1)
+                    .filter(|&(_, c)| c == ch)
+                    .nth(count - 1)
+                    .map_or(from, |(i, _)| self.rope.line_to_char(line) + i)
+            }
         }
     }
 
@@ -771,6 +793,40 @@ mod tests {
         let mut d = Document::new("a\nb\nc");
         d.delete_lines(2);
         assert_eq!(d.rope.to_string(), "c");
+    }
+
+    #[test]
+    fn delete_lines_on_last_line_takes_preceding_newline() {
+        // Empty last line (buffer ends in '\n'): dd deletes it, not a no-op.
+        let mut d = Document::new("abc\n");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_lines(1);
+        assert_eq!(d.rope.to_string(), "abc");
+        assert_eq!(d.caret_line_col(), (0, 0));
+
+        // Non-empty last line: no phantom empty line left behind.
+        let mut d = Document::new("abc\ndef");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_lines(1);
+        assert_eq!(d.rope.to_string(), "abc");
+
+        // A mid-buffer dd before an empty last line keeps that line.
+        let mut d = Document::new("abc\ndef\n");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_lines(1);
+        assert_eq!(d.rope.to_string(), "abc\n");
+    }
+
+    #[test]
+    fn till_char_motion() {
+        let mut d = Document::new("say (hi) x");
+        // Target is the found char itself — exclusive sweeps stop before it.
+        assert_eq!(d.motion_target(Motion::TillChar('('), 0, 1), 4);
+        // Count picks the n-th occurrence; not found → motion fails.
+        assert_eq!(d.motion_target(Motion::TillChar(')'), 0, 1), 7);
+        assert_eq!(d.motion_target(Motion::TillChar('z'), 0, 1), 0);
+        d.delete_motion(Motion::TillChar('x'), 1); // ct/dt sweep
+        assert_eq!(d.rope.to_string(), "x");
     }
 
     #[test]

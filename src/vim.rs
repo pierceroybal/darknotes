@@ -114,6 +114,10 @@ enum Pending {
     None,
     /// An operator (`d`/`y`/`c`) awaiting its motion, or a doubled key (`dd`).
     Operator(Op),
+    /// An operator saw `t`; the next key is the literal target char
+    /// (`ct{char}`/`dt{char}`). Carries the count since `apply_operator`
+    /// consumed it when `t` arrived.
+    Till { op: Op, count: usize },
     /// `g` was pressed; the next key completes a `g`-sequence (`gg`).
     GPrefix,
     /// `z` was pressed; the next key completes a `z`-sequence (`zz`/`zt`/`zb`).
@@ -212,6 +216,23 @@ impl Vim {
             return vec![];
         }
 
+        // A pending `t` target consumes this key as a literal char — before
+        // count parsing, so `dt3` reads `3` as the target, not a count.
+        if let Pending::Till { op, count } = self.pending {
+            self.pending = Pending::None;
+            // `key_char` is the typed char (shift applied); keys that don't
+            // produce one (arrows, enter, …) abort the operator.
+            let Some(ch) = ks.key_char.as_ref().and_then(|s| s.chars().next()) else {
+                return vec![];
+            };
+            let till = Motion::TillChar(ch);
+            return match op {
+                Op::Delete => vec![Action::DeleteMotion(till, count)],
+                Op::Yank => vec![Action::YankMotion(till, count)],
+                Op::Change => self.enter_insert(vec![Action::DeleteMotion(till, count)]),
+            };
+        }
+
         // Count digits. '0' counts only mid-count; with no count pending it's the
         // line-start motion handled below. Runs before the pending-sequence step
         // so a count between operator and motion accumulates (`d3w`).
@@ -230,7 +251,8 @@ impl Vim {
             Pending::Operator(op) => return self.apply_operator(op, key, shift),
             Pending::GPrefix => return self.complete_g_prefix(key),
             Pending::ZPrefix => return self.complete_z_prefix(key),
-            Pending::None => {}
+            // Till is resolved above, before count parsing.
+            Pending::Till { .. } | Pending::None => {}
         }
 
         // Motions come from one table shared with visual and operator-pending;
@@ -297,6 +319,12 @@ impl Vim {
             ]),
             // `C`: change to end of line — delete to EOL, then insert. Same as `c$`.
             ("c", true) => self.enter_insert(vec![Action::DeleteMotion(Motion::LineEnd, 1)]),
+            // `D`: delete to end of line. Same as `d$`.
+            // ponytail: count (`2D`) ignored — extend when multi-line D matters.
+            ("d", true) => {
+                self.count = None;
+                vec![Action::DeleteMotion(Motion::LineEnd, 1)]
+            }
             // The current caret is already the selection's anchor (normal-mode
             // ops leave a bare caret), so entering visual just flips the mode.
             ("v", false) => {
@@ -488,6 +516,11 @@ impl Vim {
                 ]),
             };
         }
+        // `t` needs one more key (its target char); park the operator + count.
+        if (key, shift) == ("t", false) {
+            self.pending = Pending::Till { op, count };
+            return vec![];
+        }
         match motion(key, shift) {
             Some(spec) if spec.op_target => match op {
                 Op::Delete => vec![Action::DeleteMotion(spec.motion, count)],
@@ -636,6 +669,58 @@ mod tests {
         };
         assert_eq!(v.on_key(&c_shift), vec![Action::DeleteMotion(Motion::LineEnd, 1)]);
         assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn capital_d_deletes_to_eol() {
+        let mut v = vim();
+        let d_shift = Keystroke {
+            key: "d".into(),
+            key_char: Some("D".into()),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&d_shift), vec![Action::DeleteMotion(Motion::LineEnd, 1)]);
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ct_changes_till_char() {
+        let mut v = vim();
+        v.on_key(&k("c"));
+        assert!(v.on_key(&k("t")).is_empty()); // awaiting the target char
+        assert_eq!(
+            v.on_key(&k("x")),
+            vec![Action::DeleteMotion(Motion::TillChar('x'), 1)]
+        );
+        assert_eq!(v.mode, Mode::Insert);
+
+        // The target is literal — a digit after `t` is not a count.
+        let mut v = vim();
+        v.on_key(&k("d"));
+        v.on_key(&k("t"));
+        assert_eq!(
+            v.on_key(&k("3")),
+            vec![Action::DeleteMotion(Motion::TillChar('3'), 1)]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+
+        // `2ctx`: the count rides along.
+        let mut v = vim();
+        v.on_key(&k("2"));
+        v.on_key(&k("c"));
+        v.on_key(&k("t"));
+        assert_eq!(
+            v.on_key(&k("x")),
+            vec![Action::DeleteMotion(Motion::TillChar('x'), 2)]
+        );
+
+        // A non-printing key aborts the operator.
+        let mut v = vim();
+        v.on_key(&k("c"));
+        v.on_key(&k("t"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert_eq!(v.mode, Mode::Normal);
+        assert_eq!(v.on_key(&k("x")), vec![Action::DeleteCharUnder(1)]); // grammar clean
     }
 
     #[test]
