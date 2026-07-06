@@ -102,7 +102,8 @@ impl Default for Config {
         Self {
             vault: None,
             theme: "dark".into(),
-            font_family: "DejaVu Sans Mono".into(),
+            // Embedded at startup in main.rs; always available regardless of OS.
+            font_family: "Courier Prime".into(),
             font_size: 15.0,
             tab_width: 2,
             line_numbers: LineNumbers::Off,

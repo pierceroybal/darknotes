@@ -10,7 +10,8 @@
 # Color palette: "dark" (default) or "light".
 theme = "dark"
 
-font_family = "DejaVu Sans Mono"
+# "Courier Prime" is embedded in the binary; any installed family works too.
+font_family = "Courier Prime"
 font_size   = 15
 tab_width    = 2   # spaces inserted for Tab
 

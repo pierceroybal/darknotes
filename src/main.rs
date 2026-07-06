@@ -24,6 +24,27 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
+        // Embedded so the editor font renders identically on every machine,
+        // with no system-install step. All four styles ship because markdown
+        // rendering uses bold/italic runs; missing styles would fall back to
+        // another family mid-line.
+        cx.text_system()
+            .add_fonts(vec![
+                include_bytes!("../assets/fonts/CourierPrime-Regular.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../assets/fonts/CourierPrime-Bold.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../assets/fonts/CourierPrime-Italic.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../assets/fonts/CourierPrime-BoldItalic.ttf")
+                    .as_slice()
+                    .into(),
+            ])
+            .expect("embedded Courier Prime fonts are valid TTFs");
+
         let config = Config::load();
         let theme = theme::Theme::by_name(&config.theme).unwrap_or_else(|| {
             eprintln!("darknotes: unknown theme {:?}; using default", config.theme);
