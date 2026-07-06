@@ -60,6 +60,15 @@ impl Motion {
     }
 }
 
+/// A text object: the region around the caret an operator acts on (`diw`,
+/// `dap`). `around` (`a` vs `i`) also takes the adjacent whitespace — trailing
+/// spaces for a word, trailing blank lines for a paragraph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextObject {
+    Word { around: bool },
+    Paragraph { around: bool },
+}
+
 /// The unnamed register: text from the last delete/yank, replayed by `p`/`P`.
 /// `linewise` (from `dd`/`yy`) pastes on new lines; charwise pastes inline.
 #[derive(Clone, Default)]
@@ -421,6 +430,157 @@ impl Document {
         }
         let at = start.min(self.rope.len_chars());
         self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
+    }
+
+    /// Char span `[start, end)` of a text object at the caret, plus whether it
+    /// is linewise (paragraphs are, words aren't). `None` when there's nothing
+    /// under the caret (empty line for a word, empty buffer for a paragraph).
+    fn object_span(&self, obj: TextObject) -> Option<(usize, usize, bool)> {
+        match obj {
+            TextObject::Word { around } => self.word_span(around).map(|(a, b)| (a, b, false)),
+            TextObject::Paragraph { around } => {
+                self.paragraph_span(around).map(|(a, b)| (a, b, true))
+            }
+        }
+    }
+
+    /// `iw`/`aw`: the same-class run under the caret (a whitespace run counts
+    /// as its own "word", per vim). Never crosses the line. `around` adds the
+    /// trailing spaces — or the leading ones when none trail; from whitespace
+    /// it adds the following word instead.
+    fn word_span(&self, around: bool) -> Option<(usize, usize)> {
+        let len = self.rope.len_chars();
+        let p = self.caret();
+        if p >= len || self.rope.char(p) == '\n' {
+            return None;
+        }
+        let is_ws = |c: char| c != '\n' && c.is_whitespace();
+        let c0 = self.rope.char(p);
+        let same_run = |c: char| {
+            if c == '\n' {
+                false
+            } else if is_ws(c0) {
+                is_ws(c)
+            } else {
+                !c.is_whitespace() && char_class(c) == char_class(c0)
+            }
+        };
+        let mut start = p;
+        while start > 0 && same_run(self.rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = p + 1;
+        while end < len && same_run(self.rope.char(end)) {
+            end += 1;
+        }
+        if around {
+            if is_ws(c0) {
+                // From whitespace, `aw` takes the spaces plus the word after.
+                if end < len && !self.rope.char(end).is_whitespace() {
+                    let cls = char_class(self.rope.char(end));
+                    while end < len {
+                        let c = self.rope.char(end);
+                        if c.is_whitespace() || char_class(c) != cls {
+                            break;
+                        }
+                        end += 1;
+                    }
+                }
+            } else {
+                let e = end + self.rope.chars_at(end).take_while(|&c| is_ws(c)).count();
+                if e > end {
+                    end = e;
+                } else {
+                    while start > 0 && is_ws(self.rope.char(start - 1)) {
+                        start -= 1;
+                    }
+                }
+            }
+        }
+        Some((start, end))
+    }
+
+    /// `ip`/`ap`: the block of contiguous non-blank lines around the caret's
+    /// line (or of blank lines, when the caret sits on one). `around` adds the
+    /// trailing blank lines — or the leading ones when none trail; from a
+    /// blank block it adds the following paragraph instead.
+    fn paragraph_span(&self, around: bool) -> Option<(usize, usize)> {
+        let blank = |l: usize| self.line_len_chars(l) == 0;
+        let last_line = self.rope.len_lines().saturating_sub(1);
+        let (line, _) = self.line_col_of(self.caret());
+        let on_blank = blank(line);
+        let mut first = line;
+        while first > 0 && blank(first - 1) == on_blank {
+            first -= 1;
+        }
+        let mut last = line;
+        while last < last_line && blank(last + 1) == on_blank {
+            last += 1;
+        }
+        if around {
+            let mut l = last;
+            while l < last_line && blank(l + 1) != on_blank {
+                l += 1;
+            }
+            if l > last {
+                last = l;
+            } else if !on_blank {
+                while first > 0 && blank(first - 1) {
+                    first -= 1;
+                }
+            }
+        }
+        let start = self.rope.line_to_char(first);
+        let end = if last >= last_line {
+            self.rope.len_chars()
+        } else {
+            self.rope.line_to_char(last + 1)
+        };
+        (start < end).then_some((start, end))
+    }
+
+    /// `d{object}`, or `c{object}` when `change`: delete the object's span into
+    /// the register. A change on a linewise object spares the span's last
+    /// newline, leaving one empty line for the insert that follows (vim `cip`).
+    pub fn delete_object(&mut self, obj: TextObject, change: bool) {
+        let Some((start, mut end, linewise)) = self.object_span(obj) else {
+            return;
+        };
+        self.set_register(self.rope.slice(start..end).to_string(), linewise);
+        let mut del_start = start;
+        if linewise && change {
+            if self.rope.char(end - 1) == '\n' {
+                end -= 1;
+            }
+        } else if linewise && end >= self.rope.len_chars() && start > 0 {
+            // Deleting through EOF takes the newline *before* the span too,
+            // else a phantom empty last line remains (same rule as `dd`).
+            del_start = start - 1;
+        }
+        if del_start < end {
+            self.rope.remove(del_start..end);
+            self.dirty = true;
+        }
+        let at = start.min(self.rope.len_chars());
+        // A linewise delete lands the caret at line start (like `dd`); charwise
+        // stays at the span start, the normal-mode clamp snapping it if needed.
+        self.set_caret(if linewise && !change {
+            self.rope.line_to_char(self.rope.char_to_line(at))
+        } else {
+            at
+        });
+    }
+
+    /// `y{object}`: copy the object's span into the register. Charwise drops
+    /// the caret to the span start (like `y{motion}`); linewise stays (like `yy`).
+    pub fn yank_object(&mut self, obj: TextObject) {
+        let Some((start, end, linewise)) = self.object_span(obj) else {
+            return;
+        };
+        self.set_register(self.rope.slice(start..end).to_string(), linewise);
+        if !linewise {
+            self.set_caret(start);
+        }
     }
 
     /// `x`: delete `count` chars at the caret, not past end-of-line.
@@ -845,6 +1005,103 @@ mod tests {
         assert_eq!(d.motion_target(Motion::TillChar('z'), 0, 1), 0);
         d.delete_motion(Motion::TillChar('x'), 1); // ct/dt sweep
         assert_eq!(d.rope.to_string(), "x");
+    }
+
+    #[test]
+    fn word_object_spans() {
+        // diw mid-word: just the word.
+        let mut d = Document::new("foo bar baz");
+        d.move_motion(Motion::CharRight, 5); // on 'a' of "bar"
+        d.delete_object(TextObject::Word { around: false }, false);
+        assert_eq!(d.rope.to_string(), "foo  baz");
+        assert_eq!(d.caret_line_col(), (0, 4));
+
+        // daw: word + trailing space.
+        let mut d = Document::new("foo bar baz");
+        d.move_motion(Motion::CharRight, 5);
+        d.delete_object(TextObject::Word { around: true }, false);
+        assert_eq!(d.rope.to_string(), "foo baz");
+
+        // daw on the last word: no trailing space → takes the leading one.
+        let mut d = Document::new("foo bar");
+        d.move_motion(Motion::CharRight, 5);
+        d.delete_object(TextObject::Word { around: true }, false);
+        assert_eq!(d.rope.to_string(), "foo");
+
+        // iw on whitespace: the whitespace run is the object.
+        let mut d = Document::new("foo   bar");
+        d.move_motion(Motion::CharRight, 4);
+        d.delete_object(TextObject::Word { around: false }, false);
+        assert_eq!(d.rope.to_string(), "foobar");
+
+        // Punctuation is its own word class (like vim).
+        let mut d = Document::new("foo(bar)");
+        d.move_motion(Motion::CharRight, 4); // on 'b'
+        d.delete_object(TextObject::Word { around: false }, false);
+        assert_eq!(d.rope.to_string(), "foo()");
+
+        // iw never crosses the line.
+        let mut d = Document::new("\nfoo");
+        d.delete_object(TextObject::Word { around: false }, false); // caret on empty line
+        assert_eq!(d.rope.to_string(), "\nfoo");
+    }
+
+    #[test]
+    fn paragraph_object_spans() {
+        // dip on a middle paragraph: its lines only, linewise.
+        let mut d = Document::new("aaa\n\nbbb\nccc\n\nddd\n");
+        d.move_motion(Motion::LineDown, 2); // on "bbb"
+        d.delete_object(TextObject::Paragraph { around: false }, false);
+        assert_eq!(d.rope.to_string(), "aaa\n\n\nddd\n");
+        assert_eq!(d.caret_line_col(), (2, 0));
+
+        // dap also takes the trailing blank line.
+        let mut d = Document::new("aaa\n\nbbb\nccc\n\nddd\n");
+        d.move_motion(Motion::LineDown, 2);
+        d.delete_object(TextObject::Paragraph { around: true }, false);
+        assert_eq!(d.rope.to_string(), "aaa\n\nddd\n");
+
+        // dap on the last paragraph: no trailing blanks → takes the leading ones.
+        let mut d = Document::new("aaa\n\nbbb");
+        d.move_motion(Motion::LineDown, 2);
+        d.delete_object(TextObject::Paragraph { around: true }, false);
+        assert_eq!(d.rope.to_string(), "aaa");
+
+        // dip through EOF takes the preceding newline (no phantom last line).
+        let mut d = Document::new("aaa\n\nbbb\nccc");
+        d.move_motion(Motion::LineDown, 3);
+        d.delete_object(TextObject::Paragraph { around: false }, false);
+        assert_eq!(d.rope.to_string(), "aaa\n");
+
+        // cip clears the lines but keeps one empty line for the insert.
+        let mut d = Document::new("aaa\n\nbbb\nccc\n\nddd\n");
+        d.move_motion(Motion::LineDown, 2);
+        d.delete_object(TextObject::Paragraph { around: false }, true);
+        assert_eq!(d.rope.to_string(), "aaa\n\n\n\nddd\n");
+        assert_eq!(d.caret_line_col(), (2, 0));
+
+        // ip on a blank line: the blank block.
+        let mut d = Document::new("aaa\n\n\nbbb\n");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_object(TextObject::Paragraph { around: false }, false);
+        assert_eq!(d.rope.to_string(), "aaa\nbbb\n");
+
+        // The register is linewise: p pastes on new lines.
+        let mut d = Document::new("aaa\nbbb\n\nccc\n");
+        d.yank_object(TextObject::Paragraph { around: false });
+        assert_eq!(d.caret_line_col(), (0, 0)); // linewise yank keeps the caret
+        d.move_motion(Motion::LineDown, 3); // on "ccc"
+        d.paste(true);
+        assert_eq!(d.rope.to_string(), "aaa\nbbb\n\nccc\naaa\nbbb\n");
+    }
+
+    #[test]
+    fn yank_word_object() {
+        let mut d = Document::new("foo bar");
+        d.move_motion(Motion::CharRight, 5); // on 'a'
+        d.yank_object(TextObject::Word { around: false });
+        assert_eq!(d.caret_line_col(), (0, 4)); // caret to span start
+        assert_eq!(d.register_text(), "bar");
     }
 
     #[test]

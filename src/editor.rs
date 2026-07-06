@@ -840,6 +840,8 @@ impl Editor {
             Action::DeleteCharUnder(n) => self.doc_mut().delete_char_under(n),
             Action::YankMotion(m, n) => self.doc_mut().yank_motion(m, n),
             Action::YankLines(n) => self.doc_mut().yank_lines(n),
+            Action::DeleteObject { obj, change } => self.doc_mut().delete_object(obj, change),
+            Action::YankObject(obj) => self.doc_mut().yank_object(obj),
             // clipboard=unnamed: an external copy supersedes the internal
             // register. Same content means the register was ours (we mirrored
             // it out), so keep its linewise flag; foreign text guesses linewise

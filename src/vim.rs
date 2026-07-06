@@ -1,6 +1,6 @@
 use gpui::Keystroke;
 
-use crate::document::Motion;
+use crate::document::{Motion, TextObject};
 
 /// The editor's action vocabulary — edits decoupled from the keys that trigger
 /// them. The editor only *executes* these; the `Vim` grammar *produces* them.
@@ -16,6 +16,10 @@ pub enum Action {
     DeleteCharUnder(usize),
     YankMotion(Motion, usize),
     YankLines(usize),
+    /// `d{object}`/`c{object}` (`change` leaves an empty line on linewise
+    /// objects and is followed by insert mode).
+    DeleteObject { obj: TextObject, change: bool },
+    YankObject(TextObject),
     /// `p` (after) / `P` (before).
     Paste { after: bool },
     /// Visual-mode `d`/`x`/`y` over the current selection.
@@ -74,6 +78,7 @@ impl Action {
                 | Action::DeleteLines(..)
                 | Action::DeleteLinesVertical { .. }
                 | Action::DeleteCharUnder(..)
+                | Action::DeleteObject { .. }
                 | Action::DeleteSelection { .. }
                 | Action::IndentSelection { .. }
                 | Action::Paste { .. }
@@ -95,9 +100,11 @@ impl Action {
                 | Action::DeleteLines(..)
                 | Action::DeleteLinesVertical { .. }
                 | Action::DeleteCharUnder(..)
+                | Action::DeleteObject { .. }
                 | Action::DeleteSelection { .. }
                 | Action::YankMotion(..)
                 | Action::YankLines(..)
+                | Action::YankObject(..)
                 | Action::YankSelection { .. }
         )
     }
@@ -139,6 +146,9 @@ enum Pending {
     /// (`ct{char}`/`dt{char}`). Carries the count since `apply_operator`
     /// consumed it when `t` arrived.
     Till { op: Op, count: usize },
+    /// An operator saw `i`/`a`; the next key names the text object
+    /// (`diw`, `cap`, …).
+    Object { op: Op, around: bool },
     /// `g` was pressed; the next key completes a `g`-sequence (`gg`).
     GPrefix,
     /// `z` was pressed; the next key completes a `z`-sequence (`zz`/`zt`/`zb`).
@@ -270,6 +280,7 @@ impl Vim {
         // An active sequence (operator-pending, `g`-prefix) consumes this key.
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::Operator(op) => return self.apply_operator(op, key, shift),
+            Pending::Object { op, around } => return self.apply_object(op, around, key),
             Pending::GPrefix => return self.complete_g_prefix(key, shift),
             Pending::ZPrefix => return self.complete_z_prefix(key),
             // Till is resolved above, before count parsing.
@@ -542,6 +553,12 @@ impl Vim {
             self.pending = Pending::Till { op, count };
             return vec![];
         }
+        // `i`/`a` start a text object (`diw`/`dap`); the next key names it.
+        // ponytail: the count (`d2iw`) is dropped — objects act once.
+        if !shift && (key == "i" || key == "a") {
+            self.pending = Pending::Object { op, around: key == "a" };
+            return vec![];
+        }
         match motion(key, shift) {
             Some(spec) if spec.op_target => match op {
                 Op::Delete => vec![Action::DeleteMotion(spec.motion, count)],
@@ -559,6 +576,21 @@ impl Vim {
                 _ => vec![],
             },
             _ => vec![], // unsupported target → abort the operator
+        }
+    }
+
+    /// Resolve a pending text object against the key naming it (`w` word,
+    /// `p` paragraph); anything else aborts the operator.
+    fn apply_object(&mut self, op: Op, around: bool, key: &str) -> Vec<Action> {
+        let obj = match key {
+            "w" => TextObject::Word { around },
+            "p" => TextObject::Paragraph { around },
+            _ => return vec![],
+        };
+        match op {
+            Op::Delete => vec![Action::DeleteObject { obj, change: false }],
+            Op::Yank => vec![Action::YankObject(obj)],
+            Op::Change => self.enter_insert(vec![Action::DeleteObject { obj, change: true }]),
         }
     }
 
@@ -744,6 +776,45 @@ mod tests {
         assert!(v.on_key(&named("escape")).is_empty());
         assert_eq!(v.mode, Mode::Normal);
         assert_eq!(v.on_key(&k("x")), vec![Action::DeleteCharUnder(1)]); // grammar clean
+    }
+
+    #[test]
+    fn text_object_grammar() {
+        // diw
+        let mut v = vim();
+        v.on_key(&k("d"));
+        assert!(v.on_key(&k("i")).is_empty()); // awaiting the object key
+        assert_eq!(
+            v.on_key(&k("w")),
+            vec![Action::DeleteObject { obj: TextObject::Word { around: false }, change: false }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
+
+        // caw → change enters insert
+        let mut v = vim();
+        v.on_key(&k("c"));
+        v.on_key(&k("a"));
+        assert_eq!(
+            v.on_key(&k("w")),
+            vec![Action::DeleteObject { obj: TextObject::Word { around: true }, change: true }]
+        );
+        assert_eq!(v.mode, Mode::Insert);
+
+        // yap
+        let mut v = vim();
+        v.on_key(&k("y"));
+        v.on_key(&k("a"));
+        assert_eq!(
+            v.on_key(&k("p")),
+            vec![Action::YankObject(TextObject::Paragraph { around: true })]
+        );
+
+        // An unknown object key aborts, leaving the grammar clean.
+        let mut v = vim();
+        v.on_key(&k("d"));
+        v.on_key(&k("i"));
+        assert!(v.on_key(&k("q")).is_empty());
+        assert_eq!(v.on_key(&k("x")), vec![Action::DeleteCharUnder(1)]);
     }
 
     #[test]
