@@ -42,6 +42,10 @@ pub enum Motion {
     WordForward,
     WordBackward,
     WordEnd,
+    /// `cw` target: vim's special case — in a word, the change stops at the
+    /// end of the current word (trailing whitespace and the newline stay);
+    /// on whitespace it sweeps like `w`. Only the change operator emits it.
+    ChangeWord,
     LineStart,
     LineEnd,
     FileStart,
@@ -367,7 +371,7 @@ impl Document {
     /// `d{motion}`: delete the char range the motion sweeps over.
     pub fn delete_motion(&mut self, m: Motion, count: usize) {
         let from = self.caret();
-        let to = self.motion_target(m, from, count);
+        let to = self.op_motion_target(m, from, count);
         let (a, b) = (from.min(to), from.max(to));
         if a < b {
             self.set_register(self.rope.slice(a..b).to_string(), false);
@@ -633,7 +637,7 @@ impl Document {
     /// to the range start, as in vim.
     pub fn yank_motion(&mut self, m: Motion, count: usize) {
         let from = self.caret();
-        let to = self.motion_target(m, from, count);
+        let to = self.op_motion_target(m, from, count);
         let (a, b) = (from.min(to), from.max(to));
         if a < b {
             self.set_register(self.rope.slice(a..b).to_string(), false);
@@ -726,6 +730,32 @@ impl Document {
         self.line_col_of(self.caret())
     }
 
+    /// Motion target as swept by an operator. Vim's operator-pending `w` is
+    /// special: the final sweep stops at the end of its line instead of the
+    /// next line's first word, so `dw`/`yw` on the last word never take the
+    /// newline. Plain caret movement uses `motion_target` directly.
+    fn op_motion_target(&self, m: Motion, from: usize, count: usize) -> usize {
+        match m {
+            Motion::WordForward => self.word_sweep_end(from, count.max(1)),
+            _ => self.motion_target(m, from, count),
+        }
+    }
+
+    /// End of an operator's `w` sweep: `next_word_start` repeated, but the
+    /// last repeat is clamped to the end of the line it starts on. Starting
+    /// on an empty line the sweep takes exactly that line's newline (vim
+    /// `dw` there collapses the line).
+    fn word_sweep_end(&self, from: usize, count: usize) -> usize {
+        let mut q = from;
+        for _ in 1..count {
+            q = self.next_word_start(q);
+        }
+        let (line, _) = self.line_col_of(q);
+        let eol = self.rope.line_to_char(line) + self.line_len_chars(line);
+        let stop = if eol == q { q + 1 } else { eol };
+        self.next_word_start(q).min(stop)
+    }
+
     /// Target offset of a motion from `from`, repeated `count` times. Char and
     /// line motions stay within their line's bounds (vim `h`/`l` don't wrap);
     /// word motions cross lines.
@@ -781,6 +811,31 @@ impl Document {
                 let mut p = from;
                 for _ in 0..count {
                     p = self.next_word_end(p);
+                }
+                p
+            }
+            Motion::ChangeWord => {
+                let len = self.rope.len_chars();
+                if from >= len || self.rope.char(from).is_whitespace() {
+                    // No word under the cursor to preserve: sweep like an
+                    // operator's `w` (still stops at the end of the line).
+                    return self.word_sweep_end(from, count);
+                }
+                // Count > 1 spans whole words; the last stops at its run end.
+                let mut p = from;
+                for _ in 1..count {
+                    p = self.next_word_start(p);
+                }
+                if p >= len {
+                    return len;
+                }
+                let cls = char_class(self.rope.char(p));
+                while p < len {
+                    let c = self.rope.char(p);
+                    if c.is_whitespace() || char_class(c) != cls {
+                        break;
+                    }
+                    p += 1;
                 }
                 p
             }
@@ -964,6 +1019,65 @@ mod tests {
         let mut d = Document::new("foo bar");
         d.delete_motion(Motion::WordForward, 1); // dw at start → "foo " gone
         assert_eq!(d.rope.to_string(), "bar");
+    }
+
+    #[test]
+    fn dw_stops_at_end_of_line() {
+        // dw on the last word of a line: word goes, newline stays.
+        let mut d = Document::new("foo bar\nbaz");
+        d.move_motion(Motion::CharRight, 4);
+        d.delete_motion(Motion::WordForward, 1);
+        assert_eq!(d.rope.to_string(), "foo \nbaz");
+
+        // Trailing whitespace goes too, still not the newline.
+        let mut d = Document::new("foo  \nbar");
+        d.delete_motion(Motion::WordForward, 1);
+        assert_eq!(d.rope.to_string(), "\nbar");
+
+        // On an empty line, dw takes the newline: the line collapses.
+        let mut d = Document::new("\nbar");
+        d.delete_motion(Motion::WordForward, 1);
+        assert_eq!(d.rope.to_string(), "bar");
+
+        // With a count, only the final word is clamped to its line.
+        let mut d = Document::new("foo\nbar baz");
+        d.delete_motion(Motion::WordForward, 2);
+        assert_eq!(d.rope.to_string(), "baz");
+
+        // Mid-line dw is untouched: sweeps through to the next word's start.
+        let mut d = Document::new("foo bar");
+        d.delete_motion(Motion::WordForward, 1);
+        assert_eq!(d.rope.to_string(), "bar");
+    }
+
+    #[test]
+    fn change_word_stops_at_word_end() {
+        // cw in a word: trailing space stays.
+        let mut d = Document::new("foo bar");
+        d.delete_motion(Motion::ChangeWord, 1);
+        assert_eq!(d.rope.to_string(), " bar");
+
+        // cw on the last word of a line: the newline stays.
+        let mut d = Document::new("foo\nbar");
+        d.delete_motion(Motion::ChangeWord, 1);
+        assert_eq!(d.rope.to_string(), "\nbar");
+
+        // On the last char of a word, only that char changes (unlike `ce`).
+        let mut d = Document::new("foo bar");
+        d.move_motion(Motion::CharRight, 2);
+        d.delete_motion(Motion::ChangeWord, 1);
+        assert_eq!(d.rope.to_string(), "fo bar");
+
+        // 2cw spans a whole word plus the next word's run.
+        let mut d = Document::new("foo bar baz");
+        d.delete_motion(Motion::ChangeWord, 2);
+        assert_eq!(d.rope.to_string(), " baz");
+
+        // On whitespace there's no word to preserve: sweeps like `w`.
+        let mut d = Document::new("a  bc");
+        d.move_motion(Motion::CharRight, 1);
+        d.delete_motion(Motion::ChangeWord, 1);
+        assert_eq!(d.rope.to_string(), "abc");
     }
 
     #[test]

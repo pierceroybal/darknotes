@@ -563,7 +563,15 @@ impl Vim {
             Some(spec) if spec.op_target => match op {
                 Op::Delete => vec![Action::DeleteMotion(spec.motion, count)],
                 Op::Yank => vec![Action::YankMotion(spec.motion, count)],
-                Op::Change => self.enter_insert(vec![Action::DeleteMotion(spec.motion, count)]),
+                Op::Change => {
+                    // `cw` swaps in the ChangeWord motion (vim special case:
+                    // don't take the space/newline after the word).
+                    let m = match spec.motion {
+                        Motion::WordForward => Motion::ChangeWord,
+                        m => m,
+                    };
+                    self.enter_insert(vec![Action::DeleteMotion(m, count)])
+                }
             },
             // `dj`/`dk`: the line motion isn't an op-target (charwise would be
             // surprising), so handle it here as a linewise delete. `yj`/`cj` etc.
@@ -854,7 +862,7 @@ mod tests {
         assert!(v.on_key(&k("c")).is_empty());
         assert_eq!(
             v.on_key(&k("w")),
-            vec![Action::DeleteMotion(Motion::WordForward, 1)]
+            vec![Action::DeleteMotion(Motion::ChangeWord, 1)]
         );
         assert_eq!(v.mode, Mode::Insert); // change = delete then insert
     }
