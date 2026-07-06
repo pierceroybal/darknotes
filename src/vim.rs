@@ -49,6 +49,10 @@ pub enum Action {
     Search { query: String, backward: bool },
     /// `n`/`N`: jump to the next/previous match of the last search.
     SearchNext { reverse: bool, count: usize },
+    /// `gt`/`gT`: cycle to the next/previous buffer. The buffer list and its
+    /// wrap live in the editor; the grammar only names the direction.
+    BufferNext,
+    BufferPrev,
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -266,7 +270,7 @@ impl Vim {
         // An active sequence (operator-pending, `g`-prefix) consumes this key.
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::Operator(op) => return self.apply_operator(op, key, shift),
-            Pending::GPrefix => return self.complete_g_prefix(key),
+            Pending::GPrefix => return self.complete_g_prefix(key, shift),
             Pending::ZPrefix => return self.complete_z_prefix(key),
             // Till is resolved above, before count parsing.
             Pending::Till { .. } | Pending::None => {}
@@ -558,13 +562,15 @@ impl Vim {
         }
     }
 
-    /// Complete a `g`-sequence: `gg` jumps to file start; anything else aborts.
-    fn complete_g_prefix(&mut self, key: &str) -> Vec<Action> {
-        self.count = None; // ponytail: `2gg` (go to line N) ignored — file start.
-        if key == "g" {
-            vec![Action::Move(Motion::FileStart, 1)]
-        } else {
-            vec![]
+    /// Complete a `g`-sequence: `gg` jumps to file start, `gt`/`gT` cycle
+    /// buffers; anything else aborts.
+    fn complete_g_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
+        self.count = None; // ponytail: `2gg`/`2gt` (go to line/tab N) ignored.
+        match (key, shift) {
+            ("g", _) => vec![Action::Move(Motion::FileStart, 1)],
+            ("t", false) => vec![Action::BufferNext],
+            ("t", true) => vec![Action::BufferPrev],
+            _ => vec![],
         }
     }
 
@@ -745,6 +751,22 @@ mod tests {
         let mut v = vim();
         assert!(v.on_key(&k("g")).is_empty()); // prefix armed, no action yet
         assert_eq!(v.on_key(&k("g")), vec![Action::Move(Motion::FileStart, 1)]);
+    }
+
+    #[test]
+    fn gt_cycles_buffers() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&k("g")), vec![]); // prefix armed
+        assert_eq!(v.on_key(&k("t")), vec![Action::BufferNext]);
+
+        // `gT` (shift) goes the other way — capitals arrive lowercase + shift.
+        let g_t = Keystroke {
+            key: "t".into(),
+            key_char: Some("T".into()),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+        };
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&g_t), vec![Action::BufferPrev]);
     }
 
     #[test]

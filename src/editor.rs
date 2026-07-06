@@ -874,6 +874,8 @@ impl Editor {
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
             Action::Search { query, backward } => self.do_search(query, backward),
             Action::SearchNext { reverse, count } => self.search_next(reverse, count),
+            Action::BufferNext => self.buffer_next(window),
+            Action::BufferPrev => self.buffer_prev(window),
         }
     }
 

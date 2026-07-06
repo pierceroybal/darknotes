@@ -161,10 +161,6 @@ pub(super) const DEFAULT_BINDINGS: &[(Ctx, &str, &str)] = &[
     (Ctx::Global, "ctrl-p", "open-file"),
     (Ctx::Global, "ctrl-shift-p", "command-palette"),
     (Ctx::Global, "ctrl-r", "redo"),
-    // Vim's tab-cycle keys; the resolver buffers the lone `g` for timeoutlen,
-    // and an unmatched follow-up (`gg`) replays into the grammar unchanged.
-    (Ctx::Normal, "g t", "buffer-next"),
-    (Ctx::Normal, "g shift-t", "buffer-prev"),
     // Vim's Ctrl-^ alternate-buffer toggle, on its US-layout key.
     (Ctx::Global, "ctrl-6", "buffer-alternate"),
 ];
