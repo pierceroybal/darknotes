@@ -30,6 +30,9 @@ pub struct Config {
     /// Render markdown by hiding syntax markers on every line except the one the
     /// cursor is on, which shows full source.
     pub render_markdown: bool,
+    /// Soft-wrap long lines at the pane edge (vim 'wrap'; `:set nowrap` to
+    /// scroll horizontally instead).
+    pub wrap: bool,
     pub keymap: Keymap,
     pub search: Search,
 }
@@ -108,6 +111,7 @@ impl Default for Config {
             tab_width: 2,
             line_numbers: LineNumbers::Off,
             render_markdown: true,
+            wrap: true,
             keymap: Keymap::default(),
             search: Search::default(),
         }

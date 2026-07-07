@@ -24,6 +24,10 @@ line_numbers = "off"
 # plain source view.
 render_markdown = true
 
+# Soft-wrap long lines at the pane edge (vim 'wrap'). Set false — or use
+# `:set nowrap` — to scroll long lines horizontally instead.
+wrap = true
+
 [keymap]
 # How long (ms) a partially-typed multi-key binding waits for its next key
 # before the typed keys are handled as ordinary input. Vim's default is 1000;

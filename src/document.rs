@@ -1,6 +1,7 @@
 use ropey::Rope;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::markdown::{self, ListContinuation};
 
@@ -100,6 +101,12 @@ pub struct Document {
     path: Option<PathBuf>,
     /// Set on every edit, cleared on save.
     dirty: bool,
+    /// Content generation, drawn from a process-wide counter so no two
+    /// documents (or states of one document) ever share a value. Bumped on
+    /// every content change — including undo/redo, which can restore
+    /// `dirty: false` while still changing text. Cheap change detection for
+    /// render caches: equal revisions ⇒ identical rope.
+    revision: u64,
     /// Last delete/yank, for `p`/`P`.
     register: Register,
     /// States before each change (`u` pops); `redo` is the inverse (`Ctrl-R`).
@@ -111,6 +118,13 @@ pub struct Document {
     goal_col: usize,
 }
 
+/// Source of `Document::revision` values — see that field's doc.
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn next_revision() -> u64 {
+    REVISION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 impl Document {
     pub fn new(text: &str) -> Self {
         Self {
@@ -118,6 +132,7 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: None,
             dirty: false,
+            revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -139,6 +154,7 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: Some(path),
             dirty: false,
+            revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -168,6 +184,18 @@ impl Document {
         self.dirty
     }
 
+    /// Content generation — changes iff the rope changed. See the field doc.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Mark a content change: dirty for save tracking, a fresh revision for
+    /// render caches. Every rope mutation routes through here (or `restore`).
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.revision = next_revision();
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -194,7 +222,7 @@ impl Document {
     pub fn insert(&mut self, text: &str) {
         let at = self.caret();
         self.rope.insert(at, text);
-        self.dirty = true;
+        self.touch();
         self.set_caret(at + text.chars().count());
     }
 
@@ -210,7 +238,7 @@ impl Document {
             ListContinuation::Item { empty, .. } if empty && clear_empty => {
                 let start = self.rope.line_to_char(line);
                 self.rope.remove(start..start + self.line_len_chars(line));
-                self.dirty = true;
+                self.touch();
                 self.set_caret(start);
             }
             ListContinuation::Item { prefix, .. } => self.insert(&format!("\n{prefix}")),
@@ -233,12 +261,12 @@ impl Document {
             let lead = text.chars().take_while(|&c| c == ' ').count().min(width);
             if lead > 0 {
                 self.rope.remove(start..start + lead);
-                self.dirty = true;
+                self.touch();
                 self.set_caret(start + col.saturating_sub(lead));
             }
         } else if markdown::is_list_item(&text) {
             self.rope.insert(start, &" ".repeat(width));
-            self.dirty = true;
+            self.touch();
             self.set_caret(caret + width);
         } else {
             self.insert(&" ".repeat(width));
@@ -252,7 +280,7 @@ impl Document {
             return;
         }
         self.rope.remove(at - 1..at);
-        self.dirty = true;
+        self.touch();
         self.set_caret(at - 1);
     }
 
@@ -261,7 +289,7 @@ impl Document {
         let at = self.caret();
         if at < self.rope.len_chars() {
             self.rope.remove(at..at + 1);
-            self.dirty = true;
+            self.touch();
         }
     }
 
@@ -319,7 +347,7 @@ impl Document {
         if start < end {
             self.set_register(self.rope.slice(start..end).to_string(), linewise);
             self.rope.remove(start..end);
-            self.dirty = true;
+            self.touch();
         }
         let at = start.min(self.rope.len_chars());
         let (line, _) = self.line_col_of(at);
@@ -356,11 +384,11 @@ impl Document {
                     self.rope.line(line).chars().take_while(|&c| c == ' ').count().min(width);
                 if lead > 0 {
                     self.rope.remove(start..start + lead);
-                    self.dirty = true;
+                    self.touch();
                 }
             } else {
                 self.rope.insert(start, &" ".repeat(width));
-                self.dirty = true;
+                self.touch();
             }
         }
         let text: String = self.rope.line(l0).chars().filter(|&c| c != '\n').collect();
@@ -376,7 +404,7 @@ impl Document {
         if a < b {
             self.set_register(self.rope.slice(a..b).to_string(), false);
             self.rope.remove(a..b);
-            self.dirty = true;
+            self.touch();
             self.set_caret(a);
         }
     }
@@ -398,7 +426,7 @@ impl Document {
         if del_start < end {
             self.set_register(self.rope.slice(start..end).to_string(), true);
             self.rope.remove(del_start..end);
-            self.dirty = true;
+            self.touch();
         }
         let at = start.min(self.rope.len_chars());
         self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
@@ -430,7 +458,7 @@ impl Document {
         if del_start < end {
             self.set_register(self.rope.slice(start..end).to_string(), true);
             self.rope.remove(del_start..end);
-            self.dirty = true;
+            self.touch();
         }
         let at = start.min(self.rope.len_chars());
         self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
@@ -563,7 +591,7 @@ impl Document {
         }
         if del_start < end {
             self.rope.remove(del_start..end);
-            self.dirty = true;
+            self.touch();
         }
         let at = start.min(self.rope.len_chars());
         // A linewise delete lands the caret at line start (like `dd`); charwise
@@ -597,7 +625,7 @@ impl Document {
         if from < to {
             self.set_register(self.rope.slice(from..to).to_string(), false);
             self.rope.remove(from..to);
-            self.dirty = true;
+            self.touch();
         }
         // The caret stays at the deletion point — which may now be past the
         // line's last char. `s` needs it there (insert continues at that spot);
@@ -608,11 +636,17 @@ impl Document {
     /// Snap a caret sitting one past the line's last char back onto it. Normal
     /// mode disallows that column (insert mode needs it for appending), so the
     /// editor calls this after every keystroke that lands in normal mode.
+    ///
+    /// The snap is a view-legality correction, not a horizontal move, so it
+    /// preserves the goal column — vim keeps `curswant` across clamps, which
+    /// is what lets `j`/`k` pass a short line and return to their column.
     pub fn clamp_caret_to_line(&mut self) {
         let (line, col) = self.line_col_of(self.caret());
         let len = self.line_len_chars(line);
         if col >= len && col > 0 {
+            let goal = self.goal_col;
             self.set_caret(self.rope.line_to_char(line) + len - 1);
+            self.goal_col = goal;
         }
     }
 
@@ -687,7 +721,7 @@ impl Document {
         };
 
         self.rope.insert(at, &payload);
-        self.dirty = true;
+        self.touch();
         self.set_caret(new_caret.min(self.rope.len_chars()));
     }
 
@@ -697,7 +731,10 @@ impl Document {
 
     fn restore(&mut self, s: Snapshot) {
         self.rope = s.rope;
+        // The snapshot's dirty flag comes back verbatim (undo to the saved
+        // state is clean), but the content still changed — new revision.
         self.dirty = s.dirty;
+        self.revision = next_revision();
         self.set_caret(s.caret.min(self.rope.len_chars()));
     }
 
@@ -994,6 +1031,22 @@ mod tests {
         d.move_motion(Motion::CharLeft, 2);
         d.move_motion(Motion::LineUp, 2);
         assert_eq!(d.caret_line_col(), (0, 2));
+    }
+
+    #[test]
+    fn eol_clamp_keeps_goal_column_sticky() {
+        // The editor clamps after every normal-mode keystroke. Passing a
+        // 1-char line snaps the caret to its only char (col 0) — but the
+        // goal column must survive the snap, or every later j/k sticks to
+        // the first column (vim keeps curswant across clamps).
+        let mut d = Document::new("aaaa aaaa aaaa\nb\ncccc cccc cccc");
+        d.move_motion(Motion::CharRight, 9);
+        d.move_motion(Motion::LineDown, 1);
+        d.clamp_caret_to_line();
+        assert_eq!(d.caret_line_col(), (1, 0)); // snapped onto "b"
+        d.move_motion(Motion::LineDown, 1);
+        d.clamp_caret_to_line();
+        assert_eq!(d.caret_line_col(), (2, 9)); // goal survived the clamp
     }
 
     #[test]

@@ -15,7 +15,7 @@ use ropey::Rope;
 /// What a stretch of source text *is*. The renderer maps each kind to a style;
 /// structure features read the same kinds. A new kind is one variant here plus a
 /// scanner case plus a render mapping — no change to the parse/render seam.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SpanKind {
     Heading(u8),
     ListItem,
@@ -44,7 +44,7 @@ pub struct Span {
 /// A flattened, non-overlapping slice of a line. `kind == None` is default
 /// (unstyled) text. Segment lengths sum to the line's byte length, which
 /// `shape_line` requires or it drops glyphs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Segment {
     pub len: usize,
     pub kind: Option<SpanKind>,

@@ -105,6 +105,12 @@ pub(super) const COMMANDS: &[Command] = &[
         },
     },
     Command {
+        name: "set",
+        ex: &["se", "set"],
+        takes_arg: true,
+        run: |ed, a, _win, _cx| ed.set_option(a.arg.as_deref()),
+    },
+    Command {
         name: "nohlsearch",
         ex: &["noh", "nohl", "nohlsearch"],
         takes_arg: false,

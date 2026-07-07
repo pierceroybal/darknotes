@@ -87,7 +87,7 @@ fn main() {
                 ..Default::default()
             },
             move |window, cx| {
-                let editor = cx.new(|cx| Editor::new(root, initial, config, cx));
+                let editor = cx.new(|cx| Editor::new(root, initial, config, window, cx));
                 // Focus on launch, or on_key_down never fires and nothing types.
                 let handle = editor.read(cx).focus_handle(cx);
                 window.focus(&handle);

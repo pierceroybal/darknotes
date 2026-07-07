@@ -1,7 +1,7 @@
 mod command;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,6 +28,10 @@ use crate::vim::{Action, Mode, Scroll, Vim};
 
 const WELCOME: &str =
     "# Welcome to darknotes\n\nOpen a vault: darknotes <folder>\nOr a file: darknotes <path.md>\n";
+
+/// Fixed sidebar width. The soft-wrap width is derived as viewport minus
+/// this, so it must match the `.w(px(SIDEBAR_WIDTH))` on the sidebar list.
+const SIDEBAR_WIDTH: f32 = 330.;
 
 /// Which pane keystrokes drive. One entity owns both panes and a single focus
 /// handle, so switching is a routing flag, not a GPUI focus change.
@@ -70,6 +74,91 @@ struct Picker {
     /// when the query is empty.
     results: Vec<usize>,
     selected: usize,
+}
+
+/// Everything the editor's row list is built from, beyond session constants
+/// (font, theme, gutter mode). Equal keys ⇒ identical rows, so render reuses
+/// the cached build. `revision` values are process-unique per content state,
+/// so buffer switches and `:e` reloads can't collide.
+#[derive(PartialEq)]
+struct RowsKey {
+    revision: u64,
+    caret: usize,
+    mode: Mode,
+    /// Visual-mode selection span (`None` outside visual mode).
+    sel: Option<(usize, usize)>,
+    /// The query whose matches are highlighted (incsearch preview or lit
+    /// hlsearch); empty = none.
+    q: String,
+    wrap_width: Option<Pixels>,
+}
+
+/// The last row build: what it was built from, its rows, the caret's row,
+/// and how many rows each logical line produced — the caret fast path uses
+/// the per-line counts to splice single lines instead of rebuilding.
+struct RowsCache {
+    key: RowsKey,
+    rows: Rc<Vec<LineElement>>,
+    cur_row: usize,
+    line_rows: Vec<u32>,
+}
+
+/// Inputs to `append_line_rows` that are uniform across lines within one
+/// build, bundled so the caret fast path can rebuild single lines without
+/// rerunning a whole `build_rows` pass.
+struct RowCtx {
+    rope: ropey::Rope, // ropey clone is cheap (shared, CoW)
+    spans: Rc<Vec<Vec<markdown::Span>>>,
+    theme: Theme,
+    font: Font,
+    font_size: Pixels,
+    wrap_width: Option<Pixels>,
+    /// Columns per row when the font probed monospace; the plain-ASCII
+    /// column-walk wrap path.
+    mono_cols: Option<usize>,
+    mode: Mode,
+    cur_line: usize,
+    cur_col: usize,
+    sel_span: Option<(usize, usize)>,
+    search_ranges: Vec<(usize, usize)>,
+    num_width: usize,
+}
+
+/// Wrap boundaries for lines that need real shaping (non-ASCII, tabs, bold
+/// spans), cached across row rebuilds. gpui's own layout cache only survives
+/// frame to frame — and memoized frames don't shape — so leaning on it meant
+/// re-platform-shaping every such line on every caret move (visible j/k
+/// stutter). Two generations, rotated once per *full* build: an entry unused
+/// for one whole build is dropped. A width change clears everything, since
+/// boundaries depend on it.
+#[derive(Default)]
+struct ShapeWrapCache {
+    width: Pixels,
+    cur: HashMap<(String, Vec<Segment>), Vec<usize>>,
+    prev: HashMap<(String, Vec<Segment>), Vec<usize>>,
+}
+
+impl ShapeWrapCache {
+    /// Start a full build: rotate generations, or clear on width change.
+    fn begin(&mut self, width: Pixels) {
+        if width != self.width {
+            self.width = width;
+            self.cur.clear();
+            self.prev.clear();
+        } else {
+            self.prev = std::mem::take(&mut self.cur);
+        }
+    }
+
+    /// Look up boundaries, promoting a previous-generation hit.
+    fn get(&mut self, key: &(String, Vec<Segment>)) -> Option<Vec<usize>> {
+        if let Some(v) = self.cur.get(key) {
+            return Some(v.clone());
+        }
+        let v = self.prev.remove(key)?;
+        self.cur.insert(key.clone(), v.clone());
+        Some(v)
+    }
 }
 
 /// The last search and the live prompt state. Lives on the editor, not the
@@ -120,8 +209,26 @@ pub struct Editor {
     pending_window: bool,
     /// Drives the editor line list's scroll position (wheel + scroll-to-cursor).
     scroll: UniformListScrollHandle,
-    /// Caret line at the last render; a change requests a scroll-to-cursor.
-    last_line: usize,
+    /// Caret *visual row* at the last render (soft-wrap makes rows outnumber
+    /// lines); a change requests a scroll-to-cursor. Also what `zz`/`zt`/`zb`
+    /// reposition — fresh, since z-scrolls don't move the caret.
+    last_row: usize,
+    /// Center the caret's row on the next render. Set by buffer switches: the
+    /// shared scroll handle still holds the old buffer's offset, and the new
+    /// buffer's visual-row index isn't known until render builds its wrap map.
+    center_on_render: bool,
+    /// Soft-wrap long lines at the pane edge (`:set wrap`/`nowrap`, config
+    /// `wrap`). Off = long lines overflow right behind `scroll_x`.
+    wrap: bool,
+    /// The last row build, reused while nothing it depends on changed
+    /// (`RowsKey`). Scroll-only frames — the common case while reading —
+    /// rebuild nothing; caret-only moves patch two lines.
+    rows_cache: Option<RowsCache>,
+    /// Cross-build cache of shaped wrap boundaries; see `ShapeWrapCache`.
+    wrap_cache: ShapeWrapCache,
+    /// Markdown parse of the active buffer, memoized on its revision (the
+    /// parse is document-wide and caret-independent).
+    spans_cache: Option<(u64, Rc<Vec<Vec<markdown::Span>>>)>,
     /// Horizontal scroll offset in pixels (lines have no soft-wrap, so they
     /// overflow right). The caret line's element nudges this in prepaint to keep
     /// the caret on screen; every line reads it in paint. Shared because the line
@@ -158,8 +265,14 @@ impl Editor {
         vault_root: PathBuf,
         initial: Option<PathBuf>,
         config: Config,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // A resize only repaints by default. The wrap width reads the live
+        // viewport in render, so force a render after every bounds change —
+        // the async maximize at startup otherwise lands after the last
+        // render and leaves stale narrow wrapping until the next keystroke.
+        cx.observe_window_bounds(window, |_, _, cx| cx.notify()).detach();
         let vault = Vault::scan(vault_root);
         let doc = match initial {
             Some(path) => open_or_empty(&path),
@@ -201,7 +314,12 @@ impl Editor {
             pane: Pane::Editor,
             pending_window: false,
             scroll: UniformListScrollHandle::new(),
-            last_line: 0,
+            last_row: 0,
+            center_on_render: false,
+            wrap: config.wrap,
+            rows_cache: None,
+            wrap_cache: ShapeWrapCache::default(),
+            spans_cache: None,
             scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
             font_family: config.font_family.into(),
             font_size: config.font_size,
@@ -258,10 +376,9 @@ impl Editor {
         // into the new buffer. The query itself survives — vim search is global.
         self.search.origin = None;
         // The scroll handle is shared across buffers and still holds the old
-        // offset; recenter on this buffer's own caret (kept on its Document).
-        let line = self.doc().caret_line_col().0;
-        self.scroll.scroll_to_item_strict(line, ScrollStrategy::Center);
-        self.last_line = line;
+        // offset; recenter on this buffer's own caret. Deferred to the render
+        // pass — the caret's visual row needs this buffer's wrap map.
+        self.center_on_render = true;
         self.reveal_current();
         window.focus(&self.focus);
     }
@@ -322,6 +439,299 @@ impl Editor {
         } else {
             true
         }
+    }
+
+    /// `:set {option}` — vim option toggles. Only 'wrap' exists so far; grow
+    /// this into an option table when the second option arrives.
+    fn set_option(&mut self, arg: Option<&str>) {
+        match arg {
+            Some("wrap") => self.wrap = true,
+            Some("nowrap") => self.wrap = false,
+            Some("wrap!") | Some("invwrap") => self.wrap = !self.wrap,
+            // Bare `:set` / `:set wrap?` report the current value, vim-style.
+            None | Some("wrap?") => {
+                self.message = Some(if self.wrap { "  wrap" } else { "nowrap" }.into())
+            }
+            Some(other) => self.message = Some(format!("E518: Unknown option: {other}")),
+        }
+    }
+
+    /// The query whose matches should be highlighted right now: the pending
+    /// prompt text while a `/`/`?` search is being typed (incsearch preview),
+    /// else the last submitted query while hlsearch is lit. Empty = none.
+    fn search_query(&self) -> String {
+        let prompt_open = self.vim.mode == Mode::Command && self.vim.prompt() != ':';
+        if prompt_open && self.search_cfg.incsearch {
+            self.vim.command_line().to_string()
+        } else if !prompt_open && self.search_cfg.hlsearch && self.search.hl {
+            self.search.query.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// Per-line markdown spans of the active buffer, memoized on its content
+    /// revision (the parse is document-wide and caret-independent).
+    fn spans(&mut self) -> Rc<Vec<Vec<markdown::Span>>> {
+        let rev = self.doc().revision();
+        match &self.spans_cache {
+            Some((r, s)) if *r == rev => s.clone(),
+            _ => {
+                let s = Rc::new(markdown::parse(&self.doc().rope));
+                self.spans_cache = Some((rev, s.clone()));
+                s
+            }
+        }
+    }
+
+    /// Assemble the per-build inputs shared by every line. `window` shapes
+    /// the two one-glyph monospace probes.
+    fn row_ctx(&mut self, wrap_width: Option<Pixels>, theme: &Theme, window: &mut Window) -> RowCtx {
+        let spans = self.spans();
+        let rope = self.doc().rope.clone(); // ropey clone is cheap (shared, CoW)
+        let mode = self.vim.mode;
+        let (cur_line, cur_col) = self.doc().caret_line_col();
+        // The selected char-range to highlight, `None` outside visual mode.
+        let sel_span: Option<(usize, usize)> =
+            mode.is_visual().then(|| self.doc().selection_span(mode == Mode::VisualLine));
+        let q = self.search_query();
+        let search_ranges = if q.is_empty() {
+            Vec::new()
+        } else {
+            find_matches(&rope, &q, search_sensitive(&q, &self.search_cfg))
+        };
+
+        // Shaping font, matching what `LineElement` resolves from the window's
+        // text-style cascade so wrap boundaries agree with the painted rows.
+        let font = gpui::font(self.font_family.clone());
+        let font_size = px(self.font_size);
+
+        // Monospace fast path: when every glyph advances the same, wrap
+        // boundaries are a pure column walk — no platform shaping, which is
+        // what made opening/editing long-lined docs drag. Probe the font once
+        // ('i' and 'M' advance alike ⇒ monospace); the per-line gate in
+        // `append_line_rows` keeps the exact shaped path for anything the
+        // walk can't promise.
+        let mono_cols: Option<usize> = wrap_width.and_then(|w| {
+            let advance = |s: &'static str| {
+                let runs = [run(&font, 1, theme.foreground)];
+                window.text_system().shape_line(s.into(), font_size, &runs, None).width
+            };
+            let (iw, mw) = (advance("i"), advance("M"));
+            ((iw - mw).abs() < px(0.01) && iw > Pixels::ZERO)
+                .then(|| ((w / iw) as usize).max(1))
+        });
+
+        let num_width = rope.len_lines().to_string().len().max(3);
+        RowCtx {
+            rope,
+            spans,
+            theme: *theme,
+            font,
+            font_size,
+            wrap_width,
+            mono_cols,
+            mode,
+            cur_line,
+            cur_col,
+            sel_span,
+            search_ranges,
+            num_width,
+        }
+    }
+
+    /// One `LineElement` per *visual row* of the buffer, the caret's row
+    /// index, and each logical line's row count. With soft-wrap on, a logical
+    /// line becomes one element per wrapped row, its display text, styling
+    /// segments, highlights, and caret sliced to each row. `LineElement`
+    /// stays a fixed-height single row, which is what keeps `uniform_list`'s
+    /// virtualization valid.
+    ///
+    /// Runs only when a `RowsKey` input changed beyond a caret move (render
+    /// memoizes and caret moves patch single lines via `append_line_rows`).
+    // ponytail: a full rebuild walks the whole doc (conceal + slice, ≈ per
+    // edit keystroke). If typing in a huge doc ever bites, cache rows per
+    // line keyed on (text, segments) like `ShapeWrapCache`.
+    fn build_rows(
+        &mut self,
+        ctx: &RowCtx,
+        window: &mut Window,
+    ) -> (Vec<LineElement>, usize, Vec<u32>) {
+        // Full build = one cache generation for the shaped wrap boundaries.
+        self.wrap_cache.begin(ctx.wrap_width.unwrap_or(Pixels::ZERO));
+        let line_count = ctx.rope.len_lines();
+        let mut rows = Vec::with_capacity(line_count);
+        let mut line_rows = Vec::with_capacity(line_count);
+        let mut cur_row = 0;
+        for i in 0..line_count {
+            let base = rows.len();
+            if let Some(k) = self.append_line_rows(ctx, i, window, &mut rows) {
+                cur_row = base + k;
+            }
+            line_rows.push((rows.len() - base) as u32);
+        }
+        (rows, cur_row, line_rows)
+    }
+
+    /// Build logical line `i`'s visual rows into `out`, returning the caret's
+    /// index within the appended rows when `i` is the cursor line. The whole
+    /// per-line pipeline lives here so the caret fast path can redo exactly
+    /// the lines that changed.
+    fn append_line_rows(
+        &mut self,
+        ctx: &RowCtx,
+        i: usize,
+        window: &mut Window,
+        out: &mut Vec<LineElement>,
+    ) -> Option<usize> {
+        let base = out.len();
+        let mut caret_at = None;
+        // Conceal markers on every line but the cursor line, which keeps
+        // full source so caret math stays on real document bytes.
+        let text = line_text(&ctx.rope, i);
+        let line_spans = ctx.spans.get(i).map_or(&[][..], Vec::as_slice);
+        let segs = markdown::flatten(text.len(), line_spans);
+        // Highlights land in source columns; a concealed line remaps them
+        // through the conceal map so they track the display text.
+        let selection = ctx.sel_span.and_then(|(lo, hi)| line_highlight(&ctx.rope, i, lo, hi));
+        let search: Vec<Highlight> = ctx
+            .search_ranges
+            .iter()
+            .filter_map(|&(lo, hi)| line_highlight(&ctx.rope, i, lo, hi))
+            .collect();
+        let (text, segments, selection, search) = if self.render_markdown && i != ctx.cur_line {
+            let c = markdown::conceal(&text, &segs);
+            let selection = selection.and_then(|h| remap_highlight(h, &text, &c));
+            let search =
+                search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
+            (c.text, c.segments, selection, search)
+        } else {
+            (text, segs, selection, search)
+        };
+
+        // Byte offset where each visual row starts: 0, plus one per wrap
+        // boundary (the boundary glyph opens the next row). Plain ASCII
+        // lines in a monospace font take the column walk; anything the
+        // walk can't promise — non-ASCII (fallback fonts, wide glyphs),
+        // tabs, bold spans (a family's bold could differ) — shapes for
+        // exact boundaries, cached in `wrap_cache` across rebuilds.
+        let row_starts: Vec<usize> = match ctx.wrap_width {
+            None => vec![0],
+            Some(w) => {
+                let plain = text.is_ascii()
+                    && !text.contains('\t')
+                    && segments.iter().all(|s| {
+                        !matches!(s.kind, Some(SpanKind::Heading(_)) | Some(SpanKind::Strong))
+                    });
+                match ctx.mono_cols {
+                    Some(cols) if plain => wrap_columns(&text, cols),
+                    _ => {
+                        let key = (text.clone(), segments.clone());
+                        match self.wrap_cache.get(&key) {
+                            Some(starts) => starts,
+                            None => {
+                                let runs = segments_to_runs(
+                                    &text,
+                                    &segments,
+                                    &ctx.font,
+                                    ctx.theme.foreground,
+                                    &ctx.theme,
+                                );
+                                let wrapped = window
+                                    .text_system()
+                                    .shape_text(
+                                        text.clone().into(),
+                                        ctx.font_size,
+                                        &runs,
+                                        Some(w),
+                                        None,
+                                    )
+                                    .ok()
+                                    .and_then(|lines| lines.into_iter().next());
+                                let mut starts = vec![0];
+                                if let Some(wl) = wrapped {
+                                    starts.extend(wl.wrap_boundaries.iter().map(|b| {
+                                        wl.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix]
+                                            .index
+                                    }));
+                                }
+                                self.wrap_cache.cur.insert(key, starts.clone());
+                                starts
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // Char col where each row starts — highlight and caret columns
+        // are char-based, byte offsets index the text slices. ASCII:
+        // bytes are cols. Otherwise one pass over the char boundaries
+        // (per-row `chars().count()` was quadratic on long lines).
+        let (row_cols, line_chars): (Vec<usize>, usize) = if text.is_ascii() {
+            (row_starts.clone(), text.len())
+        } else {
+            let mut cols = Vec::with_capacity(row_starts.len());
+            let mut chars = 0;
+            let mut ci = text.char_indices().peekable();
+            for &b in &row_starts {
+                while ci.next_if(|&(cb, _)| cb < b).is_some() {
+                    chars += 1;
+                }
+                cols.push(chars);
+            }
+            (cols, text.chars().count())
+        };
+        let last = row_starts.len() - 1;
+        // The caret's row: the last row starting at or before its byte (a
+        // byte on a boundary belongs to the row the boundary opens).
+        let caret_row = (i == ctx.cur_line).then(|| {
+            let byte = caret_bytes(&text, ctx.cur_col).0;
+            row_starts.partition_point(|&b| b <= byte) - 1
+        });
+
+        for k in 0..=last {
+            let b0 = row_starts[k];
+            let b1 = row_starts.get(k + 1).copied().unwrap_or(text.len());
+            let c0 = row_cols[k];
+            let c1 = row_cols.get(k + 1).copied().unwrap_or(line_chars);
+            if caret_row == Some(k) {
+                caret_at = Some(out.len() - base);
+            }
+            // Line number on the first row only; continuation rows carry
+            // same-width blanks so their text aligns. Relative mode is
+            // hybrid: the cursor line shows its absolute number, others
+            // the distance to it.
+            let num_width = ctx.num_width;
+            let gutter = (self.line_numbers != LineNumbers::Off).then(|| {
+                if k > 0 {
+                    return (format!(" {:>num_width$}  ", "").into(), ctx.theme.muted);
+                }
+                let n = match self.line_numbers {
+                    LineNumbers::Relative if i != ctx.cur_line => i.abs_diff(ctx.cur_line),
+                    _ => i + 1,
+                };
+                let color =
+                    if i == ctx.cur_line { ctx.theme.foreground } else { ctx.theme.muted };
+                (format!(" {n:>num_width$}  ").into(), color)
+            });
+            out.push(LineElement {
+                text: text[b0..b1].to_string().into(),
+                segments: slice_segments(&segments, b0, b1),
+                caret: (caret_row == Some(k)).then(|| LineCaret {
+                    col: ctx.cur_col - c0,
+                    block: ctx.mode != Mode::Insert,
+                }),
+                selection: selection.and_then(|h| clip_row_highlight(h, c0, c1, k == last)),
+                search: search
+                    .iter()
+                    .filter_map(|&h| clip_row_highlight(h, c0, c1, k == last))
+                    .collect(),
+                scroll_x: self.scroll_x.clone(),
+                gutter,
+                follow_h: ctx.wrap_width.is_none(),
+            });
+        }
+        caret_at
     }
 
     /// `:e {path}` — open `path` for editing. A nonexistent file opens as a
@@ -863,15 +1273,16 @@ impl Editor {
             Action::Undo => self.doc_mut().undo(),
             // `z` scroll commands don't move the caret, so the render auto-scroll
             // won't override this; `_strict` repositions the already-visible
-            // cursor line (plain `scroll_to_item` no-ops when it's on screen).
+            // cursor row (plain `scroll_to_item` no-ops when it's on screen).
+            // `last_row` is the caret's visual row from the last render — current,
+            // because a z-scroll follows a rendered keystroke and moves nothing.
             Action::Scroll(s) => {
-                let line = self.doc().caret_line_col().0;
                 let strategy = match s {
                     Scroll::Center => ScrollStrategy::Center,
                     Scroll::Top => ScrollStrategy::Top,
                     Scroll::Bottom => ScrollStrategy::Bottom,
                 };
-                self.scroll.scroll_to_item_strict(line, strategy);
+                self.scroll.scroll_to_item_strict(self.last_row, strategy);
             }
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
             Action::Search { query, backward } => self.do_search(query, backward),
@@ -1181,7 +1592,7 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _win: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Commit the preview tab on its first edit. render runs after every
         // notify, so this catches every mutation path (keys, chords, palette
         // picks, timer-replayed sequences) without instrumenting each one.
@@ -1190,22 +1601,136 @@ impl Render for Editor {
         }
 
         let theme = *cx.global::<Theme>();
-        let (cur_line, cur_col) = self.doc().caret_line_col();
 
-        // Keep the caret on screen, but only when it actually moved — so the
-        // mouse wheel can scroll freely without snapping back every frame.
-        // `scroll_to_item` snaps an offscreen line to the strategy's edge, so
-        // pick the edge by direction: moving down lands it at the bottom, up at
-        // the top — each a one-line scroll, never a page jump.
-        if cur_line != self.last_line {
-            let strategy = if cur_line > self.last_line {
+        // Soft-wrap width: the live viewport minus the fixed sidebar and the
+        // line-number gutter. Live — not last frame's layout — so a resize
+        // (including the async maximize at startup) re-wraps correctly within
+        // its own frame. `None` turns wrapping off.
+        let line_count = self.doc().rope.len_lines();
+        // Gutter wide enough for the largest line number, monospace-aligned.
+        let num_width = line_count.to_string().len().max(3);
+        let wrap_width = if self.wrap {
+            // Wrapped rows never overflow — clear any leftover nowrap offset.
+            self.scroll_x.set(Pixels::ZERO);
+            let gutter_w = if self.line_numbers == LineNumbers::Off {
+                Pixels::ZERO
+            } else {
+                let sample: SharedString = format!(" {line_count:>num_width$}  ").into();
+                let font = gpui::font(self.font_family.clone());
+                let runs = [run(&font, sample.len(), theme.foreground)];
+                window.text_system().shape_line(sample, px(self.font_size), &runs, None).width
+            };
+            let w = window.viewport_size().width - px(SIDEBAR_WIDTH) - gutter_w;
+            (w > Pixels::ZERO).then_some(w)
+        } else {
+            None
+        };
+        // Reuse the previous rows when nothing they depend on changed — a
+        // wheel scroll re-renders every frame and must not rebuild (much less
+        // re-shape) the whole document each time. A caret-only change (j/k,
+        // h/l, w/b — the hot path) patches just the affected lines.
+        let key = RowsKey {
+            revision: self.doc().revision(),
+            caret: self.doc().caret_offset(),
+            mode: self.vim.mode,
+            sel: self
+                .vim
+                .mode
+                .is_visual()
+                .then(|| self.doc().selection_span(self.vim.mode == Mode::VisualLine)),
+            q: self.search_query(),
+            wrap_width,
+        };
+        enum Plan {
+            Hit,
+            Patch,
+            Full,
+        }
+        let plan = match &self.rows_cache {
+            Some(c) if c.key == key => Plan::Hit,
+            // Relative line numbers re-label every row on a caret line
+            // change, so they can't take the two-line patch.
+            Some(c)
+                if caret_only_change(&c.key, &key)
+                    && self.line_numbers != LineNumbers::Relative =>
+            {
+                Plan::Patch
+            }
+            _ => Plan::Full,
+        };
+        let (lines, cur_row) = match plan {
+            Plan::Hit => {
+                let c = self.rows_cache.as_ref().unwrap();
+                (c.rows.clone(), c.cur_row)
+            }
+            Plan::Patch => {
+                // Same content, no highlights: only the old and new cursor
+                // lines can render differently (conceal swap, caret, gutter
+                // emphasis). Rebuild those lines and splice them in place.
+                let mut c = self.rows_cache.take().unwrap();
+                let ctx = self.row_ctx(wrap_width, &theme, window);
+                let old_line =
+                    ctx.rope.char_to_line(c.key.caret.min(ctx.rope.len_chars()));
+                let new_line = ctx.cur_line;
+                let mut rows = Rc::try_unwrap(c.rows).unwrap_or_else(|rc| (*rc).clone());
+                let mut caret_in_line = 0;
+                // Higher line first, so the lower splice's length change
+                // can't shift the row range the higher one was measured at.
+                let redo: &[usize] = if old_line == new_line {
+                    &[new_line][..]
+                } else if old_line > new_line {
+                    &[old_line, new_line][..]
+                } else {
+                    &[new_line, old_line][..]
+                };
+                for &li in redo {
+                    let start: usize =
+                        c.line_rows[..li].iter().map(|&n| n as usize).sum();
+                    let end = start + c.line_rows[li] as usize;
+                    let mut fresh = Vec::new();
+                    if let Some(k) = self.append_line_rows(&ctx, li, window, &mut fresh) {
+                        caret_in_line = k;
+                    }
+                    c.line_rows[li] = fresh.len() as u32;
+                    rows.splice(start..end, fresh);
+                }
+                let cur_row = c.line_rows[..new_line].iter().map(|&n| n as usize).sum::<usize>()
+                    + caret_in_line;
+                let rows = Rc::new(rows);
+                self.rows_cache =
+                    Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows: c.line_rows });
+                (rows, cur_row)
+            }
+            Plan::Full => {
+                let ctx = self.row_ctx(wrap_width, &theme, window);
+                let (rows, cur_row, line_rows) = self.build_rows(&ctx, window);
+                let rows = Rc::new(rows);
+                self.rows_cache =
+                    Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows });
+                (rows, cur_row)
+            }
+        };
+        let editor_row_count = lines.len();
+
+        // Keep the caret's row on screen, but only when it actually moved — so
+        // the mouse wheel can scroll freely without snapping back every frame.
+        // A buffer switch recenters instead (the shared scroll handle still
+        // holds the old buffer's offset). `scroll_to_item` snaps an offscreen
+        // row to the strategy's edge, so the follow picks the edge by
+        // direction: moving down lands it at the bottom, up at the top — each
+        // a one-row scroll, never a page jump.
+        if self.center_on_render {
+            self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center);
+            self.center_on_render = false;
+        } else if cur_row != self.last_row {
+            let strategy = if cur_row > self.last_row {
                 ScrollStrategy::Bottom
             } else {
                 ScrollStrategy::Top
             };
-            self.scroll.scroll_to_item(cur_line, strategy);
-            self.last_line = cur_line;
+            self.scroll.scroll_to_item(cur_row, strategy);
         }
+        self.last_row = cur_row;
 
         // Keep the sidebar cursor on screen as `j`/`k` move it past the viewport.
         // Only while the sidebar drives keys, so a click (which switches to the
@@ -1229,38 +1754,8 @@ impl Render for Editor {
             self.picker_scroll.scroll_to_item(p.selected, ScrollStrategy::Center);
         }
 
-        let rope = self.doc().rope.clone(); // ropey clone is cheap (shared, CoW)
-        let line_count = rope.len_lines();
-        // ponytail: full re-scan each render (≈ per keystroke). Markdown docs are
-        // small and it's a cheap char walk; cache on a doc revision if it bites.
-        let spans = markdown::parse(&rope);
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
-        let render_markdown = self.render_markdown;
-        let line_numbers = self.line_numbers;
-        // Gutter wide enough for the largest line number, monospace-aligned.
-        let num_width = line_count.to_string().len().max(3);
-        // The selected char-range to highlight, `None` outside visual mode.
-        let highlight: Option<(usize, usize)> =
-            mode.is_visual().then(|| self.doc().selection_span(mode == Mode::VisualLine));
-
-        // Search matches to paint: the pending query while a search prompt is
-        // open (incsearch preview), else the last submitted one while hlsearch
-        // is lit. ponytail: full re-scan per render, same precedent as the
-        // markdown parse above; cache on a doc revision if it bites.
-        let prompt_open = mode == Mode::Command && self.vim.prompt() != ':';
-        let q = if prompt_open && self.search_cfg.incsearch {
-            self.vim.command_line().to_string()
-        } else if !prompt_open && self.search_cfg.hlsearch && self.search.hl {
-            self.search.query.clone()
-        } else {
-            String::new()
-        };
-        let search_ranges = if q.is_empty() {
-            Vec::new()
-        } else {
-            find_matches(&rope, &q, search_sensitive(&q, &self.search_cfg))
-        };
 
         let bar = if mode == Mode::Command {
             format!("{}{}", self.vim.prompt(), self.vim.command_line())
@@ -1384,11 +1879,11 @@ impl Render for Editor {
                     .flex_col()
                     .child(tabline)
                     .child(
-                        uniform_list("lines", line_count + overscroll, move |range, _win, _cx| {
+                        uniform_list("lines", editor_row_count + overscroll, move |range, _win, _cx| {
                             range
                                 .map(|i| {
-                                    // Phantom overscroll line past EOF: blank, no gutter.
-                                    if i >= line_count {
+                                    // Phantom overscroll row past EOF: blank, no gutter.
+                                    if i >= editor_row_count {
                                         return LineElement {
                                             text: "".into(),
                                             segments: Vec::new(),
@@ -1397,64 +1892,10 @@ impl Render for Editor {
                                             search: Vec::new(),
                                             scroll_x: scroll_x.clone(),
                                             gutter: None,
+                                            follow_h: false,
                                         };
                                     }
-                                    // Relative mode is hybrid: cursor line shows its
-                                    // absolute number, others the distance to it.
-                                    let gutter = (line_numbers != LineNumbers::Off).then(|| {
-                                        let n = match line_numbers {
-                                            LineNumbers::Relative if i != cur_line => {
-                                                i.abs_diff(cur_line)
-                                            }
-                                            _ => i + 1,
-                                        };
-                                        let color = if i == cur_line {
-                                            theme.foreground
-                                        } else {
-                                            theme.muted
-                                        };
-                                        (format!(" {n:>num_width$}  ").into(), color)
-                                    });
-                                    // Conceal markers on every line but the cursor
-                                    // line, which keeps full source so caret math
-                                    // stays on real document bytes.
-                                    let text = line_text(&rope, i);
-                                    let line_spans = spans.get(i).map_or(&[][..], Vec::as_slice);
-                                    let segs = markdown::flatten(text.len(), line_spans);
-                                    // Highlights land in source columns; a concealed
-                                    // line remaps them through the conceal map so they
-                                    // track the display text, not where the source was.
-                                    let selection =
-                                        highlight.and_then(|(lo, hi)| line_highlight(&rope, i, lo, hi));
-                                    let search: Vec<Highlight> = search_ranges
-                                        .iter()
-                                        .filter_map(|&(lo, hi)| line_highlight(&rope, i, lo, hi))
-                                        .collect();
-                                    let (text, segments, selection, search) =
-                                        if render_markdown && i != cur_line {
-                                            let c = markdown::conceal(&text, &segs);
-                                            let selection =
-                                                selection.and_then(|h| remap_highlight(h, &text, &c));
-                                            let search = search
-                                                .into_iter()
-                                                .filter_map(|h| remap_highlight(h, &text, &c))
-                                                .collect();
-                                            (c.text, c.segments, selection, search)
-                                        } else {
-                                            (text, segs, selection, search)
-                                        };
-                                    LineElement {
-                                        text: text.into(),
-                                        segments,
-                                        caret: (i == cur_line).then_some(LineCaret {
-                                            col: cur_col,
-                                            block: mode != Mode::Insert,
-                                        }),
-                                        selection,
-                                        search,
-                                        scroll_x: scroll_x.clone(),
-                                        gutter,
-                                    }
+                                    lines[i].clone()
                                 })
                                 .collect()
                         })
@@ -1498,6 +1939,10 @@ struct Highlight {
 /// When `render_markdown` is on, non-cursor lines carry concealed text/segments
 /// and the cursor line carries source, so only the two lines a vertical move
 /// swaps between re-shape — everything else stays cached.
+/// With soft-wrap, one of these is one *visual row*: `build_rows` slices a
+/// wrapped line into per-row text/segments/highlights, so this element never
+/// needs to know about wrapping.
+#[derive(Clone)]
 struct LineElement {
     text: SharedString,
     /// Styled segments matching `text` (concealed or source), mapped to runs in
@@ -1518,6 +1963,10 @@ struct LineElement {
     /// Pre-formatted line-number string and its color. `None` when the gutter is
     /// off. Painted at a fixed left position; the text is shifted right past it.
     gutter: Option<(SharedString, Hsla)>,
+    /// Nudge `scroll_x` to keep the caret horizontally on screen — nowrap
+    /// only. A wrapped row never overflows, and its caret reaching the right
+    /// edge must not shift the pane. Only the caret row acts on it.
+    follow_h: bool,
 }
 
 struct LinePrepaint {
@@ -1606,22 +2055,24 @@ impl Element for LineElement {
                 let (caret_byte, under_end) = caret_bytes(&self.text, c.col);
                 let x = shaped.x_for_index(caret_byte);
                 // Follow the caret horizontally: keep it `margin` inside both
-                // edges of the pane. Only the cursor line writes scroll_x; every
-                // line reads it in paint. A short line (caret near x=0) snaps the
+                // edges of the pane. Only the cursor row writes scroll_x; every
+                // row reads it in paint. A short line (caret near x=0) snaps the
                 // offset back to 0 on its own.
                 // ponytail: margin ≈ 2 chars; no mouse-wheel/`zh`/`zl` scroll yet.
-                let margin = font_size * 2.;
-                let viewport = bounds.size.width - gutter_w;
-                let mut s = self.scroll_x.get();
-                if x < s + margin {
-                    s = x - margin;
-                    if s < Pixels::ZERO {
-                        s = Pixels::ZERO;
+                if self.follow_h {
+                    let margin = font_size * 2.;
+                    let viewport = bounds.size.width - gutter_w;
+                    let mut s = self.scroll_x.get();
+                    if x < s + margin {
+                        s = x - margin;
+                        if s < Pixels::ZERO {
+                            s = Pixels::ZERO;
+                        }
+                    } else if x > s + viewport - margin {
+                        s = x - viewport + margin;
                     }
-                } else if x > s + viewport - margin {
-                    s = x - viewport + margin;
+                    self.scroll_x.set(s);
                 }
-                self.scroll_x.set(s);
                 match (c.block, under_end) {
                     // Block caret over a char: full-cell quad, and grab that
                     // glyph from the cached layout to repaint it dark on top.
@@ -1845,6 +2296,78 @@ fn line_highlight(rope: &ropey::Rope, i: usize, lo: usize, hi: usize) -> Option<
     })
 }
 
+/// The only difference between two row keys is where the caret sits: same
+/// content, same mode, no selection, no highlighted search. Then only the old
+/// and new cursor lines can render differently (conceal swap, caret quad,
+/// gutter emphasis), so the cached rows can be patched instead of rebuilt.
+fn caret_only_change(old: &RowsKey, new: &RowsKey) -> bool {
+    old.revision == new.revision
+        && old.wrap_width == new.wrap_width
+        && old.mode == new.mode
+        && old.sel.is_none()
+        && new.sel.is_none()
+        && old.q.is_empty()
+        && new.q.is_empty()
+}
+
+/// Greedy word wrap for plain ASCII text in a monospace font: row-start byte
+/// offsets for rows of at most `cols` chars, breaking after the last space in
+/// the row, or mid-word when one word overruns a whole row. Only valid where
+/// byte == char == column — the caller gates on ASCII.
+// ponytail: a break can leave a space at a row edge — cosmetic, vim-like.
+fn wrap_columns(text: &str, cols: usize) -> Vec<usize> {
+    let cols = cols.max(1);
+    let bytes = text.as_bytes();
+    let mut starts = vec![0];
+    let (mut row_start, mut last_space) = (0usize, None);
+    let mut i = 0;
+    while i < bytes.len() {
+        if i - row_start == cols {
+            let next = last_space.map_or(i, |s: usize| s + 1);
+            starts.push(next);
+            row_start = next;
+            last_space = None;
+            i = next;
+            continue;
+        }
+        if bytes[i] == b' ' {
+            last_space = Some(i);
+        }
+        i += 1;
+    }
+    starts
+}
+
+/// Slice a line's styling segments down to the byte range `[b0, b1)` of one
+/// wrapped visual row. Kinds are kept; lengths clip to the range.
+fn slice_segments(segments: &[Segment], b0: usize, b1: usize) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    for seg in segments {
+        let (s, e) = (pos, pos + seg.len);
+        pos = e;
+        let (a, b) = (s.max(b0), e.min(b1));
+        if a < b {
+            out.push(Segment { len: b - a, kind: seg.kind });
+        }
+    }
+    out
+}
+
+/// Clip a line-level column highlight to one visual row's char range
+/// `[c0, c1)`, re-based to row-local columns. `to_eol` (fill past the last
+/// char) only survives on the line's last row, where the line actually ends;
+/// `None` when nothing of the span lands on this row.
+fn clip_row_highlight(h: Highlight, c0: usize, c1: usize, last_row: bool) -> Option<Highlight> {
+    let to_eol = h.to_eol && last_row;
+    let a = h.start_col.max(c0);
+    let b = h.end_col.min(c1).max(a);
+    if a >= b && !to_eol {
+        return None;
+    }
+    Some(Highlight { start_col: a - c0, end_col: b - c0, to_eol })
+}
+
 /// Remap a source-column highlight onto a concealed line: char col → source
 /// byte, through the conceal map, → display char col. `None` when the span was
 /// entirely concealed away (nothing visible to highlight).
@@ -1943,14 +2466,101 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, filter_items, find_matches, match_buffer, next_match, rel_display,
-        remap_highlight, resolve, search_sensitive, segment_style, Highlight, PickItem,
+        caret_bytes, clip_row_highlight, filter_items, find_matches, match_buffer, next_match,
+        rel_display, remap_highlight, resolve, search_sensitive, segment_style, slice_segments,
+        wrap_columns, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
     use gpui::Hsla;
     use ropey::Rope;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    #[ignore = "manual perf probe: cargo test bench_rebuild -- --ignored --nocapture"]
+    fn bench_rebuild_cpu() {
+        let text =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tuiHandoff.md"))
+                .unwrap();
+        let rope = ropey::Rope::from_str(&text);
+        let iters = 200u32;
+        let start = std::time::Instant::now();
+        let mut rows = 0usize;
+        for _ in 0..iters {
+            let spans = markdown::parse(&rope);
+            for i in 0..rope.len_lines() {
+                let t = super::line_text(&rope, i);
+                let line_spans = spans.get(i).map_or(&[][..], Vec::as_slice);
+                let segs = markdown::flatten(t.len(), line_spans);
+                let c = markdown::conceal(&t, &segs);
+                let starts = wrap_columns(&c.text, 100);
+                for k in 0..starts.len() {
+                    let b0 = starts[k];
+                    let b1 = starts.get(k + 1).copied().unwrap_or(c.text.len());
+                    let row = c.text[b0..b1].to_string();
+                    let segs = slice_segments(&c.segments, b0, b1);
+                    rows += 1 + row.len().min(1) + segs.len().min(1);
+                }
+            }
+        }
+        println!("avg rebuild: {:?}, {} row-units", start.elapsed() / iters, rows / iters as usize);
+    }
+
+    #[test]
+    fn wrap_columns_breaks_words_and_walls() {
+        // Word break: "hello worl|d…" overflows at 10; the row breaks after
+        // the space, so row 2 starts at 'w'.
+        assert_eq!(wrap_columns("hello world foo", 10), vec![0, 6]);
+        // No spaces: hard breaks every `cols`.
+        assert_eq!(wrap_columns("aaaaaaaaaaaa", 5), vec![0, 5, 10]);
+        // Exact fit and empty: single row.
+        assert_eq!(wrap_columns("aaaaa", 5), vec![0]);
+        assert_eq!(wrap_columns("", 5), vec![0]);
+        // cols 0 clamps to 1 instead of looping forever.
+        assert_eq!(wrap_columns("ab", 0), vec![0, 1]);
+    }
+
+    #[test]
+    fn slice_segments_clips_to_row_range() {
+        use markdown::Segment;
+        let segs = vec![
+            Segment { len: 3, kind: Some(SpanKind::Marker) },
+            Segment { len: 5, kind: None },
+        ];
+        // Row [2, 6): one byte of the marker, three of the body.
+        assert_eq!(
+            slice_segments(&segs, 2, 6),
+            vec![Segment { len: 1, kind: Some(SpanKind::Marker) }, Segment { len: 3, kind: None }]
+        );
+        // A row past the segments' end is unstyled.
+        assert!(slice_segments(&segs, 8, 12).is_empty());
+    }
+
+    #[test]
+    fn clip_row_highlight_splits_across_rows() {
+        // A line wrapped at col 10; selection [4, 14) reaching the newline.
+        let h = Highlight { start_col: 4, end_col: 14, to_eol: true };
+        // First row [0,10): local [4,10), not at line end → no to_eol fill.
+        assert!(matches!(
+            clip_row_highlight(h, 0, 10, false),
+            Some(Highlight { start_col: 4, end_col: 10, to_eol: false })
+        ));
+        // Last row [10,16): local [0,4), keeps the to_eol fill.
+        assert!(matches!(
+            clip_row_highlight(h, 10, 16, true),
+            Some(Highlight { start_col: 0, end_col: 4, to_eol: true })
+        ));
+        // A span the row misses entirely.
+        let short = Highlight { start_col: 0, end_col: 3, to_eol: false };
+        assert!(clip_row_highlight(short, 10, 16, true).is_none());
+        // Zero-width span at EOL survives through to_eol (linewise selection
+        // covering a wrapped line's newline).
+        let eol = Highlight { start_col: 14, end_col: 14, to_eol: true };
+        assert!(matches!(
+            clip_row_highlight(eol, 10, 16, true),
+            Some(Highlight { start_col: 4, end_col: 4, to_eol: true })
+        ));
+    }
 
     #[test]
     fn strong_color_differs_from_plain_text() {
