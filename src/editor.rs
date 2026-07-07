@@ -2477,36 +2477,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
-    #[ignore = "manual perf probe: cargo test bench_rebuild -- --ignored --nocapture"]
-    fn bench_rebuild_cpu() {
-        let text =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tuiHandoff.md"))
-                .unwrap();
-        let rope = ropey::Rope::from_str(&text);
-        let iters = 200u32;
-        let start = std::time::Instant::now();
-        let mut rows = 0usize;
-        for _ in 0..iters {
-            let spans = markdown::parse(&rope);
-            for i in 0..rope.len_lines() {
-                let t = super::line_text(&rope, i);
-                let line_spans = spans.get(i).map_or(&[][..], Vec::as_slice);
-                let segs = markdown::flatten(t.len(), line_spans);
-                let c = markdown::conceal(&t, &segs);
-                let starts = wrap_columns(&c.text, 100);
-                for k in 0..starts.len() {
-                    let b0 = starts[k];
-                    let b1 = starts.get(k + 1).copied().unwrap_or(c.text.len());
-                    let row = c.text[b0..b1].to_string();
-                    let segs = slice_segments(&c.segments, b0, b1);
-                    rows += 1 + row.len().min(1) + segs.len().min(1);
-                }
-            }
-        }
-        println!("avg rebuild: {:?}, {} row-units", start.elapsed() / iters, rows / iters as usize);
-    }
-
-    #[test]
     fn wrap_columns_breaks_words_and_walls() {
         // Word break: "hello worl|d…" overflows at 10; the row breaks after
         // the space, so row 2 starts at 'w'.
