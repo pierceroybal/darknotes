@@ -1,6 +1,6 @@
 //! Hand-edited user preferences, read once at startup from
 //! `config.toml`. Durable prefs only — machine-owned restore state (open
-//! buffers, cursor, scroll) belongs in a separate `session.json`, never here,
+//! buffers, cursor, scroll) belongs in a separate `session.toml`, never here,
 //! so churning state can't clobber a hand-edited file's comments.
 
 use std::collections::BTreeMap;
@@ -169,12 +169,17 @@ fn parse_or_default(text: &str, src: &str) -> Config {
     })
 }
 
+/// Shared config-dir resolution (`config.toml`, `session.toml`).
 // ponytail: XDG/HOME only — add `%APPDATA%` if/when Windows is targeted.
-fn config_path() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("darknotes").join("config.toml"))
+    Some(base.join("darknotes"))
+}
+
+fn config_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("config.toml"))
 }
 
 fn expand_tilde(s: &str) -> PathBuf {

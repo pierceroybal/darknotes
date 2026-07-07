@@ -22,6 +22,7 @@ use crate::document::Document;
 use crate::keymap::{Ctx, Resolver};
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use crate::markdown::{self, Segment, SpanKind};
+use crate::session;
 use crate::theme::Theme;
 use crate::vault::Vault;
 use crate::vim::{Action, Mode, Scroll, Vim};
@@ -274,19 +275,47 @@ impl Editor {
         // render and leaves stale narrow wrapping until the next keystroke.
         cx.observe_window_bounds(window, |_, _, cx| cx.notify()).detach();
         let vault = Vault::scan(vault_root);
-        let doc = match initial {
-            Some(path) => open_or_empty(&path),
-            None => match vault.files.first() {
-                Some(first) => open_or_empty(first),
-                None => Document::new(WELCOME),
-            },
-        };
+        // An explicit CLI file means a fresh session; otherwise rebuild last
+        // session's tabs. Files deleted since then are skipped (Document::open,
+        // not open_or_empty — a missing file must not resurrect as an empty
+        // buffer).
+        let mut buffers = Vec::new();
+        let mut active = 0;
+        if initial.is_none() {
+            if let Some(s) = session::restore(&vault.root) {
+                let mut seen_preview = false;
+                for e in s.files {
+                    let Ok(mut doc) = Document::open(&e.path) else { continue };
+                    doc.jump_to(e.caret);
+                    // At most one preview buffer exists; against a hand-edited
+                    // or stale file, the first preview wins and the rest pin.
+                    let preview = e.preview && !seen_preview;
+                    seen_preview |= preview;
+                    buffers.push(Buffer { doc, preview });
+                }
+                active = s.active.min(buffers.len().saturating_sub(1));
+            }
+        }
+        let restored = !buffers.is_empty();
+        if !restored {
+            let doc = match initial {
+                Some(path) => open_or_empty(&path),
+                None => match vault.files.first() {
+                    Some(first) => open_or_empty(first),
+                    None => Document::new(WELCOME),
+                },
+            };
+            // The startup buffer is a preview like any other open: the first
+            // navigation replaces it, the first edit commits it.
+            buffers.push(Buffer { doc, preview: true });
+        }
         let vim = Vim::new(config.tab_width);
         let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
         let keymap = Resolver::new(&config.keymap, DEFAULT_BINDINGS, &names);
-        // Open the tree to the initial file and park the sidebar cursor on it.
+        // Open the tree to the active file and park the sidebar cursor on it.
         let mut expanded = HashSet::new();
-        let selected = doc
+        let selected = buffers[active]
+            .doc
             .path()
             .map(|p| {
                 expand_ancestors(&vault.root, p, &mut expanded);
@@ -298,10 +327,8 @@ impl Editor {
             })
             .unwrap_or(0);
         Self {
-            // The startup buffer is a preview like any other open: the first
-            // navigation replaces it, the first edit commits it.
-            buffers: vec![Buffer { doc, preview: true }],
-            active: 0,
+            buffers,
+            active,
             alternate: None,
             vim,
             focus: cx.focus_handle(),
@@ -315,7 +342,10 @@ impl Editor {
             pending_window: false,
             scroll: UniformListScrollHandle::new(),
             last_row: 0,
-            center_on_render: false,
+            // A restored mid-file caret must start centered; the render pass
+            // owns the scroll because the caret's visual row needs this
+            // buffer's wrap map (same as a buffer switch).
+            center_on_render: restored,
             wrap: config.wrap,
             rows_cache: None,
             wrap_cache: ShapeWrapCache::default(),
@@ -381,6 +411,7 @@ impl Editor {
         self.center_on_render = true;
         self.reveal_current();
         window.focus(&self.focus);
+        self.save_session();
     }
 
     /// Switch to buffer `i`, recording where we came from for `Ctrl-6`/`:b #`.
@@ -834,6 +865,9 @@ impl Editor {
         } else if self.active > i {
             self.active -= 1; // same buffer, shifted index
         }
+        // Idempotent when switch_to above already wrote; the other branches
+        // need it.
+        self.save_session();
     }
 
     /// `:q`(`!`) — quit the app; refuses while any buffer has unsaved changes.
@@ -846,6 +880,7 @@ impl Editor {
                 return;
             }
         }
+        self.save_session();
         cx.quit();
     }
 
@@ -1393,6 +1428,27 @@ impl Editor {
 
     /// `:w` with no arg writes the backing file; `:w <name>` saves as `<name>`,
     /// defaulting a bare name to `.md`.
+    /// Snapshot open buffers to session.toml. Pathless buffers (scratch,
+    /// `:enew`) aren't on disk and are skipped; `active` is re-pointed into
+    /// the kept list (0 if the active buffer itself was pathless).
+    fn save_session(&self) {
+        let mut files = Vec::new();
+        let mut active = 0;
+        for (i, b) in self.buffers.iter().enumerate() {
+            let Some(path) = b.doc.path() else { continue };
+            if i == self.active {
+                active = files.len();
+            }
+            files.push(session::FileEntry {
+                // Canonicalized: the next launch's cwd can differ.
+                path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+                preview: b.preview,
+                caret: b.doc.caret_offset(),
+            });
+        }
+        session::record(&self.vault.root, session::VaultSession { active, files });
+    }
+
     fn save(&mut self, arg: Option<&str>) {
         let result = match arg {
             Some(name) => {
@@ -1430,6 +1486,8 @@ impl Editor {
         if result.is_ok() {
             // Saving pins a preview tab, edited or not (VS Code behavior).
             self.buffers[self.active].preview = false;
+            // `:w` is a natural caret snapshot, and the preview flag changed.
+            self.save_session();
         }
         self.message = Some(match result {
             Ok(name) => format!("\"{name}\" written"),

@@ -3,6 +3,7 @@ mod document;
 mod editor;
 mod keymap;
 mod markdown;
+mod session;
 mod theme;
 mod vault;
 mod vim;
