@@ -1770,23 +1770,39 @@ impl Render for Editor {
         };
         let editor_row_count = lines.len();
 
-        // Keep the caret's row on screen, but only when it actually moved — so
+        // Keep the caret on screen, but only when its row actually moved — so
         // the mouse wheel can scroll freely without snapping back every frame.
         // A buffer switch recenters instead (the shared scroll handle still
-        // holds the old buffer's offset). `scroll_to_item` snaps an offscreen
-        // row to the strategy's edge, so the follow picks the edge by
-        // direction: moving down lands it at the bottom, up at the top — each
-        // a one-row scroll, never a page jump.
+        // holds the old buffer's offset). Like vim, landing on a soft-wrapped
+        // line pulls the whole line into view, not just the caret's row: the
+        // scroll target is the line's last visual row moving down, its first
+        // moving up, clamped so the caret itself stays visible when a single
+        // line wraps taller than the viewport. One scroll_to_item call only —
+        // gpui keeps a single deferred scroll per frame, last call wins.
+        let line_h = px(self.font_size * 22.0 / 15.0);
         if self.center_on_render {
             self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center);
             self.center_on_render = false;
         } else if cur_row != self.last_row {
-            let strategy = if cur_row > self.last_row {
-                ScrollStrategy::Bottom
+            let c = self.rows_cache.as_ref().unwrap();
+            let line = self.doc().rope.char_to_line(c.key.caret);
+            let first: usize = c.line_rows[..line].iter().map(|&n| n as usize).sum();
+            let last = first + c.line_rows[line] as usize - 1;
+            // Rows that fit fully in the viewport (1 before first layout).
+            let fit = self
+                .scroll
+                .0
+                .borrow()
+                .last_item_size
+                .map_or(1, |s| (s.item.height / line_h).floor() as usize)
+                .max(1);
+            if cur_row > self.last_row {
+                let target = last.min(cur_row + fit - 1);
+                self.scroll.scroll_to_item(target, ScrollStrategy::Bottom);
             } else {
-                ScrollStrategy::Top
-            };
-            self.scroll.scroll_to_item(cur_row, strategy);
+                let target = first.max(cur_row.saturating_sub(fit - 1));
+                self.scroll.scroll_to_item(target, ScrollStrategy::Top);
+            }
         }
         self.last_row = cur_row;
 
@@ -1841,7 +1857,6 @@ impl Render for Editor {
         // `zz`/`zt` keep working near the bottom of the file, and the wheel can
         // scroll until the last real line sits at the top of the viewport. Sized
         // from the previous frame's viewport height (zero before first layout).
-        let line_h = px(self.font_size * 22.0 / 15.0);
         let overscroll = self
             .scroll
             .0
