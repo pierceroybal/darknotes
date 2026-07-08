@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// A vault is a root folder plus the markdown files found beneath it. `tree` is
+/// A vault is a root folder plus the files found beneath it. `tree` is
 /// the nested folder/file structure for the sidebar; `files` is the same files
-/// flattened, for navigation and `:e`/`:w` resolution. Hidden dirs (`.git`,
-/// `.obsidian`) are skipped and folders with no `.md` beneath them are omitted.
+/// flattened, for navigation and `:e`/`:w` resolution. Hidden files and dirs
+/// (`.git`, `.obsidian`, `.env`) are skipped and folders with nothing visible
+/// beneath them are omitted.
 pub struct Vault {
     pub root: PathBuf,
     pub tree: Vec<Entry>,
@@ -83,8 +84,8 @@ fn push_rows(entries: &[Entry], depth: usize, expanded: &HashSet<PathBuf>, out: 
 // trees; revisit if someone points it at a huge directory.
 //
 // Returns `dir`'s children: subfolders first (each recursed into), then files,
-// both alphabetical by name. Folders with no `.md` anywhere beneath are dropped
-// so the sidebar has no dead, un-openable rows.
+// both alphabetical by name. Folders with nothing visible anywhere beneath are
+// dropped so the sidebar has no dead, un-openable rows.
 fn build_dir(dir: &Path) -> Vec<Entry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -100,9 +101,8 @@ fn build_dir(dir: &Path) -> Vec<Entry> {
                     dirs.push(Entry::Dir { name: file_name(&path), path, children });
                 }
             }
-        } else if path.extension().is_some_and(|e| e == "md") {
-            // Show the stem — the `.md` extension is implied by the app.
-            files.push(Entry::File { name: file_stem(&path), path });
+        } else if !is_hidden(&path) {
+            files.push(Entry::File { name: display_name(&path), path });
         }
     }
     dirs.sort_by(|a, b| entry_name(a).cmp(entry_name(b)));
@@ -132,12 +132,16 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// File name without its extension — only `.md` files reach here, so this drops
-/// the implied `.md` for the sidebar label.
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
+/// Sidebar label: `.md` files show their stem (the extension is implied by the
+/// app); any other file shows its full name, extension included.
+fn display_name(path: &Path) -> String {
+    if path.extension().is_some_and(|e| e == "md") {
+        path.file_stem()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        file_name(path)
+    }
 }
 
 fn is_hidden(path: &Path) -> bool {
@@ -155,13 +159,14 @@ mod tests {
     }
 
     #[test]
-    fn scan_finds_md_recursively_skipping_hidden() {
+    fn scan_shows_all_files_skipping_hidden() {
         let root = std::env::temp_dir().join("darknotes_vault_test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::create_dir_all(root.join(".hidden")).unwrap();
         std::fs::write(root.join("a.md"), "a").unwrap();
         std::fs::write(root.join("b.txt"), "b").unwrap();
+        std::fs::write(root.join(".env"), "secret").unwrap();
         std::fs::write(root.join("sub/c.md"), "c").unwrap();
         std::fs::write(root.join(".hidden/d.md"), "d").unwrap();
 
@@ -177,7 +182,7 @@ mod tests {
                     .replace('\\', "/")
             })
             .collect();
-        assert_eq!(names, vec!["sub/c.md", "a.md"]);
+        assert_eq!(names, vec!["sub/c.md", "a.md", "b.txt"]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -188,16 +193,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("a.md"), "a").unwrap();
+        std::fs::write(root.join("b.sql"), "b").unwrap();
         std::fs::write(root.join("sub/c.md"), "c").unwrap();
 
         let vault = Vault::scan(&root);
         let mut expanded = HashSet::new();
 
-        // Collapsed: the folder and the root file, both at depth 0. File labels
-        // drop the `.md` extension; folder names are shown as-is.
+        // Collapsed: the folder and the root files, all at depth 0. `.md` labels
+        // drop the extension; other files keep theirs; folder names are as-is.
         assert_eq!(
             depth_names(&vault.visible_rows(&expanded)),
-            vec![(0, "sub".to_string()), (0, "a".to_string())]
+            vec![
+                (0, "sub".to_string()),
+                (0, "a".to_string()),
+                (0, "b.sql".to_string()),
+            ]
         );
 
         // Expanded: the folder's child appears between, indented one level.
@@ -208,6 +218,7 @@ mod tests {
                 (0, "sub".to_string()),
                 (1, "c".to_string()),
                 (0, "a".to_string()),
+                (0, "b.sql".to_string()),
             ]
         );
 

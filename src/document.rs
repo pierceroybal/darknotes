@@ -200,6 +200,16 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Whether markdown-aware editing conveniences (list continuation, list-line
+    /// Tab, span styling) apply: true for `.md` files and pathless scratch
+    /// buffers (no file yet, destined to become a note), false for any other
+    /// real extension.
+    pub fn is_markdown(&self) -> bool {
+        self.path
+            .as_deref()
+            .map_or(true, |p| p.extension().is_some_and(|e| e == "md"))
+    }
+
     fn caret(&self) -> usize {
         self.selections[0].head
     }
@@ -232,6 +242,10 @@ impl Document {
     /// `clear_empty` (Enter, not `o`) erases the marker of an empty item rather
     /// than repeating it — the way out of a list.
     pub fn insert_newline(&mut self, clear_empty: bool) {
+        if !self.is_markdown() {
+            self.insert("\n");
+            return;
+        }
         let (line, _) = self.line_col_of(self.caret());
         let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
         match markdown::list_continuation(&text) {
@@ -264,7 +278,7 @@ impl Document {
                 self.touch();
                 self.set_caret(start + col.saturating_sub(lead));
             }
-        } else if markdown::is_list_item(&text) {
+        } else if self.is_markdown() && markdown::is_list_item(&text) {
             self.rope.insert(start, &" ".repeat(width));
             self.touch();
             self.set_caret(caret + width);
@@ -1469,6 +1483,35 @@ mod tests {
         d.move_motion(Motion::CharRight, 1);
         d.indent(2, false);
         assert_eq!(d.rope.to_string(), "f  oo");
+    }
+
+    #[test]
+    fn is_markdown_by_path() {
+        let mut d = Document::new("x");
+        assert!(d.is_markdown()); // pathless scratch buffer
+        d.path = Some(PathBuf::from("/v/note.md"));
+        assert!(d.is_markdown());
+        d.path = Some(PathBuf::from("/v/schema.sql"));
+        assert!(!d.is_markdown());
+        d.path = Some(PathBuf::from("/v/Makefile"));
+        assert!(!d.is_markdown());
+    }
+
+    #[test]
+    fn non_markdown_skips_list_conveniences() {
+        // Enter after a list-looking line in a .sql file: plain split, no "- ".
+        let mut d = Document::new("- foo");
+        d.path = Some(PathBuf::from("/v/schema.sql"));
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true);
+        assert_eq!(d.rope.to_string(), "- foo\n");
+
+        // Tab on a list-looking line inserts at the caret, no line shift.
+        let mut d = Document::new("- foo");
+        d.path = Some(PathBuf::from("/v/schema.sql"));
+        d.move_motion(Motion::CharRight, 1);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "-   foo");
     }
 
     #[test]

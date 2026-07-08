@@ -502,13 +502,18 @@ impl Editor {
     }
 
     /// Per-line markdown spans of the active buffer, memoized on its content
-    /// revision (the parse is document-wide and caret-independent).
+    /// revision (the parse is document-wide and caret-independent). Non-markdown
+    /// buffers get empty spans per line — plain text, no conceal/styling.
     fn spans(&mut self) -> Rc<Vec<Vec<markdown::Span>>> {
         let rev = self.doc().revision();
         match &self.spans_cache {
             Some((r, s)) if *r == rev => s.clone(),
             _ => {
-                let s = Rc::new(markdown::parse(&self.doc().rope));
+                let s = if self.doc().is_markdown() {
+                    Rc::new(markdown::parse(&self.doc().rope))
+                } else {
+                    Rc::new(vec![Vec::new(); self.doc().rope.len_lines()])
+                };
                 self.spans_cache = Some((rev, s.clone()));
                 s
             }
@@ -1533,6 +1538,9 @@ impl Editor {
 }
 
 /// Bare names get a `.md` extension; anything with an extension is left alone.
+/// Deliberate even though the vault holds mixed file types: `:e foo` stays a
+/// quick note creator; opening `schema.sql` means typing its real name (or
+/// picking it from the sidebar/switcher, which pass full paths).
 fn with_md_ext(name: &str) -> PathBuf {
     let p = PathBuf::from(name);
     if p.extension().is_none() {
@@ -1561,11 +1569,17 @@ fn open_or_empty(path: &Path) -> Document {
     })
 }
 
-/// Vault-relative path of `path`, `.md` dropped, forward-slashed — the switcher
-/// match key and label (e.g. `projects/ideas`).
+/// Vault-relative path of `path`, forward-slashed — the switcher match key and
+/// label. The implied `.md` is dropped (`projects/ideas`); any other extension
+/// is kept (`sql/schema.sql`).
 fn rel_display(root: &Path, path: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.with_extension("").to_string_lossy().replace('\\', "/")
+    let rel = if rel.extension().is_some_and(|e| e == "md") {
+        rel.with_extension("")
+    } else {
+        rel.to_path_buf()
+    };
+    rel.to_string_lossy().replace('\\', "/")
 }
 
 /// Resolve a `:b` argument against buffer display names (vault-relative, `.md`
@@ -2722,6 +2736,8 @@ mod tests {
         let root = Path::new("/v");
         assert_eq!(rel_display(root, Path::new("/v/sub/note.md")), "sub/note");
         assert_eq!(rel_display(root, Path::new("/v/notes.v2.md")), "notes.v2");
+        // Non-.md extensions are kept.
+        assert_eq!(rel_display(root, Path::new("/v/sql/schema.sql")), "sql/schema.sql");
     }
 
     #[test]
