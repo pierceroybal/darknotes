@@ -24,7 +24,7 @@ use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use crate::markdown::{self, Segment, SpanKind};
 use crate::session;
 use crate::theme::Theme;
-use crate::vault::Vault;
+use crate::vault::{Row, Vault};
 use crate::vim::{Action, Mode, Scroll, Vim};
 
 const WELCOME: &str =
@@ -75,6 +75,33 @@ struct Picker {
     /// when the query is empty.
     results: Vec<usize>,
     selected: usize,
+}
+
+/// A sidebar file-op prompt — modal like the picker. Create and rename edit
+/// inline in the tree: the input renders as the row being created/renamed
+/// (vim's open-line, for files) with `label` as a status-line hint. The
+/// delete confirmation lives in the status line alone. Printable keys extend
+/// `input`, Backspace trims, Enter applies via `action`, Esc — or clicking
+/// another row — cancels.
+struct FilePrompt {
+    /// Status-line text: a hint (`"New in notes/"`) while editing inline,
+    /// the whole question for the delete confirmation.
+    label: String,
+    input: String,
+    action: PromptAction,
+}
+
+/// What Enter does with a finished file prompt.
+enum PromptAction {
+    /// Create `input` inside `dir`: a folder on a trailing `/`, else a file
+    /// (bare names default to `.md`). `at`/`depth` place the phantom input
+    /// row in the sidebar list while typing.
+    Create { dir: PathBuf, at: usize, depth: usize },
+    /// Rename `target` (whose row renders the input in place) to `input`
+    /// within its folder.
+    Rename { target: PathBuf },
+    /// Permanently delete `target` (already inside `.trash`) on `y`.
+    ConfirmDelete { target: PathBuf },
 }
 
 /// Everything the editor's row list is built from, beyond session constants
@@ -208,6 +235,15 @@ pub struct Editor {
     last_selected: usize,
     /// `Ctrl-W` was the previous key; the next key picks a pane.
     pending_window: bool,
+    /// Armed first key of a doubled sidebar file op (`dd`/`cc`/`yy`); the
+    /// next key completes or cancels it.
+    pending_sidebar: Option<char>,
+    /// Sidebar cut/copy register: the marked path plus whether `p` moves
+    /// (`x`) or copies (`yy`) it.
+    file_register: Option<(PathBuf, bool)>,
+    /// Open file-op prompt (create/rename/delete-confirm), or `None`.
+    /// Routes keys while `Some`, like the picker.
+    prompt: Option<FilePrompt>,
     /// Drives the editor line list's scroll position (wheel + scroll-to-cursor).
     scroll: UniformListScrollHandle,
     /// Caret *visual row* at the last render (soft-wrap makes rows outnumber
@@ -340,6 +376,9 @@ impl Editor {
             message: None,
             pane: Pane::Editor,
             pending_window: false,
+            pending_sidebar: None,
+            file_register: None,
+            prompt: None,
             scroll: UniformListScrollHandle::new(),
             last_row: 0,
             // A restored mid-file caret must start centered; the render pass
@@ -1111,7 +1150,27 @@ impl Editor {
     /// Navigate the sidebar tree (`Pane::Sidebar`): `j`/`k` move the cursor over
     /// visible rows, `l`/Enter toggles a folder or opens a file, `h` collapses an
     /// open folder or jumps to the parent folder, Escape returns.
-    fn sidebar_key(&mut self, key: &str, window: &mut Window) {
+    ///
+    /// File operations (sidebar-local, independent of editor vim state):
+    /// `o`/`O` create in the cursor's / the parent folder, `dd` moves to the
+    /// vault's `.trash` (inside Trash it deletes forever, confirmed), `cc`
+    /// renames, `yy`/`x` load the file register, `p` pastes it into the
+    /// cursor's folder (yank copies, cut moves).
+    fn sidebar_key(&mut self, key: &str, shift: bool, window: &mut Window) {
+        // A pending doubled op (`d`/`c`/`y`) either completes or dies here.
+        if let Some(first) = self.pending_sidebar.take() {
+            match (first, key) {
+                ('d', "d") => self.trash_selected(window),
+                ('c', "c") => self.open_rename_prompt(),
+                ('y', "y") => self.yank_selected(),
+                _ => {} // any other key cancels the op
+            }
+            return;
+        }
+        if key == "o" {
+            self.open_create_prompt(shift); // works in an empty vault too
+            return;
+        }
         let rows = self.vault.visible_rows(&self.expanded);
         if rows.is_empty() {
             return;
@@ -1141,9 +1200,387 @@ impl Editor {
                     }
                 }
             }
+            "d" | "c" | "y" if !shift => {
+                self.pending_sidebar = key.chars().next();
+            }
+            "x" if !shift => self.cut_selected(),
+            "p" if !shift => self.paste_register(),
             "escape" => self.pane = Pane::Editor,
             _ => {}
         }
+    }
+
+    /// The sidebar row under the cursor, or `None` in an empty vault.
+    fn selected_row(&self) -> Option<Row> {
+        let mut rows = self.vault.visible_rows(&self.expanded);
+        (!rows.is_empty()).then(|| rows.swap_remove(self.selected.min(rows.len() - 1)))
+    }
+
+    /// The folder file ops target: the folder under the sidebar cursor, a file
+    /// row's containing folder, or the vault root in an empty vault.
+    fn cursor_dir(&self) -> PathBuf {
+        match self.selected_row() {
+            Some(r) if r.is_dir => r.path,
+            Some(r) => r
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.vault.root.clone()),
+            None => self.vault.root.clone(),
+        }
+    }
+
+    /// Park the sidebar cursor on `path`'s row, expanding ancestors so it's
+    /// visible. The render pass scrolls it on screen.
+    fn select_path(&mut self, path: &Path) {
+        expand_ancestors(&self.vault.root, path, &mut self.expanded);
+        if let Some(i) = self
+            .vault
+            .visible_rows(&self.expanded)
+            .iter()
+            .position(|r| r.path == path)
+        {
+            self.selected = i;
+        }
+    }
+
+    /// After an entry moved on disk (rename / cut-paste / trash), re-point any
+    /// open buffer at the old path — or inside the old folder — to the new
+    /// location, so saves land in the file's new home.
+    fn repoint_buffers(&mut self, old: &Path, new: &Path) {
+        let mut changed = false;
+        for b in &mut self.buffers {
+            let Some(rest) = b
+                .doc
+                .path()
+                .and_then(|p| p.strip_prefix(old).ok().map(Path::to_path_buf))
+            else {
+                continue;
+            };
+            let dest = if rest.as_os_str().is_empty() { new.to_path_buf() } else { new.join(&rest) };
+            b.doc.set_path(dest);
+            changed = true;
+        }
+        if changed {
+            self.save_session();
+        }
+    }
+
+    /// `o`/`O` — grow an editable phantom row right below the cursor (vim's
+    /// open-line, for files): type the name in place, Enter creates, Esc
+    /// cancels. `parent` targets one level up (clamped to the vault root).
+    fn open_create_prompt(&mut self, parent: bool) {
+        let mut dir = self.cursor_dir();
+        if parent && dir != self.vault.root {
+            if let Some(p) = dir.parent() {
+                dir = p.to_path_buf();
+            }
+        }
+        let rows = self.vault.visible_rows(&self.expanded);
+        // The phantom renders indented one level under its folder's row; the
+        // sorted position comes from the post-commit rescan. `o` grows it
+        // below the cursor (vim's open-line); `O` targets a folder the cursor
+        // isn't in, so it sits under that folder's row instead — as its first
+        // child, or at the top of the tree for the root (which has no row).
+        let depth = rows.iter().find(|r| r.path == dir).map_or(0, |r| r.depth + 1);
+        let at = if parent {
+            rows.iter().position(|r| r.path == dir).map_or(0, |i| i + 1)
+        } else if rows.is_empty() {
+            0
+        } else {
+            self.selected.min(rows.len() - 1) + 1
+        };
+        self.sidebar_scroll.scroll_to_item(at, ScrollStrategy::Bottom);
+        let rel = dir
+            .strip_prefix(&self.vault.root)
+            .unwrap_or(&dir)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let label = if rel.is_empty() { "New".to_string() } else { format!("New in {rel}/") };
+        self.prompt = Some(FilePrompt {
+            label,
+            input: String::new(),
+            action: PromptAction::Create { dir, at, depth },
+        });
+    }
+
+    /// `cc` — the cursor row's label becomes editable in place, prefilled
+    /// with the display name (a `.md` file's stem, any other entry's full
+    /// name); Enter renames within the folder.
+    fn open_rename_prompt(&mut self) {
+        let Some(row) = self.selected_row() else { return };
+        if row.path == self.vault.root.join(".trash") {
+            self.message = Some("cannot rename the Trash".into());
+            return;
+        }
+        self.prompt = Some(FilePrompt {
+            label: "Rename".into(),
+            input: row.name,
+            action: PromptAction::Rename { target: row.path },
+        });
+    }
+
+    /// `dd` — move the cursor row into the vault's `.trash`, closing any
+    /// buffer open on it (a tab pointing into the trash is a trap). A dirty
+    /// buffer blocks the whole op — write or discard first. Inside Trash it
+    /// becomes the permanent delete (confirmed); on the Trash row itself it
+    /// empties the trash.
+    fn trash_selected(&mut self, window: &mut Window) {
+        let Some(row) = self.selected_row() else { return };
+        let trash = self.vault.root.join(".trash");
+        if row.path.starts_with(&trash) {
+            self.prompt = Some(FilePrompt {
+                label: format!("Delete \"{}\" forever? (y/n) ", row.name),
+                input: String::new(),
+                action: PromptAction::ConfirmDelete { target: row.path },
+            });
+            return;
+        }
+        let dirty = self
+            .buffers
+            .iter()
+            .find(|b| b.doc.is_dirty() && b.doc.path().is_some_and(|p| p.starts_with(&row.path)))
+            .map(|b| self.buffer_display(b));
+        if let Some(name) = dirty {
+            self.message = Some(format!("E89: No write since last change for buffer \"{name}\""));
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(&trash) {
+            self.message = Some(format!("trash failed: {e}"));
+            return;
+        }
+        let name = row.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let dest = unique_dest(&trash, &name);
+        match std::fs::rename(&row.path, &dest) {
+            Ok(()) => {
+                // All clean (checked above), so close_buffer can't refuse.
+                // Closing the active buffer reveals the next one in the
+                // sidebar; put the cursor back on the deletion site after.
+                let keep = self.selected;
+                while let Some(i) = self
+                    .buffers
+                    .iter()
+                    .position(|b| b.doc.path().is_some_and(|p| p.starts_with(&row.path)))
+                {
+                    self.close_buffer(i, false, window);
+                }
+                self.selected = keep;
+                self.message = Some(format!("moved to Trash: {}", row.name));
+            }
+            Err(e) => self.message = Some(format!("trash failed: {e}")),
+        }
+        self.rescan_vault();
+    }
+
+    /// `yy` — load the file register for a `p` copy.
+    fn yank_selected(&mut self) {
+        let Some(row) = self.selected_row() else { return };
+        if row.is_dir {
+            // ponytail: files only — folder copy needs a recursive-copy path,
+            // add when someone wants it. (Folder *move* works via `x`.)
+            self.message = Some("can only yank files".into());
+            return;
+        }
+        self.message = Some(format!("yanked: {}", row.name));
+        self.file_register = Some((row.path, false));
+    }
+
+    /// `x` — load the file register for a `p` move. Folders too (a move is
+    /// one rename); cutting inside Trash is the restore path.
+    fn cut_selected(&mut self) {
+        let Some(row) = self.selected_row() else { return };
+        if row.path == self.vault.root.join(".trash") {
+            self.message = Some("cannot cut the Trash".into());
+            return;
+        }
+        self.message = Some(format!("cut: {}", row.name));
+        self.file_register = Some((row.path, true));
+    }
+
+    /// `p` — drop the register into the cursor's folder: a yank copies (and
+    /// can paste again), a cut moves (and empties the register).
+    fn paste_register(&mut self) {
+        let Some((src, cut)) = self.file_register.clone() else {
+            self.message = Some("nothing to paste".into());
+            return;
+        };
+        if !src.exists() {
+            self.message = Some("cut/yanked file no longer exists".into());
+            self.file_register = None;
+            return;
+        }
+        let dir = self.cursor_dir();
+        let Some(name) = src.file_name() else { return };
+        let name = name.to_string_lossy().into_owned();
+        // A move onto a taken name is an error; a copy numbers itself instead
+        // (`note 2.md`), so pasting a yank into its own folder duplicates.
+        let (dest, result) = if cut {
+            let dest = dir.join(&name);
+            if dest == src {
+                return; // moving onto itself: nothing to do
+            }
+            if dest.exists() {
+                self.message = Some(format!("already exists: {name}"));
+                return;
+            }
+            if src.is_dir() && dest.starts_with(&src) {
+                self.message = Some("cannot move a folder into itself".into());
+                return;
+            }
+            let r = std::fs::rename(&src, &dest);
+            (dest, r)
+        } else {
+            let dest = unique_dest(&dir, &name);
+            let r = std::fs::copy(&src, &dest).map(|_| ());
+            (dest, r)
+        };
+        match result {
+            Ok(()) => {
+                if cut {
+                    self.repoint_buffers(&src, &dest);
+                    self.file_register = None;
+                }
+                self.rescan_vault();
+                self.select_path(&dest);
+                let verb = if cut { "moved" } else { "copied" };
+                let final_name = dest.file_name().unwrap_or_default().to_string_lossy();
+                self.message = Some(format!("{verb}: {final_name}"));
+            }
+            Err(e) => self.message = Some(format!("paste failed: {e}")),
+        }
+    }
+
+    /// Keystrokes while a file-op prompt is open. Mirrors `picker_key`:
+    /// printable chars extend the input, Backspace trims, Enter applies, Esc
+    /// cancels. The delete confirmation is single-key: `y` commits, anything
+    /// else cancels.
+    fn prompt_key(&mut self, ev: &KeyDownEvent, window: &mut Window) {
+        let key = ev.keystroke.key.as_str();
+        if matches!(
+            self.prompt.as_ref().map(|p| &p.action),
+            Some(PromptAction::ConfirmDelete { .. })
+        ) {
+            if let Some(FilePrompt { action: PromptAction::ConfirmDelete { target }, .. }) =
+                self.prompt.take()
+            {
+                if key == "y" {
+                    self.delete_forever(&target);
+                }
+            }
+            return;
+        }
+        let m = ev.keystroke.modifiers;
+        match key {
+            "escape" => self.prompt = None,
+            "enter" => {
+                // take() drops the prompt borrow before the action mutates self.
+                if let Some(p) = self.prompt.take() {
+                    self.apply_prompt(p, window);
+                }
+            }
+            "backspace" => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.input.pop();
+                }
+            }
+            _ if !m.control && !m.alt && !m.platform => {
+                if let Some(s) = ev.keystroke.key_char.clone() {
+                    if let Some(p) = self.prompt.as_mut() {
+                        p.input.push_str(&s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_prompt(&mut self, prompt: FilePrompt, window: &mut Window) {
+        let input = prompt.input.trim();
+        if input.is_empty() {
+            return;
+        }
+        match prompt.action {
+            PromptAction::Create { dir, .. } => self.create_entry(&dir, input, window),
+            PromptAction::Rename { target } => self.rename_entry(&target, input),
+            PromptAction::ConfirmDelete { .. } => {} // handled in prompt_key
+        }
+    }
+
+    /// Create `input` inside `dir`: a folder when it ends in `/`, else a file
+    /// (bare names default to `.md`) that opens for editing. Slashes inside
+    /// the name create the intermediate folders.
+    fn create_entry(&mut self, dir: &Path, input: &str, window: &mut Window) {
+        if let Some(folder) = input.strip_suffix('/') {
+            if folder.is_empty() {
+                return;
+            }
+            match std::fs::create_dir_all(dir.join(folder)) {
+                Ok(()) => {
+                    self.rescan_vault();
+                    self.select_path(&dir.join(folder));
+                    self.message = Some(format!("created: {folder}/"));
+                }
+                Err(e) => self.message = Some(format!("create failed: {e}")),
+            }
+            return;
+        }
+        let path = dir.join(with_md_ext(input));
+        if path.exists() {
+            self.message = Some(format!("already exists: {input}"));
+            return;
+        }
+        let result = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, ""));
+        match result {
+            Ok(()) => {
+                self.rescan_vault();
+                self.open_path(path, window); // reveals the row, refocuses the editor
+                self.pane = Pane::Editor;
+            }
+            Err(e) => self.message = Some(format!("create failed: {e}")),
+        }
+    }
+
+    /// Apply `cc`: rename `target` to `input` within its folder. File names
+    /// default to `.md` like `:e`/`:w`; folder names are taken as typed.
+    fn rename_entry(&mut self, target: &Path, input: &str) {
+        let new_name = if target.is_dir() { PathBuf::from(input) } else { with_md_ext(input) };
+        let Some(parent) = target.parent() else { return };
+        let dest = parent.join(new_name);
+        if dest == target {
+            return;
+        }
+        if dest.exists() {
+            self.message = Some(format!("already exists: {input}"));
+            return;
+        }
+        match std::fs::rename(target, &dest) {
+            Ok(()) => {
+                self.repoint_buffers(target, &dest);
+                self.rescan_vault();
+                self.select_path(&dest);
+                let name = dest.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                self.message = Some(format!("renamed to: {name}"));
+            }
+            Err(e) => self.message = Some(format!("rename failed: {e}")),
+        }
+    }
+
+    /// `y` on the delete confirmation — the only operation that destroys data.
+    fn delete_forever(&mut self, target: &Path) {
+        let result = if target.is_dir() {
+            std::fs::remove_dir_all(target)
+        } else {
+            std::fs::remove_file(target)
+        };
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        self.message = Some(match result {
+            Ok(()) => format!("deleted: {name}"),
+            Err(e) => format!("delete failed: {e}"),
+        });
+        self.rescan_vault();
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1153,6 +1590,13 @@ impl Editor {
         // included), so route before any other handling.
         if self.picker.is_some() {
             self.picker_key(ev, window, cx);
+            cx.notify();
+            return;
+        }
+
+        // File-op prompts (create/rename/delete-confirm) are modal the same way.
+        if self.prompt.is_some() {
+            self.prompt_key(ev, window);
             cx.notify();
             return;
         }
@@ -1178,10 +1622,13 @@ impl Editor {
         }
         if m.control && !m.alt && !m.platform && key == "w" {
             self.pending_window = true;
+            // A half-typed sidebar op must not survive a pane switch and
+            // complete on an unrelated later keystroke.
+            self.pending_sidebar = None;
             return;
         }
         if self.pane == Pane::Sidebar {
-            self.sidebar_key(key, window);
+            self.sidebar_key(key, m.shift, window);
             cx.notify();
             return;
         }
@@ -1550,6 +1997,25 @@ fn with_md_ext(name: &str) -> PathBuf {
     }
 }
 
+/// First non-existing `dir/name`, numbering before the extension when taken
+/// (`note 2.md`, `note 3.md`, …) — so moving into `.trash` never collides.
+fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let p = Path::new(name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    (2..)
+        .map(|n| dir.join(format!("{stem} {n}{ext}")))
+        .find(|p| !p.exists())
+        .expect("some numbered name is free")
+}
+
 /// Resolve a `:w`/`:e` filename to a path: default bare names to `.md`, and
 /// root relative names under the vault (`root`) so the sidebar finds them after
 /// a save. Absolute paths are honored as typed.
@@ -1845,7 +2311,10 @@ impl Render for Editor {
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
 
-        let bar = if mode == Mode::Command {
+        let bar = if let Some(p) = &self.prompt {
+            // Create/rename input renders inline in the tree; this is a hint.
+            p.label.clone()
+        } else if mode == Mode::Command {
             format!("{}{}", self.vim.prompt(), self.vim.command_line())
         } else if let Some(msg) = self.message.clone() {
             msg
@@ -1862,8 +2331,38 @@ impl Render for Editor {
 
         let open_path = self.doc().path().map(Path::to_path_buf);
         let tabline = self.render_tabline(&theme, cx);
-        let cursor = (self.pane == Pane::Sidebar).then_some(self.selected);
-        let rows = self.vault.visible_rows(&self.expanded);
+        let trash_dir = self.vault.root.join(".trash");
+        let mut rows = self.vault.visible_rows(&self.expanded);
+        // Inline file-op editing: a create prompt renders as a phantom row at
+        // its insertion point, a rename replaces its row's label with the
+        // input. The edited row takes over the cursor highlight.
+        let mut edit_row = None;
+        match &self.prompt {
+            Some(FilePrompt { action: PromptAction::Create { at, depth, .. }, input, .. }) => {
+                let at = (*at).min(rows.len());
+                rows.insert(
+                    at,
+                    Row {
+                        depth: *depth,
+                        name: input.clone(),
+                        path: PathBuf::new(),
+                        is_dir: false,
+                        expanded: false,
+                    },
+                );
+                edit_row = Some(at);
+            }
+            Some(FilePrompt { action: PromptAction::Rename { target }, input, .. }) => {
+                if let Some(i) = rows.iter().position(|r| r.path == *target) {
+                    rows[i].name = input.clone();
+                    edit_row = Some(i);
+                }
+            }
+            _ => {}
+        }
+        let cursor =
+            (self.pane == Pane::Sidebar && edit_row.is_none()).then_some(self.selected);
+        let caret_h = px(self.font_size);
         let row_count = rows.len();
         let entity = cx.entity();
 
@@ -1901,11 +2400,17 @@ impl Render for Editor {
                             let row = &rows[i];
                             let is_open_file =
                                 open_path.as_deref() == Some(row.path.as_path());
-                            // Sidebar cursor (active pane) outranks open-file highlight.
-                            let (bg, fg) = if cursor == Some(i) {
+                            let editing = edit_row == Some(i);
+                            // The edited row outranks the sidebar cursor
+                            // (suppressed while editing) and open-file highlight.
+                            let (bg, fg) = if editing || cursor == Some(i) {
                                 (theme.sidebar_cursor_background, theme.sidebar_active_foreground)
                             } else if is_open_file {
                                 (theme.sidebar_current_background, theme.sidebar_active_foreground)
+                            } else if row.path.starts_with(&trash_dir) {
+                                // Trash and everything in it read grayed-out:
+                                // in limbo, not real notes.
+                                (theme.sidebar_background, theme.muted)
                             } else {
                                 (theme.sidebar_background, theme.sidebar_foreground)
                             };
@@ -1922,28 +2427,41 @@ impl Render for Editor {
                             let path = row.path.clone();
                             let is_dir = row.is_dir;
                             let entity = entity.clone();
-                            div()
-                                .pl(indent)
-                                .pr_2()
-                                .bg(bg)
-                                .text_color(fg)
-                                .child(label)
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    move |_ev: &MouseUpEvent, window, cx| {
-                                        let path = path.clone();
-                                        entity.update(cx, |this, cx| {
-                                            this.selected = i;
-                                            if is_dir {
-                                                this.toggle(path);
-                                            } else {
-                                                this.open_path(path, window);
-                                                this.pane = Pane::Editor;
+                            let base = div().pl(indent).pr_2().bg(bg).text_color(fg);
+                            let base = if editing {
+                                // The live input, with a block caret after it.
+                                base.flex()
+                                    .items_center()
+                                    .child(label)
+                                    .child(div().w(px(2.)).h(caret_h).bg(fg))
+                            } else {
+                                base.child(label)
+                            };
+                            base.on_mouse_up(
+                                MouseButton::Left,
+                                move |_ev: &MouseUpEvent, window, cx| {
+                                    let path = path.clone();
+                                    entity.update(cx, |this, cx| {
+                                        // Click-away cancels an open inline edit;
+                                        // a click on the edited row does nothing.
+                                        if this.prompt.is_some() {
+                                            if !editing {
+                                                this.prompt = None;
                                             }
                                             cx.notify();
-                                        });
-                                    },
-                                )
+                                            return;
+                                        }
+                                        this.selected = i;
+                                        if is_dir {
+                                            this.toggle(path);
+                                        } else {
+                                            this.open_path(path, window);
+                                            this.pane = Pane::Editor;
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                            )
                         })
                         .collect::<Vec<_>>()
                 })
@@ -2555,13 +3073,33 @@ mod tests {
     use super::{
         caret_bytes, clip_row_highlight, filter_items, find_matches, match_buffer, next_match,
         rel_display, remap_highlight, resolve, search_sensitive, segment_style, slice_segments,
-        wrap_columns, Highlight, PickItem,
+        unique_dest, wrap_columns, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
     use gpui::Hsla;
     use ropey::Rope;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn unique_dest_numbers_taken_names() {
+        let dir = std::env::temp_dir().join("darknotes_unique_dest_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Free name: used as-is. Taken: numbered before the extension,
+        // skipping numbers that are themselves taken.
+        assert_eq!(unique_dest(&dir, "a.md"), dir.join("a.md"));
+        std::fs::write(dir.join("a.md"), "").unwrap();
+        assert_eq!(unique_dest(&dir, "a.md"), dir.join("a 2.md"));
+        std::fs::write(dir.join("a 2.md"), "").unwrap();
+        assert_eq!(unique_dest(&dir, "a.md"), dir.join("a 3.md"));
+        // Extension-less names (folders) number at the end.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(unique_dest(&dir, "sub"), dir.join("sub 2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wrap_columns_breaks_words_and_walls() {

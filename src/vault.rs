@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 /// A vault is a root folder plus the files found beneath it. `tree` is
 /// the nested folder/file structure for the sidebar; `files` is the same files
 /// flattened, for navigation and `:e`/`:w` resolution. Hidden files and dirs
-/// (`.git`, `.obsidian`, `.env`) are skipped and folders with nothing visible
-/// beneath them are omitted.
+/// (`.git`, `.obsidian`, `.env`) are skipped; empty folders show as collapsed
+/// rows so freshly created folders are visible targets. The one dot-folder
+/// shown is the vault's `.trash` (where sidebar `dd` moves things): appended
+/// last in the tree, labeled `Trash`, hidden while empty, and kept out of
+/// `files` so the fuzzy picker doesn't offer trashed notes.
 pub struct Vault {
     pub root: PathBuf,
     pub tree: Vec<Entry>,
@@ -38,9 +41,16 @@ pub struct Row {
 impl Vault {
     pub fn scan(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let tree = build_dir(&root);
+        let mut tree = build_dir(&root);
         let mut files = Vec::new();
         collect_files(&tree, &mut files);
+        // `.trash` is added after `collect_files` so its contents stay out of
+        // the flat file list, and after the sort so it sits last.
+        let trash = root.join(".trash");
+        let children = build_dir(&trash);
+        if !children.is_empty() {
+            tree.push(Entry::Dir { name: "Trash".into(), path: trash, children });
+        }
         Self { root, tree, files }
     }
 
@@ -84,8 +94,8 @@ fn push_rows(entries: &[Entry], depth: usize, expanded: &HashSet<PathBuf>, out: 
 // trees; revisit if someone points it at a huge directory.
 //
 // Returns `dir`'s children: subfolders first (each recursed into), then files,
-// both alphabetical by name. Folders with nothing visible anywhere beneath are
-// dropped so the sidebar has no dead, un-openable rows.
+// both alphabetical by name. Empty folders are kept — they're where new notes
+// go — and show as collapsed rows.
 fn build_dir(dir: &Path) -> Vec<Entry> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -97,9 +107,7 @@ fn build_dir(dir: &Path) -> Vec<Entry> {
         if path.is_dir() {
             if !is_hidden(&path) {
                 let children = build_dir(&path);
-                if !children.is_empty() {
-                    dirs.push(Entry::Dir { name: file_name(&path), path, children });
-                }
+                dirs.push(Entry::Dir { name: file_name(&path), path, children });
             }
         } else if !is_hidden(&path) {
             files.push(Entry::File { name: display_name(&path), path });
@@ -183,6 +191,41 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["sub/c.md", "a.md", "b.txt"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trash_and_empty_folders() {
+        let root = std::env::temp_dir().join("darknotes_vault_trash_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join(".trash")).unwrap();
+        std::fs::write(root.join("a.md"), "a").unwrap();
+
+        // An empty `.trash` stays hidden; an empty ordinary folder shows.
+        let vault = Vault::scan(&root);
+        assert_eq!(
+            depth_names(&vault.visible_rows(&HashSet::new())),
+            vec![(0, "empty".to_string()), (0, "a".to_string())]
+        );
+
+        // With contents, Trash appears last, relabeled, expandable — but its
+        // files stay out of the flat list (the fuzzy picker's source).
+        std::fs::write(root.join(".trash/old.md"), "x").unwrap();
+        let vault = Vault::scan(&root);
+        let mut expanded = HashSet::new();
+        expanded.insert(root.join(".trash"));
+        assert_eq!(
+            depth_names(&vault.visible_rows(&expanded)),
+            vec![
+                (0, "empty".to_string()),
+                (0, "a".to_string()),
+                (0, "Trash".to_string()),
+                (1, "old".to_string()),
+            ]
+        );
+        assert_eq!(vault.files, vec![root.join("a.md")]);
 
         let _ = std::fs::remove_dir_all(&root);
     }

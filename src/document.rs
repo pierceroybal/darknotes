@@ -200,6 +200,14 @@ impl Document {
         self.path.as_deref()
     }
 
+    /// Re-point the backing file after a rename/move on disk. Content and
+    /// dirty state are untouched; the revision bumps so path-dependent render
+    /// caches (markdown styling keys off the extension) rebuild.
+    pub fn set_path(&mut self, path: PathBuf) {
+        self.path = Some(path);
+        self.revision = next_revision();
+    }
+
     /// Whether markdown-aware editing conveniences (list continuation, list-line
     /// Tab, span styling) apply: true for `.md` files and pathless scratch
     /// buffers (no file yet, destined to become a note), false for any other
