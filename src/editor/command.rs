@@ -149,6 +149,13 @@ pub(super) const COMMANDS: &[Command] = &[
         },
     },
     Command {
+        name: "refresh",
+        ex: &["refresh"],
+        takes_arg: false,
+        // Pick up file ops made outside the app (git, sync, another editor).
+        run: |ed, _a, _win, _cx| ed.rescan_vault(),
+    },
+    Command {
         name: "focus-sidebar",
         ex: &[],
         takes_arg: false,
