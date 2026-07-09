@@ -57,6 +57,9 @@ pub enum Action {
     /// wrap live in the editor; the grammar only names the direction.
     BufferNext,
     BufferPrev,
+    /// `gd`/`gf`/`gx`: follow the link under the caret (wikilink → note,
+    /// URL → browser). Link detection lives in the editor.
+    FollowLink,
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -185,6 +188,14 @@ impl Vim {
 
     /// Reset transient editing state on a buffer switch, keeping config
     /// (tab width).
+    /// Mid-sequence (operator/`g`/`z`/till pending): the next key belongs to
+    /// this grammar, so the keymap layer must not start a binding match on it
+    /// (vim semantics: mappings apply at command start only — the `f` of `gf`
+    /// is never the lead of an `f f` binding).
+    pub fn in_sequence(&self) -> bool {
+        !matches!(self.pending, Pending::None)
+    }
+
     pub fn reset(&mut self) {
         self.mode = Mode::Normal;
         self.count = None;
@@ -603,13 +614,15 @@ impl Vim {
     }
 
     /// Complete a `g`-sequence: `gg` jumps to file start, `gt`/`gT` cycle
-    /// buffers; anything else aborts.
+    /// buffers, `gd`/`gf`/`gx` follow the link under the caret; anything else
+    /// aborts.
     fn complete_g_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
         self.count = None; // ponytail: `2gg`/`2gt` (go to line/tab N) ignored.
         match (key, shift) {
             ("g", _) => vec![Action::Move(Motion::FileStart, 1)],
             ("t", false) => vec![Action::BufferNext],
             ("t", true) => vec![Action::BufferPrev],
+            ("d" | "f" | "x", false) => vec![Action::FollowLink],
             _ => vec![],
         }
     }
@@ -852,8 +865,29 @@ mod tests {
     fn g_then_other_key_aborts() {
         let mut v = vim();
         v.on_key(&k("g"));
-        assert!(v.on_key(&k("x")).is_empty()); // `gx` unbound → no-op, not delete
+        assert!(v.on_key(&k("q")).is_empty()); // `gq` unbound → no-op, not delete
         assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn g_follow_keys_emit_follow_link() {
+        for key in ["d", "f", "x"] {
+            let mut v = vim();
+            assert!(v.on_key(&k("g")).is_empty()); // prefix armed
+            assert_eq!(v.on_key(&k(key)), vec![Action::FollowLink]);
+        }
+    }
+
+    #[test]
+    fn in_sequence_tracks_pending() {
+        let mut v = vim();
+        assert!(!v.in_sequence());
+        v.on_key(&k("g"));
+        assert!(v.in_sequence()); // next key belongs to the grammar
+        v.on_key(&k("f"));
+        assert!(!v.in_sequence()); // sequence resolved
+        v.on_key(&k("2")); // a bare count is not a sequence
+        assert!(!v.in_sequence());
     }
 
     #[test]

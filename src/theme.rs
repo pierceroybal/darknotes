@@ -33,6 +33,8 @@ pub struct Theme {
     pub code: Hsla,
     pub code_bg: Hsla,
     pub muted: Hsla,
+    /// Wikilinks, markdown links, and bare URLs — color only, body weight.
+    pub link: Hsla,
 }
 
 impl Global for Theme {}
@@ -68,6 +70,7 @@ impl Theme {
             code: rgb(0xb5cea8).into(),
             code_bg: rgb(0x262626).into(),
             muted: rgb(0x707070).into(),
+            link: rgb(0x6cabdd).into(),
         }
     }
 
@@ -91,6 +94,7 @@ impl Theme {
             code: rgb(0x9a3b2f).into(),
             code_bg: rgb(0xecebe7).into(),
             muted: rgb(0x8a8a8a).into(),
+            link: rgb(0x2a6fb0).into(),
         }
     }
 }

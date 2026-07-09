@@ -28,6 +28,8 @@ pub enum SpanKind {
     Frontmatter,
     Strong,
     Code,
+    /// The visible text of a `[[wikilink]]`, `[text](url)`, or bare URL.
+    Link,
     /// Syntactic punctuation (`##`, `**`, backticks, bullets) — rendered muted.
     Marker,
 }
@@ -193,14 +195,16 @@ pub fn list_continuation(line: &str) -> ListContinuation {
     ListContinuation::Item { prefix: format!("{indent}{next} "), empty }
 }
 
-/// Single left-to-right pass for inline `code` and `**strong**`, emitting a
-/// `Marker` for each delimiter and the kind for the inner text. Backtick code is
-/// matched first so `**` inside it stays literal. ASCII delimiters only, so
+/// Single left-to-right pass for inline `code`, `**strong**`, `[[wikilinks]]`,
+/// `[text](url)` links, and bare `http(s)://` URLs, emitting a `Marker` for
+/// each delimiter and the kind for the inner text. Positional scanning gives
+/// precedence to whatever opens first — a backtick consumes past any `[[` or
+/// URL inside it, so code spans stay literal. ASCII delimiters only, so
 /// scanning raw bytes is safe across multi-byte chars (continuation bytes are
-/// ≥ 0x80, never `*` or `` ` ``).
+/// ≥ 0x80, never a delimiter byte).
 ///
-// ponytail: bold + code only; single `*`/`_` emphasis, links, escapes, and
-// nesting are new SpanKind cases here — model and renderer already handle them.
+// ponytail: single `*`/`_` emphasis, escapes, and nesting are new SpanKind
+// cases here — model and renderer already handle them.
 fn scan_inline(text: &str, out: &mut Vec<Span>) {
     let b = text.as_bytes();
     let n = b.len();
@@ -217,7 +221,7 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 continue;
             }
         } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'*' {
-            if let Some(end) = find_double_star(b, i + 2) {
+            if let Some(end) = find_double(b, i + 2, b'*') {
                 out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
                 if end > i + 2 {
                     out.push(Span { range: i + 2..end, kind: SpanKind::Strong });
@@ -226,13 +230,132 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 i = end + 2;
                 continue;
             }
+        } else if b[i] == b'[' && i + 1 < n && b[i + 1] == b'[' {
+            if let Some(close) = find_double(b, i + 2, b']') {
+                let inner = &text[i + 2..close];
+                if !inner.is_empty() {
+                    // `[[target|alias]]`: conceal `[[target|`, show the alias.
+                    let vis = match inner.find('|') {
+                        Some(p) => i + 2 + p + 1,
+                        None => i + 2,
+                    };
+                    out.push(Span { range: i..vis, kind: SpanKind::Marker });
+                    if close > vis {
+                        out.push(Span { range: vis..close, kind: SpanKind::Link });
+                    }
+                    out.push(Span { range: close..close + 2, kind: SpanKind::Marker });
+                    i = close + 2;
+                    continue;
+                }
+            }
+        } else if b[i] == b'[' {
+            // `[text](url)`: conceal `[` and `](url)`, show the text.
+            if let Some(mid) = text[i + 1..].find("](").map(|p| i + 1 + p) {
+                if let Some(close) = text[mid + 2..].find(')').map(|p| mid + 2 + p) {
+                    if mid > i + 1 && close > mid + 2 {
+                        out.push(Span { range: i..i + 1, kind: SpanKind::Marker });
+                        out.push(Span { range: i + 1..mid, kind: SpanKind::Link });
+                        out.push(Span { range: mid..close + 1, kind: SpanKind::Marker });
+                        i = close + 1;
+                        continue;
+                    }
+                }
+            }
+        } else if b[i] == b'h'
+            && (text[i..].starts_with("http://") || text[i..].starts_with("https://"))
+        {
+            let end = bare_url_end(text, i);
+            out.push(Span { range: i..end, kind: SpanKind::Link });
+            i = end;
+            continue;
         }
         i += 1;
     }
 }
 
-fn find_double_star(b: &[u8], from: usize) -> Option<usize> {
-    (from..b.len().saturating_sub(1)).find(|&j| b[j] == b'*' && b[j + 1] == b'*')
+fn find_double(b: &[u8], from: usize, ch: u8) -> Option<usize> {
+    (from..b.len().saturating_sub(1)).find(|&j| b[j] == ch && b[j + 1] == ch)
+}
+
+/// End of a bare URL starting at `start`: runs to ASCII whitespace, then
+/// trailing punctuation is dropped. `)` stays — URLs contain parens
+/// (Wikipedia), so `(see https://x.com)` grabbing the `)` is the accepted wart.
+fn bare_url_end(text: &str, start: usize) -> usize {
+    let b = text.as_bytes();
+    let mut end = (start..b.len()).find(|&j| b[j].is_ascii_whitespace()).unwrap_or(b.len());
+    while end > start
+        && matches!(b[end - 1], b'.' | b',' | b';' | b':' | b'!' | b'?' | b'"' | b'\'')
+    {
+        end -= 1;
+    }
+    end
+}
+
+/// The wikilink target under `char_col` in `line` (newline stripped), if any.
+/// The full `[[...]]` span counts, brackets included. `|alias` and `#fragment`
+/// are dropped — the caller gets just the note name.
+pub fn wikilink_at(line: &str, char_col: usize) -> Option<String> {
+    let byte = line.char_indices().nth(char_col).map_or(line.len(), |(b, _)| b);
+    let mut from = 0;
+    while let Some(open) = line[from..].find("[[").map(|p| from + p) {
+        let close = line[open + 2..].find("]]").map(|p| open + 2 + p)?;
+        if byte < close + 2 {
+            if byte < open {
+                return None; // caret sits before this link; links don't nest
+            }
+            let target = line[open + 2..close].split(['|', '#']).next().unwrap_or("").trim();
+            return (!target.is_empty()).then(|| target.to_string());
+        }
+        from = close + 2;
+    }
+    None
+}
+
+/// The external-link destination under `char_col`, if any: a `[text](url)`
+/// span (whole thing counts, brackets and parens included) or a bare
+/// `http(s)://` run. Scheme-less destinations get `https://` prepended — the
+/// result is ready for `open_url`.
+pub fn url_at(line: &str, char_col: usize) -> Option<String> {
+    let byte = line.char_indices().nth(char_col).map_or(line.len(), |(b, _)| b);
+    // `[text](url)` spans first — a caret inside one never falls through.
+    let mut from = 0;
+    while let Some(open) = line[from..].find('[').map(|p| from + p) {
+        let Some(mid) = line[open + 1..].find("](").map(|p| open + 1 + p) else {
+            break;
+        };
+        let Some(close) = line[mid + 2..].find(')').map(|p| mid + 2 + p) else {
+            break;
+        };
+        if byte <= close {
+            if byte < open {
+                break; // caret before this link; a bare URL may still sit under it
+            }
+            let url = line[mid + 2..close].trim();
+            if url.is_empty() {
+                return None;
+            }
+            return Some(if url.contains("://") {
+                url.to_string()
+            } else {
+                format!("https://{url}")
+            });
+        }
+        from = close + 1;
+    }
+    // Bare `http(s)://` run under the caret.
+    let mut from = 0;
+    while let Some(start) = line[from..].find("http").map(|p| from + p) {
+        if line[start..].starts_with("http://") || line[start..].starts_with("https://") {
+            let end = bare_url_end(line, start);
+            if byte >= start && byte < end {
+                return Some(line[start..end].to_string());
+            }
+            from = end.max(start + 4);
+        } else {
+            from = start + 4;
+        }
+    }
+    None
 }
 
 /// Flatten possibly-overlapping spans into a gap-free, non-overlapping sequence
@@ -322,7 +445,7 @@ fn keep_marker(marker: &str) -> bool {
 fn priority(k: SpanKind) -> u8 {
     match k {
         SpanKind::Marker => 4,
-        SpanKind::Strong | SpanKind::Code => 3,
+        SpanKind::Strong | SpanKind::Code | SpanKind::Link => 3,
         SpanKind::CodeFence | SpanKind::CodeText => 2,
         SpanKind::Heading(_) | SpanKind::ListItem | SpanKind::BlockQuote | SpanKind::Frontmatter => 1,
     }
@@ -394,6 +517,69 @@ mod tests {
             let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
             assert_eq!(conceal(line, &segs).text, line);
         }
+    }
+
+    #[test]
+    fn wikilinks_style_and_conceal() {
+        let line = "see [[note]] and [[a/b|B]]";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        // Target/alias render as Link; brackets (and `target|`) conceal.
+        assert_eq!(kind_at(&segs, 6), Some(SpanKind::Link)); // 'n' of note
+        assert_eq!(kind_at(&segs, 23), Some(SpanKind::Link)); // 'B'
+        assert_eq!(conceal(line, &segs).text, "see note and B");
+        // Inside a code span `[[x]]` stays literal.
+        let line = "`[[x]]`";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert!(!segs.iter().any(|s| s.kind == Some(SpanKind::Link)));
+    }
+
+    #[test]
+    fn markdown_links_and_bare_urls_style_and_conceal() {
+        let line = "see [GPUI](https://gpui.rs) now";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(kind_at(&segs, 5), Some(SpanKind::Link)); // 'G'
+        assert_eq!(conceal(line, &segs).text, "see GPUI now");
+        // Degenerate forms stay literal text.
+        for line in ["[x]()", "[](y)", "[[]]"] {
+            let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+            assert!(!segs.iter().any(|s| s.kind == Some(SpanKind::Link)));
+        }
+        // A bare URL is styled to its trimmed extent (trailing comma dropped).
+        let spans = &parse(&Rope::from_str("go to https://a.com, ok"))[0];
+        assert!(spans.contains(&Span { range: 6..19, kind: SpanKind::Link }));
+    }
+
+    #[test]
+    fn wikilink_at_hit_zones_and_stripping() {
+        let line = "see [[a/b|B]] end";
+        // Anywhere on the span — brackets, target, alias — yields the target.
+        for col in [4, 7, 10, 12] {
+            assert_eq!(wikilink_at(line, col).as_deref(), Some("a/b"));
+        }
+        assert_eq!(wikilink_at("x [[note#sec]]", 5).as_deref(), Some("note")); // fragment dropped
+        assert!(wikilink_at(line, 0).is_none()); // before the link
+        assert!(wikilink_at(line, 15).is_none()); // after the link
+        assert!(wikilink_at("[[]] x", 1).is_none()); // empty target
+    }
+
+    #[test]
+    fn url_at_markdown_and_bare() {
+        let line = "a [x](https://a.com) b";
+        // The whole [text](url) span counts, brackets and parens included.
+        for col in [2, 3, 8, 19] {
+            assert_eq!(url_at(line, col).as_deref(), Some("https://a.com"));
+        }
+        assert!(url_at(line, 0).is_none());
+        assert!(url_at(line, 21).is_none());
+        // Scheme-less destination gets https:// prepended.
+        assert_eq!(url_at("[repo](github.com/foo)", 1).as_deref(), Some("https://github.com/foo"));
+        // Bare URL under the caret; trailing punctuation excluded.
+        let line = "see https://a.com. end";
+        assert_eq!(url_at(line, 6).as_deref(), Some("https://a.com"));
+        assert!(url_at(line, 17).is_none()); // the trailing dot is off-link
+        // A bare URL before a later [x](y) link on the same line still resolves.
+        assert_eq!(url_at("https://a.com [x](y)", 3).as_deref(), Some("https://a.com"));
+        assert!(url_at("[x]()", 1).is_none()); // empty destination
     }
 
     #[test]

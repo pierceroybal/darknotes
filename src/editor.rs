@@ -60,6 +60,8 @@ enum PickItem {
     /// An open buffer, by index into `Editor::buffers`. A raw index is safe:
     /// the picker is modal, so the buffer list can't change while it's open.
     Buffer(usize),
+    /// Insert `[[name]]` at the caret; payload is the `rel_display` name.
+    InsertLink(String),
 }
 
 /// The open fuzzy picker (file switcher / command palette) — a modal over the
@@ -958,6 +960,23 @@ impl Editor {
         self.picker = Some(Picker { title: "> ", items, query: String::new(), results, selected: 0 });
     }
 
+    /// Open the note picker whose pick inserts a `[[wikilink]]` at the caret.
+    fn open_insert_link_picker(&mut self) {
+        let root = self.vault.root.clone();
+        let items: Vec<(String, PickItem)> = self
+            .vault
+            .files
+            .iter()
+            .map(|p| {
+                let name = rel_display(&root, p);
+                (name.clone(), PickItem::InsertLink(name))
+            })
+            .collect();
+        let results = (0..items.len()).collect();
+        self.picker =
+            Some(Picker { title: "[[ ", items, query: String::new(), results, selected: 0 });
+    }
+
     /// Open the command palette: every registry command, its primary ex alias
     /// appended to the display so typing `:w`-style names finds it too.
     fn open_command_palette(&mut self) {
@@ -997,6 +1016,12 @@ impl Editor {
                             PickItem::File(path) => self.open_path(path, window), // refocuses the editor
                             PickItem::Command(name) => self.run_picked_command(name, window, cx),
                             PickItem::Buffer(i) => self.activate(i, window),
+                            PickItem::InsertLink(name) => {
+                                // Bypasses feed_vim's undo checkpointing, so
+                                // checkpoint here or `u` swallows earlier edits.
+                                self.doc_mut().checkpoint();
+                                self.doc_mut().insert(&format!("[[{name}]]"));
+                            }
                         }
                     }
                 }
@@ -1633,6 +1658,17 @@ impl Editor {
             return;
         }
 
+        // Mid-sequence grammar keys (the `f` of `gf`, the target of `dt`)
+        // bypass the keymap: bindings match at command start only (vim
+        // semantics), so they never wait out `timeoutlen` as a possible chord
+        // lead. Skipped while the resolver itself holds buffered keys, so
+        // replay order stays first-typed-first.
+        if self.vim.in_sequence() && !self.keymap.pending() {
+            self.feed_vim(&ev.keystroke, window, cx);
+            cx.notify();
+            return;
+        }
+
         // The keymap layer: user/default bindings resolved before the vim
         // grammar. Global bindings (Ctrl-chords) are live in every mode;
         // normal/insert bindings gate on the vim mode. Keys no binding claims
@@ -1776,6 +1812,24 @@ impl Editor {
             Action::SearchNext { reverse, count } => self.search_next(reverse, count),
             Action::BufferNext => self.buffer_next(window),
             Action::BufferPrev => self.buffer_prev(window),
+            Action::FollowLink => self.follow_link(window, cx),
+        }
+    }
+
+    /// `gd`/`gf`/`gx`: follow the link under the caret. A wikilink opens its
+    /// note, or a blank named buffer if it doesn't exist yet (created on `:w`,
+    /// like `:e`); an external URL opens in the browser. Off a link it's a
+    /// silent no-op.
+    fn follow_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (line, col) = self.doc().caret_line_col();
+        let text = line_text(&self.doc().rope, line);
+        if let Some(target) = markdown::wikilink_at(&text, col) {
+            match resolve_link(&self.vault.root, &self.vault.files, &target) {
+                Some(path) => self.open_path(path, window),
+                None => self.edit(&target, false, window),
+            }
+        } else if let Some(url) = markdown::url_at(&text, col) {
+            cx.open_url(&url);
         }
     }
 
@@ -2046,6 +2100,21 @@ fn rel_display(root: &Path, path: &Path) -> String {
         rel.to_path_buf()
     };
     rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Resolve a wikilink target to a vault file: vault-relative path (`.md`
+/// dropped) or bare file stem, case-insensitive, first hit in vault order.
+// ponytail: first match wins on duplicate stems; rank by path length if
+// collisions ever matter.
+fn resolve_link(root: &Path, files: &[PathBuf], target: &str) -> Option<PathBuf> {
+    files
+        .iter()
+        .find(|p| {
+            rel_display(root, p).eq_ignore_ascii_case(target)
+                || p.file_stem()
+                    .is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(target))
+        })
+        .cloned()
 }
 
 /// Resolve a `:b` argument against buffer display names (vault-relative, `.md`
@@ -2850,6 +2919,7 @@ fn segment_style(
         SpanKind::Code | SpanKind::CodeText | SpanKind::CodeFence => {
             (theme.code, FontWeight::NORMAL, FontStyle::Normal, Some(theme.code_bg))
         }
+        SpanKind::Link => (theme.link, FontWeight::NORMAL, FontStyle::Normal, None),
         SpanKind::BlockQuote => (theme.muted, FontWeight::NORMAL, FontStyle::Italic, None),
         SpanKind::Frontmatter | SpanKind::Marker => {
             (theme.muted, FontWeight::NORMAL, FontStyle::Normal, None)
@@ -3072,8 +3142,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 mod tests {
     use super::{
         caret_bytes, clip_row_highlight, filter_items, find_matches, match_buffer, next_match,
-        rel_display, remap_highlight, resolve, search_sensitive, segment_style, slice_segments,
-        unique_dest, wrap_columns, Highlight, PickItem,
+        rel_display, remap_highlight, resolve, resolve_link, search_sensitive, segment_style,
+        slice_segments, unique_dest, wrap_columns, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -3296,5 +3366,17 @@ mod tests {
         assert_eq!(match_buffer("TODAY", &names), Ok(1));
         assert!(match_buffer("daily", &names).unwrap_err().starts_with("E93"));
         assert!(match_buffer("nope", &names).unwrap_err().starts_with("E94"));
+    }
+
+    #[test]
+    fn resolve_link_matches_path_or_stem_case_insensitively() {
+        let root = Path::new("/v");
+        let files: Vec<PathBuf> =
+            ["/v/projects/ideas.md", "/v/daily/today.md"].map(PathBuf::from).into();
+        // Vault-relative path (`.md` dropped) and bare stem both resolve.
+        assert_eq!(resolve_link(root, &files, "projects/ideas"), Some(files[0].clone()));
+        assert_eq!(resolve_link(root, &files, "ideas"), Some(files[0].clone()));
+        assert_eq!(resolve_link(root, &files, "TODAY"), Some(files[1].clone()));
+        assert_eq!(resolve_link(root, &files, "nope"), None);
     }
 }

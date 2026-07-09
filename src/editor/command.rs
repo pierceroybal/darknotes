@@ -118,6 +118,12 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, _a, _win, _cx| ed.search.hl = false,
     },
     Command {
+        name: "insert-link",
+        ex: &[],
+        takes_arg: false,
+        run: |ed, _a, _win, _cx| ed.open_insert_link_picker(),
+    },
+    Command {
         name: "open-file",
         ex: &[],
         takes_arg: false,
