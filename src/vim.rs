@@ -171,7 +171,7 @@ pub struct Vim {
     /// forward), or `?` (search backward). Decides what Enter emits.
     prompt: char,
     /// Tab width in spaces (markdown has no literal tabs).
-    tab_width: usize,
+    pub tab_width: usize,
 }
 
 impl Vim {

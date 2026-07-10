@@ -1886,7 +1886,10 @@ impl Editor {
                 self.doc_mut().paste(after)
             }
             Action::InsertText(s) => self.doc_mut().insert(&s),
-            Action::Newline { clear_empty } => self.doc_mut().insert_newline(clear_empty),
+            Action::Newline { clear_empty } => {
+                let width = self.vim.tab_width;
+                self.doc_mut().insert_newline(clear_empty, width);
+            }
             Action::Tab { width, dedent } => self.doc_mut().indent(width, dedent),
             Action::DeleteBackward => self.doc_mut().delete_backward(),
             Action::DeleteForward => self.doc_mut().delete_forward(),

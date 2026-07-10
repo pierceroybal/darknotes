@@ -247,9 +247,11 @@ impl Document {
     /// Smart newline: continue a markdown list when the caret's line is a list
     /// item, else a plain newline. The list prefix lands at the caret, so the
     /// text after it follows the new marker (splitting an item mid-line works).
-    /// `clear_empty` (Enter, not `o`) erases the marker of an empty item rather
-    /// than repeating it — the way out of a list.
-    pub fn insert_newline(&mut self, clear_empty: bool) {
+    /// `clear_empty` (Enter, not `o`) steps an empty item out of the list
+    /// instead of repeating its marker: an indented item dedents by `width`
+    /// (one level per press, marker kept), a top-level one erases the marker,
+    /// leaving the empty line.
+    pub fn insert_newline(&mut self, clear_empty: bool, width: usize) {
         if !self.is_markdown() {
             self.insert("\n");
             return;
@@ -258,6 +260,10 @@ impl Document {
         let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
         match markdown::list_continuation(&text) {
             ListContinuation::Item { empty, .. } if empty && clear_empty => {
+                if text.starts_with(' ') {
+                    self.indent(width, true);
+                    return;
+                }
                 let start = self.rope.line_to_char(line);
                 self.rope.remove(start..start + self.line_len_chars(line));
                 self.touch();
@@ -1451,25 +1457,53 @@ mod tests {
         // Continue a bullet: caret at EOL of "- foo", Enter → new "- " below.
         let mut d = Document::new("- foo");
         d.move_motion(Motion::LineEnd, 1);
-        d.insert_newline(true);
+        d.insert_newline(true, 2);
         assert_eq!(d.rope.to_string(), "- foo\n- ");
         assert_eq!(d.caret_line_col(), (1, 2));
 
         // Enter on an empty item clears the marker (exits the list).
-        d.insert_newline(true);
+        d.insert_newline(true, 2);
         assert_eq!(d.rope.to_string(), "- foo\n");
 
         // `o`-style newline (clear_empty=false) keeps the empty marker instead.
         let mut d = Document::new("- ");
         d.move_motion(Motion::LineEnd, 1);
-        d.insert_newline(false);
+        d.insert_newline(false, 2);
         assert_eq!(d.rope.to_string(), "- \n- ");
 
         // A non-list line just splits.
         let mut d = Document::new("plain");
         d.move_motion(Motion::LineEnd, 1);
-        d.insert_newline(true);
+        d.insert_newline(true, 2);
         assert_eq!(d.rope.to_string(), "plain\n");
+    }
+
+    #[test]
+    fn smart_newline_dedents_nested_empty_items() {
+        // Enter on an empty nested item walks out one level per press, marker
+        // kept; only the top-level press clears the marker.
+        let mut d = Document::new("- a\n    - ");
+        d.move_motion(Motion::FileEnd, 1);
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "- a\n  - ");
+        assert_eq!(d.caret_line_col(), (1, 4));
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "- a\n- ");
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "- a\n");
+
+        // Odd indent shallower than a step clears to top level, not below it.
+        let mut d = Document::new(" - ");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "- ");
+
+        // A nested empty item under `o` (clear_empty=false) still repeats.
+        let mut d = Document::new("  - ");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(false, 2);
+        assert_eq!(d.rope.to_string(), "  - \n  - ");
     }
 
     #[test]
@@ -1511,7 +1545,7 @@ mod tests {
         let mut d = Document::new("- foo");
         d.path = Some(PathBuf::from("/v/schema.sql"));
         d.move_motion(Motion::LineEnd, 1);
-        d.insert_newline(true);
+        d.insert_newline(true, 2);
         assert_eq!(d.rope.to_string(), "- foo\n");
 
         // Tab on a list-looking line inserts at the caret, no line shift.
