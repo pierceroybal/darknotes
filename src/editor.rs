@@ -275,6 +275,9 @@ pub struct Editor {
     scroll_x: Rc<Cell<Pixels>>,
     /// Editor font, from config.
     font_family: SharedString,
+    /// Chrome font (sidebar, tabline, status bar, picker), from config's
+    /// `ui_font_family`; resolved at startup to the editor font when unset.
+    ui_font_family: SharedString,
     font_size: f32,
     /// Line-number gutter mode, from config.
     line_numbers: LineNumbers,
@@ -392,7 +395,12 @@ impl Editor {
             wrap_cache: ShapeWrapCache::default(),
             spans_cache: None,
             scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
-            font_family: config.font_family.into(),
+            font_family: config.font_family.clone().into(),
+            ui_font_family: if config.ui_font_family.is_empty() {
+                config.font_family.into()
+            } else {
+                config.ui_font_family.into()
+            },
             font_size: config.font_size,
             line_numbers: config.line_numbers,
             render_markdown: config.render_markdown,
@@ -1083,10 +1091,12 @@ impl Editor {
                         .h(px(420.)) // fixed so the list has a box to scroll in
                         .flex()
                         .flex_col()
+                        .font_family(self.ui_font_family.clone())
                         .bg(theme.background)
                         .border_1()
-                        .border_color(theme.accent)
-                        .rounded_md()
+                        .border_color(theme.border)
+                        .rounded_lg()
+                        .shadow_lg()
                         .child(
                             div()
                                 .px_2()
@@ -1122,7 +1132,7 @@ impl Editor {
     }
 
     /// The tab row above the editor: one tab per buffer, `{n}: {basename}`,
-    /// `[+]` when dirty, italic while a preview. Click switches; middle-click
+    /// `●` when dirty, italic while a preview. Click switches; middle-click
     /// closes (`:bd` semantics, no force).
     fn render_tabline(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let theme = *theme;
@@ -1131,7 +1141,10 @@ impl Editor {
             .flex()
             .flex_row()
             .w_full()
+            .font_family(self.ui_font_family.clone())
             .bg(theme.status_background)
+            .border_b_1()
+            .border_color(theme.border)
             .children(self.buffers.iter().enumerate().map(|(i, b)| {
                 let name = b
                     .doc
@@ -1139,10 +1152,11 @@ impl Editor {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "[No Name]".into());
-                let dirty = if b.doc.is_dirty() { " [+]" } else { "" };
+                let dirty = if b.doc.is_dirty() { " ●" } else { "" };
+                let active = i == self.active;
                 // Active tab joins the buffer area's background; inactive tabs
                 // recede into the (status-colored) strip.
-                let (bg, fg) = if i == self.active {
+                let (bg, fg) = if active {
                     (theme.background, theme.foreground)
                 } else {
                     (theme.status_background, theme.muted)
@@ -1151,11 +1165,17 @@ impl Editor {
                 let close = entity.clone();
                 div()
                     .px_2()
+                    .py_1()
                     .min_w_0()
                     .truncate() // a crowded tab row shrinks tabs, never the layout
                     .bg(bg)
                     .text_color(fg)
+                    // Inactive tabs carry a transparent border of the same
+                    // height so every tab lays out identically.
+                    .border_b_2()
+                    .border_color(if active { theme.accent } else { hsla(0., 0., 0., 0.) })
                     .when(b.preview, |d| d.italic())
+                    .when(!active, |d| d.hover(move |s| s.bg(theme.hover)))
                     .child(format!("{}: {name}{dirty}", i + 1))
                     .on_mouse_up(MouseButton::Left, move |_ev: &MouseUpEvent, window, cx| {
                         switch.update(cx, |this, cx| {
@@ -2380,22 +2400,22 @@ impl Render for Editor {
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
 
-        let bar = if let Some(p) = &self.prompt {
+        // Mode reads as a colored pill; command mode keeps the raw `:` prompt
+        // and a file-op prompt shows its hint instead. The filename (and dirty
+        // flag) live in the tabline.
+        let (pill, bar) = if let Some(p) = &self.prompt {
             // Create/rename input renders inline in the tree; this is a hint.
-            p.label.clone()
+            (None, p.label.clone())
         } else if mode == Mode::Command {
-            format!("{}{}", self.vim.prompt(), self.vim.command_line())
-        } else if let Some(msg) = self.message.clone() {
-            msg
+            (None, format!("{}{}", self.vim.prompt(), self.vim.command_line()))
         } else {
-            // The filename (and dirty flag) live in the tabline.
-            match mode {
-                Mode::Insert => "INSERT",
-                Mode::Visual => "VISUAL",
-                Mode::VisualLine => "VISUAL LINE",
-                _ => "NORMAL",
-            }
-            .to_string()
+            let pill = match mode {
+                Mode::Insert => ("INSERT", theme.mode_insert),
+                Mode::Visual => ("VISUAL", theme.mode_visual),
+                Mode::VisualLine => ("VISUAL LINE", theme.mode_visual),
+                _ => ("NORMAL", theme.accent),
+            };
+            (Some(pill), self.message.clone().unwrap_or_default())
         };
 
         let open_path = self.doc().path().map(Path::to_path_buf);
@@ -2496,7 +2516,23 @@ impl Render for Editor {
                             let path = row.path.clone();
                             let is_dir = row.is_dir;
                             let entity = entity.clone();
-                            let base = div().pl(indent).pr_2().bg(bg).text_color(fg);
+                            // Rounding and margin go on every row (highlights read
+                            // as rounded chips; on plain rows the bg matches the
+                            // pane so they're invisible) — text never shifts and
+                            // uniform_list keeps its one row height (py: ~26px).
+                            let base = div()
+                                .pl(indent)
+                                .pr_2()
+                                .mx_1()
+                                .py(px(2.))
+                                .rounded_md()
+                                .bg(bg)
+                                .text_color(fg);
+                            // Hover wash only where no highlight would be hidden
+                            // by it.
+                            let hoverable = !editing && cursor != Some(i) && !is_open_file;
+                            let base =
+                                base.when(hoverable, |d| d.hover(move |s| s.bg(theme.hover)));
                             let base = if editing {
                                 // The live input, with a block caret after it.
                                 base.flex()
@@ -2538,7 +2574,10 @@ impl Render for Editor {
                 .w(px(330.))
                 .h_full()
                 .flex_shrink_0() // never let a wide editor pane squeeze the sidebar
-                .bg(theme.sidebar_background),
+                .font_family(self.ui_font_family.clone())
+                .bg(theme.sidebar_background)
+                .border_r_1()
+                .border_color(theme.border),
             )
             .child(
                 div()
@@ -2580,10 +2619,35 @@ impl Render for Editor {
                         div()
                             .w_full()
                             .px_2()
-                            .truncate() // clip an over-long status line, don't grow the layout
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .font_family(self.ui_font_family.clone())
                             .bg(theme.status_background)
                             .text_color(theme.status_foreground)
-                            .child(bar),
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .children(pill.map(|(label, color)| {
+                                // All-caps label: the font reserves descent space
+                                // below the baseline but caps have no descenders,
+                                // so glyphs sit high in the inherited 22px line
+                                // box. A tight line box (chip inset in the bar,
+                                // centered by items_center) plus 1px top pad
+                                // rebalances the gaps.
+                                div()
+                                    .px_2()
+                                    .line_height(px(self.font_size + 2.))
+                                    .pt(px(1.))
+                                    .rounded_sm()
+                                    .bg(color)
+                                    .text_color(theme.background)
+                                    .child(label)
+                            }))
+                            .child(
+                                // Clip an over-long message, don't grow the layout.
+                                div().min_w_0().truncate().child(bar),
+                            ),
                     ),
             )
             .children(self.render_picker(&theme))

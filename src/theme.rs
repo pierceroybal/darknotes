@@ -1,4 +1,4 @@
-use gpui::{rgb, Global, Hsla};
+use gpui::{hsla, rgb, Global, Hsla};
 
 /// A semantic color palette. Every rendered color reads from here instead of a
 /// hardcoded hex, so a theme swap is a single `cx.set_global(Theme)`. Stored as
@@ -35,6 +35,16 @@ pub struct Theme {
     pub muted: Hsla,
     /// Wikilinks, markdown links, and bare URLs — color only, body weight.
     pub link: Hsla,
+    /// 1px pane separators: sidebar/editor edge, below the tabline, above the
+    /// status bar.
+    pub border: Hsla,
+    /// Hover wash on sidebar rows and inactive tabs. Carries alpha so the same
+    /// wash reads correctly over both the sidebar and tabline backgrounds.
+    pub hover: Hsla,
+    /// Status-bar mode pill backgrounds; NORMAL uses `accent`. Pill text is
+    /// painted in `background`, so these must keep it readable.
+    pub mode_insert: Hsla,
+    pub mode_visual: Hsla,
 }
 
 impl Global for Theme {}
@@ -71,6 +81,10 @@ impl Theme {
             code_bg: rgb(0x262626).into(),
             muted: rgb(0x707070).into(),
             link: rgb(0x6cabdd).into(),
+            border: rgb(0x2c2c2c).into(),
+            hover: hsla(0., 0., 1., 0.06),
+            mode_insert: rgb(0x98c379).into(),
+            mode_visual: rgb(0xc678dd).into(),
         }
     }
 
@@ -95,6 +109,10 @@ impl Theme {
             code_bg: rgb(0xecebe7).into(),
             muted: rgb(0x8a8a8a).into(),
             link: rgb(0x2a6fb0).into(),
+            border: rgb(0xd9d9d6).into(),
+            hover: hsla(0., 0., 0., 0.05),
+            mode_insert: rgb(0x3d8a3d).into(),
+            mode_visual: rgb(0x8f4bab).into(),
         }
     }
 }

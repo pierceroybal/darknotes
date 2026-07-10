@@ -25,10 +25,11 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
-        // Embedded so the editor font renders identically on every machine,
-        // with no system-install step. All four styles ship because markdown
-        // rendering uses bold/italic runs; missing styles would fall back to
-        // another family mid-line.
+        // Embedded so both fonts render identically on every machine, with no
+        // system-install step. Courier Prime (editor) ships all four styles
+        // because markdown rendering uses bold/italic runs; Inter (UI chrome)
+        // ships only the styles the chrome uses — regular everywhere, italic
+        // for preview tabs. A missing style would fall back to another family.
         cx.text_system()
             .add_fonts(vec![
                 include_bytes!("../assets/fonts/CourierPrime-Regular.ttf")
@@ -43,8 +44,14 @@ fn main() {
                 include_bytes!("../assets/fonts/CourierPrime-BoldItalic.ttf")
                     .as_slice()
                     .into(),
+                include_bytes!("../assets/fonts/Inter-Regular.ttf")
+                    .as_slice()
+                    .into(),
+                include_bytes!("../assets/fonts/Inter-Italic.ttf")
+                    .as_slice()
+                    .into(),
             ])
-            .expect("embedded Courier Prime fonts are valid TTFs");
+            .expect("embedded fonts are valid TTFs");
 
         let config = Config::load();
         let theme = theme::Theme::by_name(&config.theme).unwrap_or_else(|| {

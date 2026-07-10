@@ -22,6 +22,9 @@ pub struct Config {
     /// An unknown name warns and falls back to the default at startup.
     pub theme: String,
     pub font_family: String,
+    /// Font for chrome (sidebar, tabline, status bar, picker). Empty = inherit
+    /// `font_family` for all-mono chrome.
+    pub ui_font_family: String,
     pub font_size: f32,
     /// Spaces inserted for a Tab (markdown has no literal tabs).
     pub tab_width: usize,
@@ -107,6 +110,8 @@ impl Default for Config {
             theme: "dark".into(),
             // Embedded at startup in main.rs; always available regardless of OS.
             font_family: "Courier Prime".into(),
+            // Embedded at startup in main.rs, like the editor font.
+            ui_font_family: "Inter".into(),
             font_size: 15.0,
             tab_width: 2,
             line_numbers: LineNumbers::Off,

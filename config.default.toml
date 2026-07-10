@@ -13,6 +13,11 @@ theme = "dark"
 # "Courier Prime" is embedded in the binary; any installed family works too.
 font_family = "Courier Prime"
 font_size   = 15
+
+# Font for the UI chrome (sidebar, tabs, status bar, picker). "Inter" is
+# embedded in the binary; any installed family works too. Set to "" to use
+# font_family everywhere (all-mono chrome).
+ui_font_family = "Inter"
 tab_width    = 2   # spaces inserted for Tab
 
 # Line-number gutter: "off" (default), "absolute", or "relative". "relative" is
