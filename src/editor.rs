@@ -536,6 +536,21 @@ impl Editor {
         }
     }
 
+    /// `:theme {name}` — swap the palette live. Bare `:theme` lists the
+    /// built-ins. Doesn't touch config.toml; the configured theme still wins
+    /// on next launch.
+    fn set_theme(&mut self, arg: Option<&str>, cx: &mut Context<Self>) {
+        let Some(name) = arg else {
+            let names: Vec<_> = crate::theme::Theme::names().collect();
+            self.message = Some(format!("themes: {}", names.join(", ")));
+            return;
+        };
+        match crate::theme::Theme::by_name(name) {
+            Some(t) => cx.set_global(t),
+            None => self.message = Some(format!("E185: Cannot find color scheme '{name}'")),
+        }
+    }
+
     /// The query whose matches should be highlighted right now: the pending
     /// prompt text while a `/`/`?` search is being typed (incsearch preview),
     /// else the last submitted query while hlsearch is lit. Empty = none.

@@ -111,6 +111,12 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, a, _win, _cx| ed.set_option(a.arg.as_deref()),
     },
     Command {
+        name: "theme",
+        ex: &["theme", "colorscheme", "colo"],
+        takes_arg: true,
+        run: |ed, a, _win, cx| ed.set_theme(a.arg.as_deref(), cx),
+    },
+    Command {
         name: "nohlsearch",
         ex: &["noh", "nohl", "nohlsearch"],
         takes_arg: false,

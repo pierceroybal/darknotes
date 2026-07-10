@@ -18,8 +18,9 @@ const DEFAULT_CONFIG: &str = include_str!("../config.default.toml");
 pub struct Config {
     /// Vault opened when no path is given on the CLI. `~` expands to `$HOME`.
     pub vault: Option<String>,
-    /// Built-in palette name (`"dark"`/`"light"`), resolved via `Theme::by_name`.
-    /// An unknown name warns and falls back to the default at startup.
+    /// Built-in palette name, resolved via `Theme::by_name`; bare `:theme`
+    /// lists the options. An unknown name warns and falls back to the default
+    /// at startup.
     pub theme: String,
     pub font_family: String,
     /// Font for chrome (sidebar, tabline, status bar, picker). Empty = inherit
