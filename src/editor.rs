@@ -1213,6 +1213,12 @@ impl Editor {
     fn render_tabline(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let theme = *theme;
         let entity = cx.entity();
+        // Tab separator: a translucent slice of `muted` (the inactive-tab text
+        // color, legible on the strip in every theme) rather than `border`,
+        // which several dark palettes set too close to the strip color to
+        // survive at 1px.
+        let mut sep = theme.muted;
+        sep.a *= 0.4;
         div()
             .flex()
             .flex_row()
@@ -1221,7 +1227,7 @@ impl Editor {
             .bg(theme.status_background)
             .border_b_1()
             .border_color(theme.border)
-            .children(self.buffers.iter().enumerate().map(|(i, b)| {
+            .children(self.buffers.iter().enumerate().flat_map(|(i, b)| {
                 let name = b
                     .doc
                     .path()
@@ -1239,7 +1245,7 @@ impl Editor {
                 };
                 let switch = entity.clone();
                 let close = entity.clone();
-                div()
+                let tab = div()
                     .px_2()
                     .py_1()
                     .min_w_0()
@@ -1264,7 +1270,16 @@ impl Editor {
                             this.close_buffer(i, false, window);
                             cx.notify();
                         });
-                    })
+                    });
+                // A 1px separator after every tab: crowded (truncated) inactive
+                // tabs blur together without one, and the trailing separator
+                // marks where the last tab ends against the empty strip. A
+                // sibling element, not border_r, because a tab's single
+                // border_color is taken by the active accent underline.
+                [
+                    tab.into_any_element(),
+                    div().w(px(1.)).flex_shrink_0().bg(sep).into_any_element(),
+                ]
             }))
     }
 
@@ -2620,54 +2635,85 @@ impl Render for Editor {
                                 "icons/file-code.svg"
                             };
                             // Indent one step per tree level; px_2 (8px) is the base.
-                            let indent = px(8. + row.depth as f32 * 14.);
+                            let indent = 8. + row.depth as f32 * 14.;
                             let path = row.path.clone();
                             let is_dir = row.is_dir;
                             let entity = entity.clone();
-                            // Rounding and margin go on every row (highlights read
-                            // as rounded chips; on plain rows the bg matches the
-                            // pane so they're invisible) — text never shifts and
-                            // uniform_list keeps its one row height (py: ~26px).
+                            // Bg goes on every row (on plain rows it matches the
+                            // pane so it's invisible) — highlights span the full
+                            // sidebar width, text never shifts, and uniform_list
+                            // keeps its one row height (py: ~26px).
+                            //
+                            // The row is block layout, not flex: gpui only
+                            // ellipsizes text whose div gets a definite width at
+                            // measure time, and flex items are measured
+                            // content-first, painting that untruncated layout.
+                            // Chevron and file icon are absolutely positioned
+                            // over the row's left padding instead of being flex
+                            // siblings.
+                            let icon_top = px(2.) + (line_h - px(14.)) * 0.5;
                             let base = div()
-                                .pl(indent)
+                                .w_full()
+                                .relative()
+                                // indent + chevron (14) + gap (4) + icon (14) + gap (4)
+                                .pl(px(indent + 36.))
                                 .pr_2()
-                                .mx_1()
                                 .py(px(2.))
-                                .rounded_md()
                                 .bg(bg)
                                 .text_color(fg)
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                // Chevron slot: disclosure for folders, an
-                                // equal-width spacer for files so names line up
-                                // under sibling folder names.
-                                .child(div().size(px(14.)).flex_shrink_0().children(
-                                    row.is_dir.then(|| {
-                                        let p = if row.expanded {
-                                            "icons/chevron-down.svg"
-                                        } else {
-                                            "icons/chevron-right.svg"
-                                        };
-                                        // svg() paints only with its own text
-                                        // color set; it doesn't inherit the row's.
-                                        svg().path(p).size_full().text_color(fg)
-                                    }),
-                                ))
+                                // Chevron: disclosure for folders, absent for
+                                // files (the fixed padding keeps names aligned
+                                // under sibling folder names). svg() paints only
+                                // with its own text color set; it doesn't
+                                // inherit the row's.
+                                .children(row.is_dir.then(|| {
+                                    let p = if row.expanded {
+                                        "icons/chevron-down.svg"
+                                    } else {
+                                        "icons/chevron-right.svg"
+                                    };
+                                    svg()
+                                        .path(p)
+                                        .absolute()
+                                        .left(px(indent))
+                                        .top(icon_top)
+                                        .size(px(14.))
+                                        .text_color(fg)
+                                }))
                                 .child(
-                                    svg().path(icon).size(px(14.)).flex_shrink_0().text_color(fg),
+                                    svg()
+                                        .path(icon)
+                                        .absolute()
+                                        .left(px(indent + 18.))
+                                        .top(icon_top)
+                                        .size(px(14.))
+                                        .text_color(fg),
                                 )
-                                .child(
-                                    // Name, with the inline create/rename block
-                                    // caret hugging it (no gap) while editing.
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .child(row.name.clone())
-                                        .children(
-                                            editing.then(|| div().w(px(2.)).h(caret_h).bg(fg)),
-                                        ),
-                                );
+                                .child(if editing {
+                                    // Renaming: the caret must stay visible, so
+                                    // overflow clips on the left — the text
+                                    // slides toward the icons as it grows, like
+                                    // Zed's rename input. justify_end pins the
+                                    // content's right edge (with the caret) to
+                                    // the row's; min_w_full makes short names
+                                    // span the full row so justify_end has
+                                    // nothing to shift and they stay
+                                    // left-aligned.
+                                    div().overflow_hidden().flex().justify_end().child(
+                                        div()
+                                            .min_w_full()
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .child(row.name.clone())
+                                            .child(div().w(px(2.)).h(caret_h).bg(fg)),
+                                    )
+                                } else {
+                                    // Ellipsize long names. A block child fills
+                                    // the row's content box, so the text's first
+                                    // measure sees the real width.
+                                    div().truncate().child(row.name.clone())
+                                });
                             // Hover wash only where no highlight would be hidden
                             // by it.
                             let hoverable = !editing && cursor != Some(i) && !is_open_file;
