@@ -699,14 +699,22 @@ impl Editor {
             .iter()
             .filter_map(|&(lo, hi)| line_highlight(&ctx.rope, i, lo, hi))
             .collect();
-        let (text, segments, selection, search) = if self.render_markdown && i != ctx.cur_line {
+        // Concealed heading lines shape larger inside the fixed line box.
+        // Concealed only: the cursor line (revealed source) keeps body size,
+        // so caret geometry and scroll_x math never see a non-body size.
+        // Scale is a pure function of the concealed segments — the same value
+        // the wrap cache keys on — so cached boundaries stay consistent.
+        let (text, segments, selection, search, scale) = if self.render_markdown
+            && i != ctx.cur_line
+        {
             let c = markdown::conceal(&text, &segs);
             let selection = selection.and_then(|h| remap_highlight(h, &text, &c));
             let search =
                 search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
-            (c.text, c.segments, selection, search)
+            let scale = heading_scale(&c.segments);
+            (c.text, c.segments, selection, search, scale)
         } else {
-            (text, segs, selection, search)
+            (text, segs, selection, search, 1.0)
         };
 
         // Byte offset where each visual row starts: 0, plus one per wrap
@@ -741,7 +749,7 @@ impl Editor {
                                     .text_system()
                                     .shape_text(
                                         text.clone().into(),
-                                        ctx.font_size,
+                                        ctx.font_size * scale,
                                         &runs,
                                         Some(w),
                                         None,
@@ -829,6 +837,7 @@ impl Editor {
                 scroll_x: self.scroll_x.clone(),
                 gutter,
                 follow_h: ctx.wrap_width.is_none(),
+                scale,
             });
         }
         caret_at
@@ -2659,6 +2668,7 @@ impl Render for Editor {
                                             scroll_x: scroll_x.clone(),
                                             gutter: None,
                                             follow_h: false,
+                                            scale: 1.0,
                                         };
                                     }
                                     lines[i].clone()
@@ -2758,6 +2768,9 @@ struct LineElement {
     /// only. A wrapped row never overflows, and its caret reaching the right
     /// edge must not shift the pane. Only the caret row acts on it.
     follow_h: bool,
+    /// Font-size multiplier for this row (concealed heading lines shape
+    /// larger). 1.0 everywhere else; the gutter always stays at body size.
+    scale: f32,
 }
 
 struct LinePrepaint {
@@ -2820,7 +2833,10 @@ impl Element for LineElement {
         let style = window.text_style();
         let font = style.font();
         let fg = style.color;
-        let font_size = style.font_size.to_pixels(window.rem_size());
+        let base_size = style.font_size.to_pixels(window.rem_size());
+        // Headings shape larger; the gutter below keeps body size so line
+        // numbers stay column-aligned across rows.
+        let font_size = base_size * self.scale;
 
         // Styled runs from this line's markdown spans. Shaping keys on text +
         // markup, never the caret, so the layout cache keeps hitting as the
@@ -2833,7 +2849,7 @@ impl Element for LineElement {
             let runs = [run(&font, text.len(), *color)];
             window
                 .text_system()
-                .shape_line(text.clone(), font_size, &runs, None)
+                .shape_line(text.clone(), base_size, &runs, None)
         });
         let gutter_w = gutter.as_ref().map_or(Pixels::ZERO, |g| g.width);
         let shaped = window
@@ -3019,6 +3035,23 @@ fn segments_to_runs(
             TextRun { len: seg.len, font, color, background_color, underline: None, strikethrough: None }
         })
         .collect()
+}
+
+/// Font-size multiplier for a concealed line's segments: H1 1.2×, H2 1.1×,
+/// everything else (H3+ included) body size — the fixed 22/15 line box caps
+/// how large a row can shape. A heading whose every byte is covered by a
+/// higher-priority span (e.g. `# **all bold**`) flattens with no Heading
+/// segment left and stays at body size — rare enough to ignore.
+fn heading_scale(segments: &[Segment]) -> f32 {
+    let level = segments.iter().find_map(|s| match s.kind {
+        Some(SpanKind::Heading(n)) => Some(n),
+        _ => None,
+    });
+    match level {
+        Some(1) => 1.2,
+        Some(2) => 1.1,
+        _ => 1.0,
+    }
 }
 
 /// Visual style for a flattened segment: (color, weight, slant, background).
@@ -3259,8 +3292,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 mod tests {
     use super::{
         caret_bytes, clip_row_highlight, filter_items, find_matches, match_buffer, next_match,
-        rel_display, remap_highlight, resolve, resolve_link, search_sensitive, segment_style,
-        slice_segments, unique_dest, wrap_columns, Highlight, PickItem,
+        heading_scale, rel_display, remap_highlight, resolve, resolve_link, search_sensitive,
+        segment_style, slice_segments, unique_dest, wrap_columns, Highlight, PickItem,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -3355,6 +3388,20 @@ mod tests {
         let (strong_color, _, _, _) = segment_style(Some(SpanKind::Strong), fg, &theme);
         let (plain_color, _, _, _) = segment_style(None, fg, &theme);
         assert_ne!(strong_color, plain_color);
+    }
+
+    #[test]
+    fn heading_scale_steps_down_by_level() {
+        let seg = |kind| markdown::Segment { len: 4, kind };
+        assert_eq!(heading_scale(&[seg(Some(SpanKind::Heading(1)))]), 1.2);
+        // Level wins even after inline spans (e.g. Strong) split the line.
+        assert_eq!(
+            heading_scale(&[seg(Some(SpanKind::Heading(2))), seg(Some(SpanKind::Strong))]),
+            1.1
+        );
+        assert_eq!(heading_scale(&[seg(Some(SpanKind::Heading(3)))]), 1.0);
+        assert_eq!(heading_scale(&[seg(None)]), 1.0);
+        assert_eq!(heading_scale(&[]), 1.0);
     }
 
     #[test]
