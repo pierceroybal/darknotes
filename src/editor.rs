@@ -300,6 +300,20 @@ pub struct Editor {
     search: SearchState,
     /// Search options from config (ignorecase, hlsearch, …).
     search_cfg: SearchConfig,
+    /// Blink the caret while the editor pane is focused, from config.
+    cursor_blink: bool,
+    /// Length (ms) of each blink phase, from config. 0 disables blinking.
+    blink_interval: u64,
+    /// Caret visible in the current blink phase. Every keystroke resets it to
+    /// true, so the caret reads solid while typing.
+    blink_show: bool,
+    /// Running blink toggler. Held so it stays alive; replacing it cancels the
+    /// old cycle (gpui cancels a dropped `Task`), which restarts the phase.
+    blink_timer: Option<Task<()>>,
+    /// How the caret paints this frame (blink phase + pane focus). Shared with
+    /// the line elements like `scroll_x`, so a blink tick or pane switch only
+    /// repaints — the cached rows never rebuild for it.
+    caret_paint: Rc<Cell<CaretPaint>>,
 }
 
 impl Editor {
@@ -315,6 +329,13 @@ impl Editor {
         // the async maximize at startup otherwise lands after the last
         // render and leaves stale narrow wrapping until the next keystroke.
         cx.observe_window_bounds(window, |_, _, cx| cx.notify()).detach();
+        // OS focus dims the caret (render reads `is_window_active`); repaint on
+        // the change, and restart the blink phase so re-focusing shows it solid.
+        cx.observe_window_activation(window, |this, _, cx| {
+            this.arm_blink(cx);
+            cx.notify();
+        })
+        .detach();
         let vault = Vault::scan(vault_root);
         // An explicit CLI file means a fresh session; otherwise rebuild last
         // session's tabs. Files deleted since then are skipped (Document::open,
@@ -367,7 +388,7 @@ impl Editor {
                     .unwrap_or(0)
             })
             .unwrap_or(0);
-        Self {
+        let mut this = Self {
             buffers,
             active,
             alternate: None,
@@ -411,7 +432,37 @@ impl Editor {
             picker_scroll: UniformListScrollHandle::new(),
             search: SearchState::default(),
             search_cfg: config.search,
+            cursor_blink: config.cursor_blink,
+            blink_interval: config.cursor_blink_interval,
+            blink_show: true,
+            blink_timer: None,
+            caret_paint: Rc::new(Cell::new(CaretPaint::Solid)),
+        };
+        this.arm_blink(cx);
+        this
+    }
+
+    /// Show the caret solid and (re)start the blink cycle — every keystroke
+    /// lands here, so the caret never blinks away mid-typing.
+    fn arm_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_show = true;
+        if !self.cursor_blink || self.blink_interval == 0 {
+            self.blink_timer = None;
+            return;
         }
+        let dur = Duration::from_millis(self.blink_interval);
+        self.blink_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(dur).await;
+                let alive = this.update(cx, |this, cx| {
+                    this.blink_show = !this.blink_show;
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     fn doc(&self) -> &Document {
@@ -835,6 +886,7 @@ impl Editor {
                     .filter_map(|&h| clip_row_highlight(h, c0, c1, k == last))
                     .collect(),
                 scroll_x: self.scroll_x.clone(),
+                caret_paint: self.caret_paint.clone(),
                 gutter,
                 follow_h: ctx.wrap_width.is_none(),
                 scale,
@@ -1654,6 +1706,7 @@ impl Editor {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.message = None; // a fresh keystroke clears the previous result
+        self.arm_blink(cx); // caret solid while typing; the phase restarts after
 
         // The fuzzy picker is modal: while open it swallows every key (Ctrl-W
         // included), so route before any other handling.
@@ -2253,6 +2306,18 @@ impl Render for Editor {
 
         let theme = *cx.global::<Theme>();
 
+        // Blink phase + focus reach `LineElement::paint` through this shared
+        // cell (like `scroll_x`): a blink tick or focus change repaints the
+        // caret without touching the cached rows. Unfocused — sidebar has keys
+        // or the window lost OS focus — shows a solid dim caret, no blinking.
+        self.caret_paint.set(if self.pane != Pane::Editor || !window.is_window_active() {
+            CaretPaint::Dim
+        } else if self.blink_show {
+            CaretPaint::Solid
+        } else {
+            CaretPaint::Hidden
+        });
+
         // Soft-wrap width: the live viewport minus the fixed sidebar and the
         // line-number gutter. Live — not last frame's layout — so a resize
         // (including the async maximize at startup) re-wraps correctly within
@@ -2423,6 +2488,7 @@ impl Render for Editor {
 
         let mode = self.vim.mode;
         let scroll_x = self.scroll_x.clone();
+        let caret_paint = self.caret_paint.clone();
 
         // Mode reads as a colored pill; command mode keeps the raw `:` prompt
         // and a file-op prompt shows its hint instead. The filename (and dirty
@@ -2666,6 +2732,7 @@ impl Render for Editor {
                                             selection: None,
                                             search: Vec::new(),
                                             scroll_x: scroll_x.clone(),
+                                            caret_paint: caret_paint.clone(),
                                             gutter: None,
                                             follow_h: false,
                                             scale: 1.0,
@@ -2725,6 +2792,16 @@ struct LineCaret {
     block: bool,
 }
 
+/// How the caret paints this frame: solid accent (focused, blink phase on),
+/// hidden (focused, blink phase off), or dim `muted` (editor unfocused —
+/// solid, no blinking).
+#[derive(Clone, Copy, PartialEq)]
+enum CaretPaint {
+    Solid,
+    Hidden,
+    Dim,
+}
+
 /// The selected column span within a line (visual mode). `to_eol` means the
 /// selection covers this line's newline, so the highlight fills to the edge.
 #[derive(Clone, Copy)]
@@ -2761,6 +2838,9 @@ struct LineElement {
     /// Shared horizontal scroll offset. The cursor line writes it (prepaint),
     /// every line reads it (paint) — see `Editor::scroll_x`.
     scroll_x: Rc<Cell<Pixels>>,
+    /// How the caret paints (blink phase + focus), shared like `scroll_x` —
+    /// see `Editor::caret_paint`.
+    caret_paint: Rc<Cell<CaretPaint>>,
     /// Pre-formatted line-number string and its color. `None` when the gutter is
     /// off. Painted at a fixed left position; the text is shifted right past it.
     gutter: Option<(SharedString, Hsla)>,
@@ -2980,16 +3060,28 @@ impl Element for LineElement {
                     theme.selection,
                 ));
             }
+            let caret_paint = self.caret_paint.get();
             if let Some((x, width)) = prepaint.caret {
-                let origin = point(ox + x, bounds.origin.y);
-                window.paint_quad(fill(
-                    Bounds::new(origin, size(width, line_height)),
-                    theme.accent,
-                ));
+                if caret_paint != CaretPaint::Hidden {
+                    let color = if caret_paint == CaretPaint::Dim {
+                        theme.muted
+                    } else {
+                        theme.accent
+                    };
+                    let origin = point(ox + x, bounds.origin.y);
+                    window.paint_quad(fill(
+                        Bounds::new(origin, size(width, line_height)),
+                        color,
+                    ));
+                }
             }
             let shaped = &prepaint.shaped;
             let _ = shaped.paint(point(ox, bounds.origin.y), line_height, window, cx);
-            if let Some((font_id, glyph_id, gx)) = prepaint.caret_glyph {
+            // A hidden caret's block quad isn't there, so keep the glyph in
+            // its normal color instead of repainting it dark.
+            if let Some((font_id, glyph_id, gx)) =
+                prepaint.caret_glyph.filter(|_| caret_paint != CaretPaint::Hidden)
+            {
                 // Match the baseline `ShapedLine::paint` uses: line is vertically
                 // centered, glyph sits on the baseline (`paint_glyph` y is baseline).
                 let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;

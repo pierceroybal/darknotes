@@ -37,6 +37,12 @@ pub struct Config {
     /// Soft-wrap long lines at the pane edge (vim 'wrap'; `:set nowrap` to
     /// scroll horizontally instead).
     pub wrap: bool,
+    /// Blink the caret while the editor pane is focused. An unfocused editor
+    /// (sidebar has keys) shows a solid dim caret regardless.
+    pub cursor_blink: bool,
+    /// Length in milliseconds of each blink phase (visible / hidden).
+    /// 0 also disables blinking.
+    pub cursor_blink_interval: u64,
     pub keymap: Keymap,
     pub search: Search,
 }
@@ -118,6 +124,8 @@ impl Default for Config {
             line_numbers: LineNumbers::Off,
             render_markdown: true,
             wrap: true,
+            cursor_blink: true,
+            cursor_blink_interval: 500,
             keymap: Keymap::default(),
             search: Search::default(),
         }
@@ -241,6 +249,8 @@ mod tests {
         assert_eq!(c.tab_width, 2);
         assert_eq!(c.theme, "dark");
         assert!(c.keymap.insert.is_empty());
+        assert!(c.cursor_blink);
+        assert_eq!(c.cursor_blink_interval, 500);
     }
 
     #[test]

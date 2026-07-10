@@ -33,6 +33,12 @@ render_markdown = true
 # `:set nowrap` — to scroll long lines horizontally instead.
 wrap = true
 
+# Blink the cursor while the editor pane is focused. When the sidebar has
+# focus the cursor stops blinking and dims instead. The interval is the
+# length (ms) of each on/off phase; 0 also disables blinking.
+cursor_blink = true
+cursor_blink_interval = 500
+
 [keymap]
 # How long (ms) a partially-typed multi-key binding waits for its next key
 # before the typed keys are handled as ordinary input. Vim's default is 1000;
