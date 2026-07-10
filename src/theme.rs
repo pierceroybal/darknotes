@@ -2,8 +2,9 @@ use gpui::{hsla, rgb, Global, Hsla};
 
 /// A semantic color palette. Every rendered color reads from here instead of a
 /// hardcoded hex, so a theme swap is a single `cx.set_global(Theme)`. Stored as
-/// a GPUI global: set once at startup from the configured `theme` name, read in
-/// `Editor::render` and `LineElement::paint`. New palette = a `by_name` arm.
+/// a GPUI global: set at startup from the configured `theme` name, swapped live
+/// by `:theme`, read in `Editor::render` and `LineElement::paint`. New palette
+/// = a constructor + a `BUILTINS` row.
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub background: Hsla,
