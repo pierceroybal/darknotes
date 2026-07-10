@@ -8,13 +8,45 @@ mod theme;
 mod vault;
 mod vim;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 use config::Config;
 use editor::Editor;
 use gpui::{
-    App, Application, Bounds, Focusable, WindowBounds, WindowOptions, prelude::*, px, size,
+    App, Application, AssetSource, Bounds, Focusable, SharedString, WindowBounds, WindowOptions,
+    prelude::*, px, size,
 };
+
+/// Sidebar icons (lucide, ISC — `assets/icons/LICENSE-lucide.txt`), compiled
+/// in like the fonts. gpui's `svg()` element loads by path through the app's
+/// registered `AssetSource`.
+// ponytail: five hardcoded icons — bring in a directory-embedding dep only if
+// the set actually grows.
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        macro_rules! icon {
+            ($name:literal) => {
+                Some(include_bytes!(concat!("../assets/icons/", $name)).as_slice().into())
+            };
+        }
+        Ok(match path {
+            "icons/chevron-right.svg" => icon!("chevron-right.svg"),
+            "icons/chevron-down.svg" => icon!("chevron-down.svg"),
+            "icons/folder.svg" => icon!("folder.svg"),
+            "icons/file-text.svg" => icon!("file-text.svg"),
+            "icons/file-code.svg" => icon!("file-code.svg"),
+            "icons/trash.svg" => icon!("trash.svg"),
+            _ => None,
+        })
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
 
 fn main() {
     // WSLg advertises a Wayland compositor whose version GPUI rejects; force the
@@ -24,7 +56,7 @@ fn main() {
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
     }
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(Assets).run(|cx: &mut App| {
         // Embedded so both fonts render identically on every machine, with no
         // system-install step. Courier Prime (editor) ships all four styles
         // because markdown rendering uses bold/italic runs; Inter (UI chrome)

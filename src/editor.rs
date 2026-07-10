@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, fill, hsla, point, prelude::*, px, relative, size, uniform_list, App, Bounds,
+    div, fill, hsla, point, prelude::*, px, relative, size, svg, uniform_list, App, Bounds,
     ClipboardItem, ContentMask, Context, Div, FocusHandle, Focusable, Font, FontId, FontStyle,
     FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
@@ -2503,13 +2503,28 @@ impl Render for Editor {
                             } else {
                                 (theme.sidebar_background, theme.sidebar_foreground)
                             };
-                            // Folders get a disclosure triangle; files are padded to
-                            // line their names up under sibling folder names.
-                            let label = if row.is_dir {
-                                let tri = if row.expanded { "▾" } else { "▸" };
-                                format!("{tri} {}", row.name)
+                            // Icon by kind. `.md` is keyed on the path, not the
+                            // display name (which strips the implied `.md`).
+                            let icon = if row.is_dir || row.name.ends_with('/') {
+                                // A trailing `/` in a create prompt commits as a
+                                // folder, so it previews as one.
+                                if row.path == trash_dir {
+                                    "icons/trash.svg"
+                                } else {
+                                    "icons/folder.svg"
+                                }
+                            } else if row.path.as_os_str().is_empty() {
+                                // Phantom create row: a bare name commits as a
+                                // `.md` note; an explicit extension is kept.
+                                if Path::new(&row.name).extension().is_some_and(|e| e != "md") {
+                                    "icons/file-code.svg"
+                                } else {
+                                    "icons/file-text.svg"
+                                }
+                            } else if row.path.extension().is_some_and(|e| e == "md") {
+                                "icons/file-text.svg"
                             } else {
-                                format!("  {}", row.name)
+                                "icons/file-code.svg"
                             };
                             // Indent one step per tree level; px_2 (8px) is the base.
                             let indent = px(8. + row.depth as f32 * 14.);
@@ -2527,21 +2542,44 @@ impl Render for Editor {
                                 .py(px(2.))
                                 .rounded_md()
                                 .bg(bg)
-                                .text_color(fg);
+                                .text_color(fg)
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                // Chevron slot: disclosure for folders, an
+                                // equal-width spacer for files so names line up
+                                // under sibling folder names.
+                                .child(div().size(px(14.)).flex_shrink_0().children(
+                                    row.is_dir.then(|| {
+                                        let p = if row.expanded {
+                                            "icons/chevron-down.svg"
+                                        } else {
+                                            "icons/chevron-right.svg"
+                                        };
+                                        // svg() paints only with its own text
+                                        // color set; it doesn't inherit the row's.
+                                        svg().path(p).size_full().text_color(fg)
+                                    }),
+                                ))
+                                .child(
+                                    svg().path(icon).size(px(14.)).flex_shrink_0().text_color(fg),
+                                )
+                                .child(
+                                    // Name, with the inline create/rename block
+                                    // caret hugging it (no gap) while editing.
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .child(row.name.clone())
+                                        .children(
+                                            editing.then(|| div().w(px(2.)).h(caret_h).bg(fg)),
+                                        ),
+                                );
                             // Hover wash only where no highlight would be hidden
                             // by it.
                             let hoverable = !editing && cursor != Some(i) && !is_open_file;
                             let base =
                                 base.when(hoverable, |d| d.hover(move |s| s.bg(theme.hover)));
-                            let base = if editing {
-                                // The live input, with a block caret after it.
-                                base.flex()
-                                    .items_center()
-                                    .child(label)
-                                    .child(div().w(px(2.)).h(caret_h).bg(fg))
-                            } else {
-                                base.child(label)
-                            };
                             base.on_mouse_up(
                                 MouseButton::Left,
                                 move |_ev: &MouseUpEvent, window, cx| {
