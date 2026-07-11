@@ -122,7 +122,7 @@ impl Theme {
             heading: rgb(0x73d0ff).into(),
             code: rgb(0xd5ff80).into(),
             code_bg: rgb(0x242936).into(),
-            muted: rgb(0x6c7986).into(),
+            muted: rgb(0x5c6773).into(),
             link: rgb(0x5ccfe6).into(),
             border: rgb(0x323a4d).into(),
             hover: hsla(0., 0., 1., 0.06),
