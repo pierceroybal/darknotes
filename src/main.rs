@@ -39,6 +39,7 @@ impl AssetSource for Assets {
             "icons/file-text.svg" => icon!("file-text.svg"),
             "icons/file-code.svg" => icon!("file-code.svg"),
             "icons/trash.svg" => icon!("trash.svg"),
+            "icons/check.svg" => icon!("check.svg"),
             _ => None,
         })
     }

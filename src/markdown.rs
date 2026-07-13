@@ -30,6 +30,12 @@ pub enum SpanKind {
     Code,
     /// The visible text of a `[[wikilink]]`, `[text](url)`, or bare URL.
     Link,
+    /// A thematic-break line (`---`/`***`/`___`) — concealed to a painted
+    /// hairline.
+    Rule,
+    /// A `[ ]`/`[x]` task box after a list marker; the bool is checked. The
+    /// bytes survive conceal (a painted box covers them).
+    Task(bool),
     /// Syntactic punctuation (`##`, `**`, backticks, bullets) — rendered muted.
     Marker,
 }
@@ -109,6 +115,14 @@ impl Scan {
             return spans;
         }
 
+        // Thematic break: the whole line is exactly `---`/`***`/`___` (a `---`
+        // on line 0 is frontmatter, handled above). Nothing else scans — the
+        // concealed render replaces the text with a hairline.
+        if matches!(text.trim(), "---" | "***" | "___") {
+            spans.push(Span { range: 0..len, kind: SpanKind::Rule });
+            return spans;
+        }
+
         // Line roles: a whole-line span (the structure model) plus a Marker over
         // the leading punctuation. Inline styling is then scanned over the whole
         // line — the marker prefix has no inline delimiters, so scanning it is
@@ -125,6 +139,22 @@ impl Scan {
         } else if let Some(marker_len) = list_marker(trimmed) {
             spans.push(Span { range: 0..len, kind: SpanKind::ListItem });
             spans.push(Span { range: indent..indent + marker_len, kind: SpanKind::Marker });
+            // GFM task box directly after the marker's space: `[ ]`/`[x]`,
+            // then a space or end-of-line.
+            let at = indent + marker_len + 1;
+            let rest = &text.as_bytes()[at..];
+            let checked = if rest.starts_with(b"[ ]") {
+                Some(false)
+            } else if rest.starts_with(b"[x]") || rest.starts_with(b"[X]") {
+                Some(true)
+            } else {
+                None
+            };
+            if let Some(checked) = checked {
+                if rest.get(3).map_or(true, |&b| b == b' ') {
+                    spans.push(Span { range: at..at + 3, kind: SpanKind::Task(checked) });
+                }
+            }
         }
         scan_inline(text, &mut spans);
         spans
@@ -404,8 +434,9 @@ pub struct Concealed {
     pub map: Vec<usize>,
 }
 
-/// Drop `Marker` segments from a flattened line, returning the concealed text,
-/// the segments that survive, and the source→display byte map. Boundaries fall
+/// Drop `Marker` segments (plus rule and fence lines) from a flattened line,
+/// returning the concealed text, the segments that survive, and the
+/// source→display byte map. Boundaries fall
 /// on char boundaries (markers are all ASCII), so slicing `text` is safe. The
 /// cursor line renders from source instead, so this byte shift never reaches
 /// caret math.
@@ -417,12 +448,19 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
     for seg in segments {
         let end = byte + seg.len;
         let slice = &text[byte..end];
-        if seg.kind != Some(SpanKind::Marker) || keep_marker(slice) {
+        let drop = match seg.kind {
+            Some(SpanKind::Marker) => !keep_marker(slice),
+            // Rule and fence lines vanish (fence includes any language tag);
+            // the renderer paints a hairline / the code band on the blank row.
+            Some(SpanKind::Rule | SpanKind::CodeFence) => true,
+            _ => false,
+        };
+        if drop {
+            map.extend(std::iter::repeat(out_text.len()).take(seg.len));
+        } else {
             map.extend((0..seg.len).map(|i| out_text.len() + i));
             out_text.push_str(slice);
             out_segments.push(*seg);
-        } else {
-            map.extend(std::iter::repeat(out_text.len()).take(seg.len));
         }
         byte = end;
     }
@@ -430,13 +468,12 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
     Concealed { text: out_text, segments: out_segments, map }
 }
 
-/// List bullets, ordered-list numbers, and the blockquote bar stay visible when
-/// rendering — they're structural prefixes with no rendered substitute yet, so
-/// concealing them would orphan the content. Heading `#`, `**`, and backticks
-/// are dropped.
+/// List bullets and ordered-list numbers stay visible when rendering —
+/// structural prefixes with no rendered substitute. Heading `#`, `**`,
+/// backticks, and the blockquote `>` (replaced by a painted bar) are dropped.
 fn keep_marker(marker: &str) -> bool {
     let b = marker.as_bytes();
-    matches!(marker, "-" | "*" | "+" | ">")
+    matches!(marker, "-" | "*" | "+")
         || (b.len() > 1
             && matches!(b[b.len() - 1], b'.' | b')')
             && b[..b.len() - 1].iter().all(u8::is_ascii_digit))
@@ -444,10 +481,14 @@ fn keep_marker(marker: &str) -> bool {
 
 fn priority(k: SpanKind) -> u8 {
     match k {
-        SpanKind::Marker => 4,
+        SpanKind::Marker | SpanKind::Task(_) => 4,
         SpanKind::Strong | SpanKind::Code | SpanKind::Link => 3,
         SpanKind::CodeFence | SpanKind::CodeText => 2,
-        SpanKind::Heading(_) | SpanKind::ListItem | SpanKind::BlockQuote | SpanKind::Frontmatter => 1,
+        SpanKind::Heading(_)
+        | SpanKind::ListItem
+        | SpanKind::BlockQuote
+        | SpanKind::Frontmatter
+        | SpanKind::Rule => 1,
     }
 }
 
@@ -512,11 +553,53 @@ mod tests {
     }
 
     #[test]
-    fn conceal_keeps_list_and_quote_markers() {
-        for line in ["- item", "> quote", "1. first", "2) second"] {
+    fn conceal_keeps_list_markers_drops_quote_marker() {
+        for line in ["- item", "1. first", "2) second"] {
             let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
             assert_eq!(conceal(line, &segs).text, line);
         }
+        // The `>` conceals — a painted bar replaces it at render time.
+        let line = "> quote";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(conceal(line, &segs).text, " quote");
+    }
+
+    #[test]
+    fn rule_lines_scan_and_conceal_to_empty() {
+        let spans = parse(&Rope::from_str("x\n---\n***\n___\n"));
+        for i in 1..4 {
+            assert_eq!(spans[i][0].kind, SpanKind::Rule);
+        }
+        // A `---` on line 0 stays frontmatter, not a rule.
+        assert_eq!(parse(&Rope::from_str("---\n"))[0][0].kind, SpanKind::Frontmatter);
+        // Concealed, a rule row has no text — the renderer paints the hairline.
+        let segs = flatten(3, &spans[1]);
+        assert_eq!(conceal("---", &segs).text, "");
+    }
+
+    #[test]
+    fn fence_lines_conceal_to_empty_code_text_stays() {
+        let spans = parse(&Rope::from_str("```rust\ncode\n```\n"));
+        let segs = flatten(7, &spans[0]);
+        assert_eq!(conceal("```rust", &segs).text, "");
+        let segs = flatten(4, &spans[1]);
+        assert_eq!(conceal("code", &segs).text, "code");
+    }
+
+    #[test]
+    fn task_boxes_scan_and_survive_conceal() {
+        let spans = parse(&Rope::from_str("- [ ] milk\n- [x] done\n1. [X] num\n- [x]tight\n"));
+        assert!(spans[0].contains(&Span { range: 2..5, kind: SpanKind::Task(false) }));
+        assert!(spans[1].contains(&Span { range: 2..5, kind: SpanKind::Task(true) }));
+        assert!(spans[2].contains(&Span { range: 3..6, kind: SpanKind::Task(true) }));
+        // No space after the box — not a task (GFM).
+        assert!(!spans[3].iter().any(|s| matches!(s.kind, SpanKind::Task(_))));
+        // The box bytes stay in the concealed text; the painted box covers them.
+        let line = "- [ ] milk";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        let c = conceal(line, &segs);
+        assert_eq!(c.text, line);
+        assert!(c.segments.iter().any(|s| s.kind == Some(SpanKind::Task(false))));
     }
 
     #[test]

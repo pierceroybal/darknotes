@@ -7,12 +7,13 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, fill, hsla, point, prelude::*, px, relative, size, svg, uniform_list, App, Bounds,
+    div, fill, hsla, outline, point, prelude::*, px, relative, size, svg, uniform_list, App,
+    BorderStyle, Bounds,
     ClipboardItem, ContentMask, Context, Div, FocusHandle, Focusable, Font, FontId, FontStyle,
     FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
-    TextRun, UniformListScrollHandle, Window,
+    TextRun, TransformationMatrix, UniformListScrollHandle, Window,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
@@ -21,7 +22,7 @@ use crate::config::{Config, LineNumbers, Search as SearchConfig};
 use crate::document::Document;
 use crate::keymap::{Ctx, Resolver};
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
-use crate::markdown::{self, Segment, SpanKind};
+use crate::markdown::{self, Segment, Span, SpanKind};
 use crate::session;
 use crate::theme::Theme;
 use crate::vault::{Row, Vault};
@@ -149,6 +150,9 @@ struct RowCtx {
     mode: Mode,
     cur_line: usize,
     cur_col: usize,
+    /// Fence lines of the block the caret sits in, revealed along with the
+    /// cursor line so the whole block reads as one unit while edited inside.
+    reveal_fences: [Option<usize>; 2],
     sel_span: Option<(usize, usize)>,
     search_ranges: Vec<(usize, usize)>,
     num_width: usize,
@@ -674,6 +678,7 @@ impl Editor {
         });
 
         let num_width = rope.len_lines().to_string().len().max(3);
+        let reveal_fences = fence_block(&spans, cur_line);
         RowCtx {
             rope,
             spans,
@@ -685,6 +690,7 @@ impl Editor {
             mode,
             cur_line,
             cur_col,
+            reveal_fences,
             sel_span,
             search_ranges,
             num_width,
@@ -755,17 +761,33 @@ impl Editor {
         // so caret geometry and scroll_x math never see a non-body size.
         // Scale is a pure function of the concealed segments — the same value
         // the wrap cache keys on — so cached boundaries stay consistent.
-        let (text, segments, selection, search, scale) = if self.render_markdown
-            && i != ctx.cur_line
+        let revealed = i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i));
+        let (text, segments, selection, search, scale, decor) = if self.render_markdown
+            && !revealed
         {
             let c = markdown::conceal(&text, &segs);
             let selection = selection.and_then(|h| remap_highlight(h, &text, &c));
             let search =
                 search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
             let scale = heading_scale(&c.segments);
-            (c.text, c.segments, selection, search, scale)
+            (c.text, c.segments, selection, search, scale, row_decor(line_spans))
         } else {
-            (text, segs, selection, search, 1.0)
+            // Source view (revealed line, or markdown rendering off): a task
+            // box's `[ ]` shows its source bytes styled like any other marker
+            // instead of the transparent box span. The code band is the one
+            // decoration that survives reveal — code text isn't concealed
+            // anyway, and the block should read as one unit while edited.
+            let segs = segs
+                .into_iter()
+                .map(|s| match s.kind {
+                    Some(SpanKind::Task(_)) => Segment { kind: Some(SpanKind::Marker), ..s },
+                    _ => s,
+                })
+                .collect();
+            let decor = (self.render_markdown
+                && row_decor(line_spans) == Some(RowDecor::CodeBand))
+                .then_some(RowDecor::CodeBand);
+            (text, segs, selection, search, 1.0, decor)
         };
 
         // Byte offset where each visual row starts: 0, plus one per wrap
@@ -890,6 +912,7 @@ impl Editor {
                 gutter,
                 follow_h: ctx.wrap_width.is_none(),
                 scale,
+                decor,
             });
         }
         caret_at
@@ -2399,8 +2422,9 @@ impl Render for Editor {
             }
             Plan::Patch => {
                 // Same content, no highlights: only the old and new cursor
-                // lines can render differently (conceal swap, caret, gutter
-                // emphasis). Rebuild those lines and splice them in place.
+                // lines — plus the fence lines their enclosing code blocks
+                // reveal — can render differently (conceal swap, caret,
+                // gutter emphasis). Rebuild those lines and splice in place.
                 let mut c = self.rows_cache.take().unwrap();
                 let ctx = self.row_ctx(wrap_width, &theme, window);
                 let old_line =
@@ -2410,14 +2434,12 @@ impl Render for Editor {
                 let mut caret_in_line = 0;
                 // Higher line first, so the lower splice's length change
                 // can't shift the row range the higher one was measured at.
-                let redo: &[usize] = if old_line == new_line {
-                    &[new_line][..]
-                } else if old_line > new_line {
-                    &[old_line, new_line][..]
-                } else {
-                    &[new_line, old_line][..]
-                };
-                for &li in redo {
+                let mut redo = vec![new_line, old_line];
+                redo.extend(ctx.reveal_fences.into_iter().flatten());
+                redo.extend(fence_block(&ctx.spans, old_line).into_iter().flatten());
+                redo.sort_unstable_by(|a, b| b.cmp(a));
+                redo.dedup();
+                for &li in &redo {
                     let start: usize =
                         c.line_rows[..li].iter().map(|&n| n as usize).sum();
                     let end = start + c.line_rows[li] as usize;
@@ -2785,6 +2807,7 @@ impl Render for Editor {
                                             gutter: None,
                                             follow_h: false,
                                             scale: 1.0,
+                                            decor: None,
                                         };
                                     }
                                     lines[i].clone()
@@ -2900,6 +2923,9 @@ struct LineElement {
     /// Font-size multiplier for this row (concealed heading lines shape
     /// larger). 1.0 everywhere else; the gutter always stays at body size.
     scale: f32,
+    /// Block-level paint decoration (code band / quote bar / rule hairline).
+    /// `None` on the cursor line and with markdown rendering off.
+    decor: Option<RowDecor>,
 }
 
 struct LinePrepaint {
@@ -2916,6 +2942,10 @@ struct LinePrepaint {
     /// Block caret only: the glyph under the caret, repainted dark over the
     /// block. `(font, glyph, x within the line)`. `None` for the bar and at EOL.
     caret_glyph: Option<(FontId, GlyphId, Pixels)>,
+    /// `(x0, x1, checked)` of a task box's transparent `[ ]` span; the box
+    /// paints centered in it. `None` when the row has none (or shows source —
+    /// those rows carry Marker, not Task).
+    task: Option<(Pixels, Pixels, bool)>,
 }
 
 impl IntoElement for LineElement {
@@ -3054,6 +3084,18 @@ impl Element for LineElement {
             })
             .collect();
 
+        // A task row's box target: the pixel span of its `[ ]` bytes.
+        let mut task = None;
+        let mut byte = 0;
+        for seg in &self.segments {
+            if let Some(SpanKind::Task(checked)) = seg.kind {
+                task =
+                    Some((shaped.x_for_index(byte), shaped.x_for_index(byte + seg.len), checked));
+                break;
+            }
+            byte += seg.len;
+        }
+
         LinePrepaint {
             shaped,
             gutter,
@@ -3062,6 +3104,7 @@ impl Element for LineElement {
             search,
             caret,
             caret_glyph,
+            task,
         }
     }
 
@@ -3092,9 +3135,26 @@ impl Element for LineElement {
             size(bounds.size.width - prepaint.gutter_w, bounds.size.height),
         );
         window.with_content_mask(Some(ContentMask { bounds: text_bounds }), |window| {
-            // Paint order, bottom-up: search-match quads, selection highlight,
-            // caret quad, the line, and the inverted caret glyph on top so it
-            // reads dark against the accent block.
+            // Paint order, bottom-up: block decoration, search-match quads,
+            // selection highlight, caret quad, the line, the inverted caret
+            // glyph, and the task box over its transparent source bytes.
+            // Decorations pin to the pane edge (not the scroll offset) — a
+            // band/bar that slid with `scroll_x` would read as content.
+            match self.decor {
+                Some(RowDecor::CodeBand) => window.paint_quad(fill(text_bounds, theme.code_bg)),
+                Some(RowDecor::QuoteBar) => window.paint_quad(fill(
+                    Bounds::new(text_bounds.origin, size(px(3.), line_height)),
+                    theme.muted,
+                )),
+                Some(RowDecor::Rule) => window.paint_quad(fill(
+                    Bounds::new(
+                        point(text_origin_x, bounds.origin.y + (line_height - px(1.)) / 2.),
+                        size(text_bounds.size.width, px(1.)),
+                    ),
+                    theme.border,
+                )),
+                None => {}
+            }
             for &(x, width) in &prepaint.search {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
@@ -3137,6 +3197,37 @@ impl Element for LineElement {
                 let baseline = point(ox + gx, bounds.origin.y + padding_top + shaped.ascent);
                 let _ =
                     window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, theme.background);
+            }
+            // Task box centered over its `[ ]` span: outlined when unchecked,
+            // accent-filled with a check when done. Whole-pixel origin — a
+            // 1px border at a fractional x antialiases unevenly (one edge
+            // crisp, the other ghosted).
+            if let Some((x0, x1, checked)) = prepaint.task {
+                let s = px(12.).min(line_height);
+                let b = Bounds::new(
+                    point(
+                        (ox + (x0 + x1 - s) / 2.).round(),
+                        (bounds.origin.y + (line_height - s) / 2.).round(),
+                    ),
+                    size(s, s),
+                );
+                if checked {
+                    window.paint_quad(fill(b, theme.accent).corner_radii(px(3.)));
+                    // Lucide check through the Phase-4 icon pipeline; its
+                    // 24-viewBox padding insets the stroke, so it paints
+                    // across the full box.
+                    let _ = window.paint_svg(
+                        b,
+                        "icons/check.svg".into(),
+                        TransformationMatrix::unit(),
+                        theme.background,
+                        cx,
+                    );
+                } else {
+                    window.paint_quad(
+                        outline(b, theme.muted, BorderStyle::default()).corner_radii(px(3.)),
+                    );
+                }
             }
         });
     }
@@ -3195,6 +3286,58 @@ fn heading_scale(segments: &[Segment]) -> f32 {
     }
 }
 
+/// Block-level paint decoration for a row. Applied only to concealed rows —
+/// the cursor line and raw view show plain source, like conceal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RowDecor {
+    /// Full-width `code_bg` band behind a fence/code line.
+    CodeBand,
+    /// 3px bar at the left edge of a blockquote line (its `>` conceals).
+    QuoteBar,
+    /// Hairline across the row replacing a `---`/`***`/`___` line.
+    Rule,
+}
+
+/// Decoration for a line, from its spans. The scanner pushes a line's role
+/// span first, so the leading span's kind decides — which also covers empty
+/// in-fence lines (their zero-length `CodeText` span still leads) where the
+/// flattened segments would be empty. Every visual row of a wrapped line
+/// shares the line's decor.
+fn row_decor(spans: &[Span]) -> Option<RowDecor> {
+    match spans.first().map(|s| s.kind) {
+        Some(SpanKind::CodeText | SpanKind::CodeFence) => Some(RowDecor::CodeBand),
+        Some(SpanKind::BlockQuote) => Some(RowDecor::QuoteBar),
+        Some(SpanKind::Rule) => Some(RowDecor::Rule),
+        _ => None,
+    }
+}
+
+/// The two fence lines (`[open, close]`) of the fenced block containing
+/// `line`, `[None, None]` when it isn't in one; `close` is `None` while the
+/// block is unclosed at EOF. Scans leading span kinds from the top, tracking
+/// open/close state like the scanner — adjacent blocks make a purely local
+/// opener-vs-closer test ambiguous. Revealing these along with the cursor
+/// line keeps a block's fences visible while editing inside it.
+// ponytail: O(line) rescan per caret move (index + `first` per line); track
+// state incrementally if a profile ever blames it.
+fn fence_block(spans: &[Vec<Span>], line: usize) -> [Option<usize>; 2] {
+    let lead = |i: usize| spans.get(i).and_then(|s| s.first()).map(|s| s.kind);
+    let mut open = None;
+    for i in 0..=line {
+        if lead(i) == Some(SpanKind::CodeFence) {
+            open = match open {
+                // `line` itself is this block's closing fence.
+                Some(top) if i == line => return [Some(top), Some(i)],
+                Some(_) => None, // a block closed above `line`
+                None => Some(i),
+            };
+        }
+    }
+    let Some(top) = open else { return [None, None] };
+    let close = (line + 1..spans.len()).find(|&i| lead(i) == Some(SpanKind::CodeFence));
+    [Some(top), close]
+}
+
 /// Visual style for a flattened segment: (color, weight, slant, background).
 /// `None` is default body text.
 fn segment_style(
@@ -3212,9 +3355,13 @@ fn segment_style(
         }
         SpanKind::Link => (theme.link, FontWeight::NORMAL, FontStyle::Normal, None),
         SpanKind::BlockQuote => (theme.muted, FontWeight::NORMAL, FontStyle::Italic, None),
-        SpanKind::Frontmatter | SpanKind::Marker => {
+        SpanKind::Frontmatter | SpanKind::Marker | SpanKind::Rule => {
             (theme.muted, FontWeight::NORMAL, FontStyle::Normal, None)
         }
+        // Concealed rows paint a real box over the `[ ]` bytes: the glyphs
+        // shape (reserving the box's width in the layout) but paint
+        // transparent. Source view remaps Task to Marker before this runs.
+        SpanKind::Task(_) => (Hsla { a: 0., ..fg }, FontWeight::NORMAL, FontStyle::Normal, None),
         SpanKind::ListItem => normal,
     }
 }
@@ -3432,9 +3579,10 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, clip_row_highlight, filter_items, find_matches, match_buffer, next_match,
-        heading_scale, rel_display, remap_highlight, resolve, resolve_link, search_sensitive,
-        segment_style, slice_segments, unique_dest, wrap_columns, Highlight, PickItem,
+        caret_bytes, clip_row_highlight, fence_block, filter_items, find_matches, match_buffer,
+        next_match, heading_scale, rel_display, remap_highlight, resolve, resolve_link,
+        row_decor, search_sensitive, segment_style, slice_segments, unique_dest, wrap_columns,
+        Highlight, PickItem, RowDecor,
     };
     use crate::config::Search as SearchConfig;
     use crate::markdown::{self, SpanKind};
@@ -3543,6 +3691,40 @@ mod tests {
         assert_eq!(heading_scale(&[seg(Some(SpanKind::Heading(3)))]), 1.0);
         assert_eq!(heading_scale(&[seg(None)]), 1.0);
         assert_eq!(heading_scale(&[]), 1.0);
+    }
+
+    #[test]
+    fn fence_block_finds_enclosing_fences() {
+        // 0 a, 1 open, 2 code, 3 close, 4 b, 5 open, 6 code (unclosed)
+        let spans = markdown::parse(&Rope::from_str("a\n```\ncode\n```\nb\n```\nx\n"));
+        assert_eq!(fence_block(&spans, 0), [None, None]);
+        for line in 1..=3 {
+            assert_eq!(fence_block(&spans, line), [Some(1), Some(3)], "line {line}");
+        }
+        assert_eq!(fence_block(&spans, 4), [None, None]);
+        assert_eq!(fence_block(&spans, 6), [Some(5), None]); // unclosed at EOF
+        // Adjacent blocks: an opener right after a closer keeps its role.
+        let spans = markdown::parse(&Rope::from_str("```\n```\n```\nx\n```\n"));
+        assert_eq!(fence_block(&spans, 1), [Some(0), Some(1)]);
+        assert_eq!(fence_block(&spans, 3), [Some(2), Some(4)]);
+    }
+
+    #[test]
+    fn row_decor_from_leading_span() {
+        let spans = markdown::parse(&Rope::from_str("# h\n> q\n```\ncode\n\n```\nx\n---\n"));
+        let expect = [
+            None,                     // heading
+            Some(RowDecor::QuoteBar), // > q
+            Some(RowDecor::CodeBand), // opening fence
+            Some(RowDecor::CodeBand), // code
+            Some(RowDecor::CodeBand), // empty in-fence line (zero-len span)
+            Some(RowDecor::CodeBand), // closing fence
+            None,                     // plain text
+            Some(RowDecor::Rule),     // ---
+        ];
+        for (i, want) in expect.iter().enumerate() {
+            assert_eq!(row_decor(&spans[i]), *want, "line {i}");
+        }
     }
 
     #[test]
