@@ -49,6 +49,32 @@ impl AssetSource for Assets {
 }
 
 fn main() {
+    // `-d`/`--detach`: re-spawn ourselves without the flag — stdio on /dev/null,
+    // own process group (Unix) / detached from the console (Windows) — and exit,
+    // returning the shell prompt while the window lives on.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-d" || a == "--detach") {
+        use std::process::{Command, Stdio};
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut cmd = Command::new(exe);
+        cmd.args(args.iter().filter(|a| *a != "-d" && *a != "--detach"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0); // outside the tty's foreground group, so terminal-close SIGHUP misses it
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0000_0008); // DETACHED_PROCESS
+        }
+        cmd.spawn().expect("spawn detached darknotes");
+        return;
+    }
+
     // WSLg advertises a Wayland compositor whose version GPUI rejects; force the
     // X11 backend (DISPLAY) there by hiding WAYLAND_DISPLAY before GPUI probes it.
     // ponytail: WSL-only guard; native Wayland desktops keep their compositor.
