@@ -111,6 +111,22 @@ impl Action {
                 | Action::YankSelection { .. }
         )
     }
+
+    /// Deletes that can remove or merge list lines — the editor renumbers the
+    /// surrounding ordered list after these. Insert-mode `DeleteBackward`/
+    /// `DeleteForward` are excluded: renumbering per keystroke would fight a
+    /// hand-edit of a marker's digits mid-typing.
+    pub fn renumbers(&self) -> bool {
+        matches!(
+            self,
+            Action::DeleteMotion(..)
+                | Action::DeleteLines(..)
+                | Action::DeleteLinesVertical { .. }
+                | Action::DeleteCharUnder(..)
+                | Action::DeleteObject { .. }
+                | Action::DeleteSelection { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

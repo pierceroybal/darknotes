@@ -1900,6 +1900,7 @@ impl Editor {
 
     /// The single execution seam every input grammar funnels through.
     fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        let renumbers = action.renumbers();
         match action {
             // In visual mode a motion drags the selection's head; otherwise it
             // just moves the caret.
@@ -1965,6 +1966,12 @@ impl Editor {
             Action::BufferNext => self.buffer_next(window),
             Action::BufferPrev => self.buffer_prev(window),
             Action::FollowLink => self.follow_link(window, cx),
+        }
+        // A delete can remove or merge list items; the surviving block renumbers.
+        if renumbers && self.doc().is_markdown() {
+            let (line, _) = self.doc().caret_line_col();
+            let width = self.vim.tab_width;
+            self.doc_mut().renumber_block(line, width);
         }
     }
 

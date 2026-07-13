@@ -194,6 +194,16 @@ pub fn is_list_item(line: &str) -> bool {
     list_marker(line.trim_start()).is_some()
 }
 
+/// Ordered-list item as `(number, digit count)`; `None` for unordered items
+/// and non-items.
+pub fn ordered_item(line: &str) -> Option<(u64, usize)> {
+    let trimmed = line.trim_start();
+    let marker_len = list_marker(trimmed)?;
+    let digits = marker_len - 1; // marker = digits + '.'/')', or a lone bullet
+    let n = trimmed[..digits].parse::<u64>().ok()?; // bullets: empty str, no parse
+    Some((n, digits))
+}
+
 /// How a smart newline should treat the line under the caret. The vim grammar
 /// can't see buffer text, so list continuation is decided here.
 #[derive(Clone, Debug, PartialEq, Eq)]

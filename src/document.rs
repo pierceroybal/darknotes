@@ -269,7 +269,10 @@ impl Document {
                 self.touch();
                 self.set_caret(start);
             }
-            ListContinuation::Item { prefix, .. } => self.insert(&format!("\n{prefix}")),
+            ListContinuation::Item { prefix, .. } => {
+                self.insert(&format!("\n{prefix}"));
+                self.renumber_block(line + 1, width); // mid-list: items below shift down
+            }
             ListContinuation::Plain => self.insert("\n"),
         }
     }
@@ -299,6 +302,77 @@ impl Document {
         } else {
             self.insert(&" ".repeat(width));
         }
+        if self.is_markdown() {
+            self.renumber_block(line, width);
+        }
+    }
+
+    /// Renumber ordered items in the contiguous list block around `line`.
+    /// The block is bounded by lines that are neither list items nor indented
+    /// continuation text (blank lines end it, so loose lists renumber only up
+    /// to the gap). Items whose leading spaces fall in the same `width` bucket
+    /// are siblings: a run at the block's base depth counts up from its first
+    /// item's number, nested runs restart at 1. An unordered sibling or a
+    /// depth change breaks the run; `.`/`)` punctuation is kept per item. The
+    /// caret keeps its place in its line's content when digit widths change.
+    /// Returns the block's last line; no-op (returning `line`) off a list item.
+    pub fn renumber_block(&mut self, line: usize, width: usize) -> usize {
+        let text = |d: &Self, l: usize| -> String {
+            d.rope.line(l).chars().filter(|&c| c != '\n').collect()
+        };
+        let in_block =
+            |t: &str| markdown::is_list_item(t) || (t.starts_with(' ') && !t.trim().is_empty());
+        if !markdown::is_list_item(&text(self, line)) {
+            return line;
+        }
+        let mut start = line;
+        while start > 0 && in_block(&text(self, start - 1)) {
+            start -= 1;
+        }
+        let last = self.rope.len_lines().saturating_sub(1);
+        let mut end = line;
+        while end < last && in_block(&text(self, end + 1)) {
+            end += 1;
+        }
+
+        let width = width.max(1);
+        let (cline, mut ccol) = self.line_col_of(self.caret());
+        let mut base_depth: Option<usize> = None;
+        // counters[depth]: Some(last number written) while an ordered run is live.
+        let mut counters: Vec<Option<u64>> = Vec::new();
+        for l in start..=end {
+            let t = text(self, l);
+            if !markdown::is_list_item(&t) {
+                continue; // continuation text under an item: numbering unaffected
+            }
+            let lead = t.chars().take_while(|&c| c == ' ').count();
+            let depth = lead / width;
+            let base = *base_depth.get_or_insert(depth);
+            counters.truncate(depth + 1);
+            counters.resize(depth + 1, None);
+            let Some((n, digits)) = markdown::ordered_item(&t) else {
+                counters[depth] = None; // unordered sibling breaks the run
+                continue;
+            };
+            let next = match counters[depth] {
+                Some(prev) => prev.saturating_add(1),
+                None if depth == base => n, // base run keeps its first item's number
+                None => 1,
+            };
+            counters[depth] = Some(next);
+            if next != n {
+                let at = self.rope.line_to_char(l) + lead;
+                self.rope.remove(at..at + digits);
+                let new = next.to_string();
+                self.rope.insert(at, &new);
+                self.touch();
+                if l == cline && ccol >= lead + digits {
+                    ccol = ccol + new.len() - digits; // all-ASCII: len == chars
+                }
+            }
+        }
+        self.set_caret(self.offset_in_line(cline, ccol));
+        end
     }
 
     /// Backspace: remove the char before the caret (crosses lines).
@@ -417,6 +491,12 @@ impl Document {
             } else {
                 self.rope.insert(start, &" ".repeat(width));
                 self.touch();
+            }
+        }
+        if self.is_markdown() {
+            let mut l = l0;
+            while l <= l1 {
+                l = self.renumber_block(l, width) + 1;
             }
         }
         let text: String = self.rope.line(l0).chars().filter(|&c| c != '\n').collect();
@@ -1572,6 +1652,67 @@ mod tests {
         d.indent_selection(2, true);
         assert_eq!(d.rope.to_string(), "- a\n  - b");
         assert_eq!(d.caret_line_col(), (0, 0));
+    }
+
+    #[test]
+    fn indent_renumbers_ordered_lists() {
+        // Tab on a middle item: it nests (restarting at 1) and the items
+        // below close the gap. Shift-Tab restores the original numbering.
+        let mut d = Document::new("1. a\n2. b\n3. c");
+        d.move_motion(Motion::LineDown, 1);
+        d.move_motion(Motion::LineEnd, 1);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "1. a\n  1. b\n2. c");
+        d.indent(2, true);
+        assert_eq!(d.rope.to_string(), "1. a\n2. b\n3. c");
+        assert_eq!(d.caret_line_col(), (1, 4));
+
+        // The base run keeps its first item's number (9 stays); a digit-width
+        // change (10 → 1) keeps the caret on its spot in the content.
+        let mut d = Document::new("9. a\n10. b");
+        d.move_motion(Motion::LineDown, 1);
+        d.move_motion(Motion::LineEnd, 1);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "9. a\n  1. b");
+        assert_eq!(d.caret_line_col(), (1, 6));
+
+        // `)` punctuation is kept, and a blank line ends the block: the
+        // second list never renumbers.
+        let mut d = Document::new("1) a\n2) b\n3) c\n\n7) x");
+        d.move_motion(Motion::LineDown, 1);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "1) a\n  1) b\n2) c\n\n7) x");
+
+        // An unordered sibling breaks the run: `5. y` seeds a fresh run and
+        // keeps its number instead of continuing from `2. b`.
+        let mut d = Document::new("1. a\n2. b\n- x\n5. y\n6. z");
+        d.move_motion(Motion::LineDown, 4);
+        d.indent(2, false);
+        assert_eq!(d.rope.to_string(), "1. a\n2. b\n- x\n5. y\n  1. z");
+
+        // Visual dedent pulls nested items back into the outer run.
+        let mut d = Document::new("1. a\n  1. b\n  2. c");
+        d.move_motion(Motion::LineDown, 1);
+        d.extend_motion(Motion::LineDown, 1);
+        d.indent_selection(2, true);
+        assert_eq!(d.rope.to_string(), "1. a\n2. b\n3. c");
+
+        // Enter mid-list: the new item takes the next number and the items
+        // below shift down.
+        let mut d = Document::new("1. a\n2. b");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(false, 2);
+        assert_eq!(d.rope.to_string(), "1. a\n2. \n3. b");
+        assert_eq!(d.caret_line_col(), (1, 3));
+
+        // `dd` mid-list (the editor renumbers at the caret after every delete
+        // action): the items below close the gap.
+        let mut d = Document::new("1. a\n2. b\n3. c");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_lines(1);
+        let (line, _) = d.caret_line_col();
+        d.renumber_block(line, 2);
+        assert_eq!(d.rope.to_string(), "1. a\n2. c");
     }
 
     #[test]
