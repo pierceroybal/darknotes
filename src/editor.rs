@@ -1257,7 +1257,7 @@ impl Editor {
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "[No Name]".into());
-                let dirty = if b.doc.is_dirty() { " ●" } else { "" };
+                let dirty = b.doc.is_dirty();
                 let active = i == self.active;
                 // Active tab joins the buffer area's background; inactive tabs
                 // recede into the (status-colored) strip.
@@ -1272,7 +1272,9 @@ impl Editor {
                     .px_2()
                     .py_1()
                     .min_w_0()
-                    .truncate() // a crowded tab row shrinks tabs, never the layout
+                    .flex()
+                    .flex_row()
+                    .items_center()
                     .bg(bg)
                     .text_color(fg)
                     // Inactive tabs carry a transparent border of the same
@@ -1281,7 +1283,19 @@ impl Editor {
                     .border_color(if active { theme.accent } else { hsla(0., 0., 0., 0.) })
                     .when(b.preview, |d| d.italic())
                     .when(!active, |d| d.hover(move |s| s.bg(theme.hover)))
-                    .child(format!("{}: {name}{dirty}", i + 1))
+                    .child(
+                        // a crowded tab row shrinks tabs, never the layout
+                        div().min_w_0().truncate().child(format!("{}: {name}", i + 1)),
+                    )
+                    // The dirty dot is always laid out — transparent when
+                    // clean — so saving never shifts the tab's width.
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .ml_1()
+                            .text_color(if dirty { fg } else { hsla(0., 0., 0., 0.) })
+                            .child("●"),
+                    )
                     .on_mouse_up(MouseButton::Left, move |_ev: &MouseUpEvent, window, cx| {
                         switch.update(cx, |this, cx| {
                             this.activate(i, window);
