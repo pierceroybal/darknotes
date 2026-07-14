@@ -43,6 +43,10 @@ pub struct Config {
     /// Length in milliseconds of each blink phase (visible / hidden).
     /// 0 also disables blinking.
     pub cursor_blink_interval: u64,
+    /// Reload open buffers and refresh the sidebar when something outside
+    /// darknotes changes a file under the vault (an agent, a script,
+    /// `git checkout`). Buffers with unsaved changes are never overwritten.
+    pub watch_files: bool,
     pub keymap: Keymap,
     pub search: Search,
 }
@@ -126,6 +130,7 @@ impl Default for Config {
             wrap: true,
             cursor_blink: true,
             cursor_blink_interval: 500,
+            watch_files: true,
             keymap: Keymap::default(),
             search: Search::default(),
         }
@@ -251,6 +256,7 @@ mod tests {
         assert!(c.keymap.insert.is_empty());
         assert!(c.cursor_blink);
         assert_eq!(c.cursor_blink_interval, 500);
+        assert!(c.watch_files);
     }
 
     #[test]

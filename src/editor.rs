@@ -27,6 +27,7 @@ use crate::session;
 use crate::theme::Theme;
 use crate::vault::{Row, Vault};
 use crate::vim::{Action, Mode, Scroll, Vim};
+use crate::watcher::VaultWatcher;
 
 const WELCOME: &str =
     "# Welcome to darknotes\n\nOpen a vault: darknotes <folder>\nOr a file: darknotes <path.md>\n";
@@ -34,6 +35,11 @@ const WELCOME: &str =
 /// Fixed sidebar width. The soft-wrap width is derived as viewport minus
 /// this, so it must match the `.w(px(SIDEBAR_WIDTH))` on the sidebar list.
 const SIDEBAR_WIDTH: f32 = 330.;
+
+// ponytail: fixed poll cadence over an async channel wakeup, to avoid a
+// second crate (futures) just for `mpsc::UnboundedReceiver::next()`. Drop if
+// 200ms ever feels laggy.
+const FS_POLL_INTERVAL_MS: u64 = 200;
 
 /// Which pane keystrokes drive. One entity owns both panes and a single focus
 /// handle, so switching is a routing flag, not a GPUI focus change.
@@ -225,6 +231,13 @@ pub struct Editor {
     vim: Vim,
     focus: FocusHandle,
     vault: Vault,
+    /// Recursive watch on the vault root for external changes (an agent, a
+    /// script, `git checkout`); `None` when `config.watch_files` is off or the
+    /// watch failed to start (missing inotify capacity, etc).
+    watcher: Option<VaultWatcher>,
+    /// Polls `watcher` on a timer. Held so it stays alive; dropping cancels it
+    /// (gpui cancels a dropped `Task`), like `blink_timer`/`seq_timer`.
+    fs_poll_timer: Option<Task<()>>,
     /// Transient status-line message (command result/error); cleared each key.
     message: Option<String>,
     /// Pane that receives keystrokes (`Ctrl-W h`/`l` switches).
@@ -399,6 +412,8 @@ impl Editor {
             vim,
             focus: cx.focus_handle(),
             vault,
+            watcher: None,
+            fs_poll_timer: None,
             selected,
             expanded,
             sidebar_scroll: UniformListScrollHandle::new(),
@@ -443,6 +458,15 @@ impl Editor {
             caret_paint: Rc::new(Cell::new(CaretPaint::Solid)),
         };
         this.arm_blink(cx);
+        if config.watch_files {
+            match VaultWatcher::new(&this.vault.root) {
+                Ok(w) => {
+                    this.watcher = Some(w);
+                    this.arm_fs_watch(cx);
+                }
+                Err(e) => eprintln!("darknotes: could not watch vault for changes: {e}"),
+            }
+        }
         this
     }
 
@@ -467,6 +491,83 @@ impl Editor {
                 }
             }
         }));
+    }
+
+    /// Poll `self.watcher` on a timer, mirroring `arm_blink`'s bridge from
+    /// gpui's background executor back onto the entity.
+    fn arm_fs_watch(&mut self, cx: &mut Context<Self>) {
+        let dur = Duration::from_millis(FS_POLL_INTERVAL_MS);
+        self.fs_poll_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(dur).await;
+                let alive = this.update(cx, |this, cx| this.poll_fs_events(cx));
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// React to filesystem events queued since the last tick: reload clean
+    /// open buffers whose backing file changed (keeping the caret's offset,
+    /// clamped, rather than snapping to the top), flag ones whose file was
+    /// deleted, warn (never clobber) dirty ones, and rescan the vault tree
+    /// once per batch for anything else (create/delete/rename anywhere under
+    /// the vault root).
+    ///
+    /// Existence is checked directly on disk (`path.exists()`) rather than by
+    /// branching on the event's kind — atomic saves (write-to-temp-then-rename)
+    /// and backend-specific event shapes make "was this a delete?" unreliable
+    /// to infer from the event alone, but the end state on disk is always
+    /// unambiguous.
+    fn poll_fs_events(&mut self, cx: &mut Context<Self>) {
+        let Some(watcher) = self.watcher.as_ref() else { return };
+        let events = watcher.drain();
+        if events.is_empty() {
+            return;
+        }
+        let mut tree_changed = false;
+        let mut repaint = false;
+        for event in &events {
+            for path in &event.paths {
+                let Some(i) =
+                    self.buffers.iter().position(|b| b.doc.path() == Some(path.as_path()))
+                else {
+                    tree_changed = true;
+                    continue;
+                };
+                if !path.exists() {
+                    // Already flagged: don't re-warn on every duplicate
+                    // remove event some backends fire for one deletion.
+                    if !self.buffers[i].doc.is_missing() {
+                        self.buffers[i].doc.set_missing(true);
+                        let name = self.buffer_display(&self.buffers[i]);
+                        self.message = Some(format!("file deleted: {name}"));
+                        repaint = true;
+                    }
+                    continue;
+                }
+                if self.buffers[i].doc.is_dirty() {
+                    self.buffers[i].doc.set_missing(false); // back, even if we won't reload it
+                    let name = self.buffer_display(&self.buffers[i]);
+                    self.message =
+                        Some(format!("W12: {name} changed on disk (unsaved changes kept)"));
+                    repaint = true;
+                } else {
+                    let caret = self.buffers[i].doc.caret_offset();
+                    self.buffers[i].doc = open_or_empty(path);
+                    self.buffers[i].doc.jump_to(caret); // clamped; best-effort vs. shifted content
+                    repaint |= i == self.active;
+                }
+            }
+        }
+        if tree_changed {
+            self.rescan_vault();
+            repaint = true;
+        }
+        if repaint {
+            cx.notify();
+        }
     }
 
     fn doc(&self) -> &Document {
@@ -1231,8 +1332,9 @@ impl Editor {
     }
 
     /// The tab row above the editor: one tab per buffer, `{n}: {basename}`,
-    /// `●` when dirty, italic while a preview. Click switches; middle-click
-    /// closes (`:bd` semantics, no force).
+    /// `●` when dirty, italic while a preview, muted + struck through when the
+    /// backing file has been deleted out from under it. Click switches;
+    /// middle-click closes (`:bd` semantics, no force).
     fn render_tabline(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let theme = *theme;
         let entity = cx.entity();
@@ -1258,11 +1360,13 @@ impl Editor {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "[No Name]".into());
                 let dirty = b.doc.is_dirty();
+                let missing = b.doc.is_missing();
                 let active = i == self.active;
                 // Active tab joins the buffer area's background; inactive tabs
-                // recede into the (status-colored) strip.
+                // recede into the (status-colored) strip. A deleted backing
+                // file always reads as muted, active or not.
                 let (bg, fg) = if active {
-                    (theme.background, theme.foreground)
+                    (theme.background, if missing { theme.muted } else { theme.foreground })
                 } else {
                     (theme.status_background, theme.muted)
                 };
@@ -1282,6 +1386,7 @@ impl Editor {
                     .border_b_2()
                     .border_color(if active { theme.accent } else { hsla(0., 0., 0., 0.) })
                     .when(b.preview, |d| d.italic())
+                    .when(missing, |d| d.line_through())
                     .when(!active, |d| d.hover(move |s| s.bg(theme.hover)))
                     .child(
                         // a crowded tab row shrinks tabs, never the layout

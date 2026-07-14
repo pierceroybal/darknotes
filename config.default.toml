@@ -39,6 +39,13 @@ wrap = true
 cursor_blink = true
 cursor_blink_interval = 500
 
+# Reload open buffers and refresh the sidebar when something outside
+# darknotes changes a file under the vault — an agent, a script,
+# `git checkout`. A buffer with unsaved changes is never overwritten; the
+# status line warns instead. Set false to only pick up external changes on
+# `:e`/restart.
+watch_files = true
+
 [keymap]
 # How long (ms) a partially-typed multi-key binding waits for its next key
 # before the typed keys are handled as ordinary input. Vim's default is 1000;

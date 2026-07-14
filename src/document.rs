@@ -101,6 +101,10 @@ pub struct Document {
     path: Option<PathBuf>,
     /// Set on every edit, cleared on save.
     dirty: bool,
+    /// The backing file existed but has since been deleted out from under
+    /// this buffer (an external watcher sets this — see `Editor::poll_fs_events`).
+    /// Content is kept as last known; `save` recreates the file and clears it.
+    missing: bool,
     /// Content generation, drawn from a process-wide counter so no two
     /// documents (or states of one document) ever share a value. Bumped on
     /// every content change — including undo/redo, which can restore
@@ -132,6 +136,7 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: None,
             dirty: false,
+            missing: false,
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -154,6 +159,7 @@ impl Document {
             selections: vec![Selection::caret(0)],
             path: Some(path),
             dirty: false,
+            missing: false,
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -170,6 +176,7 @@ impl Document {
             }
             std::fs::write(path, self.rope.to_string())?;
             self.dirty = false;
+            self.missing = false;
         }
         Ok(())
     }
@@ -182,6 +189,15 @@ impl Document {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// The backing file is gone (see the field doc on `missing`).
+    pub fn is_missing(&self) -> bool {
+        self.missing
+    }
+
+    pub fn set_missing(&mut self, missing: bool) {
+        self.missing = missing;
     }
 
     /// Content generation — changes iff the rope changed. See the field doc.

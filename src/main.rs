@@ -7,6 +7,7 @@ mod session;
 mod theme;
 mod vault;
 mod vim;
+mod watcher;
 
 use std::borrow::Cow;
 use std::path::PathBuf;
