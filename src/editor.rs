@@ -9,7 +9,8 @@ use std::time::Duration;
 use gpui::{
     div, fill, hsla, outline, point, prelude::*, px, relative, size, svg, uniform_list, App,
     BorderStyle, Bounds,
-    ClipboardItem, ContentMask, Context, Div, FocusHandle, Focusable, Font, FontId, FontStyle,
+    ClipboardItem, ContentMask, Context, Corners, Div, Edges, FocusHandle, Focusable, Font,
+    FontId, FontStyle,
     FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
     MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
@@ -153,6 +154,9 @@ struct RowCtx {
     /// Columns per row when the font probed monospace; the plain-ASCII
     /// column-walk wrap path.
     mono_cols: Option<usize>,
+    /// `mono_cols` shrunk by the `CODE_MARGIN + CODE_PAD` text inset — the
+    /// column budget for code-band lines, which wrap inside the band's border.
+    mono_band_cols: Option<usize>,
     mode: Mode,
     cur_line: usize,
     cur_col: usize,
@@ -787,14 +791,16 @@ impl Editor {
         // ('i' and 'M' advance alike ⇒ monospace); the per-line gate in
         // `append_line_rows` keeps the exact shaped path for anything the
         // walk can't promise.
-        let mono_cols: Option<usize> = wrap_width.and_then(|w| {
+        let mono: Option<(usize, usize)> = wrap_width.and_then(|w| {
             let advance = |s: &'static str| {
                 let runs = [run(&font, 1, theme.foreground)];
                 window.text_system().shape_line(s.into(), font_size, &runs, None).width
             };
             let (iw, mw) = (advance("i"), advance("M"));
-            ((iw - mw).abs() < px(0.01) && iw > Pixels::ZERO)
-                .then(|| ((w / iw) as usize).max(1))
+            ((iw - mw).abs() < px(0.01) && iw > Pixels::ZERO).then(|| {
+                let cols = |w: Pixels| ((w / iw) as usize).max(1);
+                (cols(w), cols(w - (CODE_MARGIN + CODE_PAD) * 2.))
+            })
         });
 
         let num_width = rope.len_lines().to_string().len().max(3);
@@ -806,7 +812,8 @@ impl Editor {
             font,
             font_size,
             wrap_width,
-            mono_cols,
+            mono_cols: mono.map(|(c, _)| c),
+            mono_band_cols: mono.map(|(_, c)| c),
             mode,
             cur_line,
             cur_col,
@@ -890,7 +897,7 @@ impl Editor {
             let search =
                 search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
             let scale = heading_scale(&c.segments);
-            (c.text, c.segments, selection, search, scale, row_decor(line_spans))
+            (c.text, c.segments, selection, search, scale, row_decor(&ctx.spans, i))
         } else {
             // Source view (revealed line, or markdown rendering off): a task
             // box's `[ ]` shows its source bytes styled like any other marker
@@ -904,9 +911,11 @@ impl Editor {
                     _ => s,
                 })
                 .collect();
-            let decor = (self.render_markdown
-                && row_decor(line_spans) == Some(RowDecor::CodeBand))
-                .then_some(RowDecor::CodeBand);
+            let decor = self
+                .render_markdown
+                .then(|| row_decor(&ctx.spans, i))
+                .flatten()
+                .filter(|d| matches!(d, RowDecor::CodeBand { .. }));
             (text, segs, selection, search, 1.0, decor)
         };
 
@@ -919,12 +928,19 @@ impl Editor {
         let row_starts: Vec<usize> = match ctx.wrap_width {
             None => vec![0],
             Some(w) => {
+                // Code-band text is inset by CODE_MARGIN + CODE_PAD per side
+                // (paint shifts it right); wrap inside the inset width — a
+                // reduced column budget on the mono walk, a reduced pixel
+                // width when shaping — so wrapped rows stay clear of the
+                // band's right border.
+                let band = matches!(decor, Some(RowDecor::CodeBand { .. }));
+                let w = if band { w - (CODE_MARGIN + CODE_PAD) * 2. } else { w };
                 let plain = text.is_ascii()
                     && !text.contains('\t')
                     && segments.iter().all(|s| {
                         !matches!(s.kind, Some(SpanKind::Heading(_)) | Some(SpanKind::Strong))
                     });
-                match ctx.mono_cols {
+                match if band { ctx.mono_band_cols } else { ctx.mono_cols } {
                     Some(cols) if plain => wrap_columns(&text, cols),
                     _ => {
                         let key = (text.clone(), segments.clone());
@@ -1032,7 +1048,15 @@ impl Editor {
                 gutter,
                 follow_h: ctx.wrap_width.is_none(),
                 scale,
-                decor,
+                // A wrapped band line closes its border only on its outermost
+                // visual rows; middle rows keep the sides running through.
+                decor: match decor {
+                    Some(RowDecor::CodeBand { top, bottom }) => Some(RowDecor::CodeBand {
+                        top: top && k == 0,
+                        bottom: bottom && k == last,
+                    }),
+                    d => d,
+                },
             });
         }
         caret_at
@@ -3274,32 +3298,68 @@ impl Element for LineElement {
         // offset; clip to the area right of the gutter so left-overflow stops at
         // the gutter and right-overflow stops at the pane edge.
         let text_origin_x = bounds.origin.x + prepaint.gutter_w;
-        let ox = text_origin_x - self.scroll_x.get();
+        // Code rows inset all their content (text, caret, highlights) by
+        // CODE_MARGIN + CODE_PAD so it clears the band border; wrap width
+        // shrank to match in `append_line_rows`.
+        let pad = match self.decor {
+            Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
+            _ => Pixels::ZERO,
+        };
+        let ox = text_origin_x + pad - self.scroll_x.get();
         let text_bounds = Bounds::new(
             point(text_origin_x, bounds.origin.y),
             size(bounds.size.width - prepaint.gutter_w, bounds.size.height),
         );
-        window.with_content_mask(Some(ContentMask { bounds: text_bounds }), |window| {
-            // Paint order, bottom-up: block decoration, search-match quads,
-            // selection highlight, caret quad, the line, the inverted caret
-            // glyph, and the task box over its transparent source bytes.
-            // Decorations pin to the pane edge (not the scroll offset) — a
-            // band/bar that slid with `scroll_x` would read as content.
-            match self.decor {
-                Some(RowDecor::CodeBand) => window.paint_quad(fill(text_bounds, theme.code_bg)),
-                Some(RowDecor::QuoteBar) => window.paint_quad(fill(
-                    Bounds::new(text_bounds.origin, size(px(3.), line_height)),
-                    theme.muted,
-                )),
-                Some(RowDecor::Rule) => window.paint_quad(fill(
-                    Bounds::new(
-                        point(text_origin_x, bounds.origin.y + (line_height - px(1.)) / 2.),
-                        size(text_bounds.size.width, px(1.)),
-                    ),
-                    theme.border,
-                )),
-                None => {}
+        // Decorations paint first (beneath everything) and outside the text
+        // mask — they pin to the pane edge, never scroll, and stay inside the
+        // row horizontally, so they don't need the clip. Outside it, a band
+        // row can bleed 1px into the row below: bordered/rounded quads render
+        // with antialiased edges, and two abutting edges on a fractional
+        // pixel boundary each blend with the backdrop, leaving a hairline
+        // seam between rows — overlapping the opaque quads hides it.
+        match self.decor {
+            Some(RowDecor::CodeBand { top, bottom }) => {
+                let edge = |on: bool| if on { px(1.) } else { Pixels::ZERO };
+                let radius = |on: bool| if on { px(4.) } else { Pixels::ZERO };
+                let bleed = if bottom { Pixels::ZERO } else { px(1.) };
+                let band_bounds = Bounds::new(
+                    point(text_bounds.origin.x + CODE_MARGIN, text_bounds.origin.y),
+                    size(text_bounds.size.width - CODE_MARGIN * 2., text_bounds.size.height + bleed),
+                );
+                window.paint_quad(
+                    fill(band_bounds, theme.code_bg)
+                        .corner_radii(Corners {
+                            top_left: radius(top),
+                            top_right: radius(top),
+                            bottom_right: radius(bottom),
+                            bottom_left: radius(bottom),
+                        })
+                        .border_widths(Edges {
+                            top: edge(top),
+                            right: px(1.),
+                            bottom: edge(bottom),
+                            left: px(1.),
+                        })
+                        .border_color(theme.border),
+                )
             }
+            Some(RowDecor::QuoteBar) => window.paint_quad(fill(
+                Bounds::new(text_bounds.origin, size(px(3.), line_height)),
+                theme.muted,
+            )),
+            Some(RowDecor::Rule) => window.paint_quad(fill(
+                Bounds::new(
+                    point(text_origin_x, bounds.origin.y + (line_height - px(1.)) / 2.),
+                    size(text_bounds.size.width, px(1.)),
+                ),
+                theme.border,
+            )),
+            None => {}
+        }
+        window.with_content_mask(Some(ContentMask { bounds: text_bounds }), |window| {
+            // Paint order, bottom-up: search-match quads, selection
+            // highlight, caret quad, the line, the inverted caret glyph, and
+            // the task box over its transparent source bytes.
             for &(x, width) in &prepaint.search {
                 let origin = point(ox + x, bounds.origin.y);
                 window.paint_quad(fill(
@@ -3435,22 +3495,44 @@ fn heading_scale(segments: &[Segment]) -> f32 {
 /// the cursor line and raw view show plain source, like conceal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RowDecor {
-    /// Full-width `code_bg` band behind a fence/code line.
-    CodeBand,
+    /// `code_bg` band behind a fence/code line, inset `CODE_MARGIN` from the
+    /// pane edges and drawn with a 1px side border. `top`/`bottom` mark the
+    /// block's first/last line, which
+    /// close the border and round its corners; `append_line_rows` further
+    /// restricts them to the first/last visual row of a wrapped line.
+    CodeBand { top: bool, bottom: bool },
     /// 3px bar at the left edge of a blockquote line (its `>` conceals).
     QuoteBar,
     /// Hairline across the row replacing a `---`/`***`/`___` line.
     Rule,
 }
 
-/// Decoration for a line, from its spans. The scanner pushes a line's role
-/// span first, so the leading span's kind decides — which also covers empty
-/// in-fence lines (their zero-length `CodeText` span still leads) where the
-/// flattened segments would be empty. Every visual row of a wrapped line
-/// shares the line's decor.
-fn row_decor(spans: &[Span]) -> Option<RowDecor> {
-    match spans.first().map(|s| s.kind) {
-        Some(SpanKind::CodeText | SpanKind::CodeFence) => Some(RowDecor::CodeBand),
+/// Horizontal margin of a code band's quad from the pane edges.
+const CODE_MARGIN: Pixels = px(8.);
+
+/// Text inset inside a code band, so content clears the border. Band text
+/// sits `CODE_MARGIN + CODE_PAD` from the pane edge; wrap width shrinks by
+/// twice that sum for band lines, keeping wrapped rows inside the border.
+const CODE_PAD: Pixels = px(8.);
+
+/// Decoration for line `line`, from its spans. The scanner pushes a line's
+/// role span first, so the leading span's kind decides — which also covers
+/// empty in-fence lines (their zero-length `CodeText` span still leads) where
+/// the flattened segments would be empty. A code band's `top`/`bottom` come
+/// from whether the neighboring lines are in-band.
+// ponytail: back-to-back fenced blocks (no blank line between) merge into one
+// band; track fence open/close state here if that ever reads wrong.
+fn row_decor(spans: &[Vec<Span>], line: usize) -> Option<RowDecor> {
+    let lead = |i: usize| spans.get(i).and_then(|s| s.first()).map(|s| s.kind);
+    match lead(line) {
+        Some(SpanKind::CodeText | SpanKind::CodeFence) => {
+            let band =
+                |i: usize| matches!(lead(i), Some(SpanKind::CodeText | SpanKind::CodeFence));
+            Some(RowDecor::CodeBand {
+                top: line == 0 || !band(line - 1),
+                bottom: !band(line + 1),
+            })
+        }
         Some(SpanKind::BlockQuote) => Some(RowDecor::QuoteBar),
         Some(SpanKind::Rule) => Some(RowDecor::Rule),
         _ => None,
@@ -3857,18 +3939,19 @@ mod tests {
     #[test]
     fn row_decor_from_leading_span() {
         let spans = markdown::parse(&Rope::from_str("# h\n> q\n```\ncode\n\n```\nx\n---\n"));
+        let band = |top, bottom| Some(RowDecor::CodeBand { top, bottom });
         let expect = [
             None,                     // heading
             Some(RowDecor::QuoteBar), // > q
-            Some(RowDecor::CodeBand), // opening fence
-            Some(RowDecor::CodeBand), // code
-            Some(RowDecor::CodeBand), // empty in-fence line (zero-len span)
-            Some(RowDecor::CodeBand), // closing fence
+            band(true, false),        // opening fence
+            band(false, false),       // code
+            band(false, false),       // empty in-fence line (zero-len span)
+            band(false, true),        // closing fence
             None,                     // plain text
             Some(RowDecor::Rule),     // ---
         ];
         for (i, want) in expect.iter().enumerate() {
-            assert_eq!(row_decor(&spans[i]), *want, "line {i}");
+            assert_eq!(row_decor(&spans, i), *want, "line {i}");
         }
     }
 
