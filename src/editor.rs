@@ -487,6 +487,17 @@ impl Editor {
             loop {
                 cx.background_executor().timer(dur).await;
                 let alive = this.update(cx, |this, cx| {
+                    // A dim caret (unfocused window / sidebar pane) is static:
+                    // skip the toggle and, critically, the notify — repainting
+                    // would redraw pixel-identical frames twice a second for
+                    // as long as the app is unfocused. Phase parks on "shown"
+                    // so the caret is solid the instant visibility returns.
+                    // `caret_paint` is render-maintained, so it covers every
+                    // pane/focus transition without hooking each one.
+                    if this.caret_paint.get() == CaretPaint::Dim {
+                        this.blink_show = true;
+                        return;
+                    }
                     this.blink_show = !this.blink_show;
                     cx.notify();
                 });
@@ -534,6 +545,14 @@ impl Editor {
         let mut tree_changed = false;
         let mut repaint = false;
         for event in &events {
+            // Pure-read events (inotify OPEN/CLOSE_NOWRITE) can't change
+            // content or the tree, and our own directory reads emit them —
+            // without this guard every `Vault::scan` triggers the next one,
+            // a self-sustaining rescan loop at the poll interval. Real
+            // changes still arrive as Modify/Create/Remove/Rename.
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                continue;
+            }
             for path in &event.paths {
                 let Some(i) =
                     self.buffers.iter().position(|b| b.doc.path() == Some(path.as_path()))
@@ -1905,6 +1924,7 @@ impl Editor {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        crate::perf::key(&ev.keystroke.key, window);
         self.message = None; // a fresh keystroke clears the previous result
         self.arm_blink(cx); // caret solid while typing; the phase restarts after
 
@@ -2507,6 +2527,7 @@ impl Focusable for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::first_frame(window);
         // Commit the preview tab on its first edit. render runs after every
         // notify, so this catches every mutation path (keys, chords, palette
         // picks, timer-replayed sequences) without instrumenting each one.

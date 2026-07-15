@@ -3,6 +3,11 @@ name = "darknotes"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# In-app performance instrumentation (src/perf.rs). Off by default so plain
+# debug/release builds carry zero measurement code; `cargo perf` turns it on.
+perf = []
+
 [dependencies]
 gpui = "0.2"
 notify = "8"

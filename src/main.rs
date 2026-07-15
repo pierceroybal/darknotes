@@ -3,6 +3,7 @@ mod document;
 mod editor;
 mod keymap;
 mod markdown;
+mod perf;
 mod session;
 mod theme;
 mod vault;
@@ -51,6 +52,8 @@ impl AssetSource for Assets {
 }
 
 fn main() {
+    perf::launch();
+
     // `-d`/`--detach`: re-spawn ourselves without the flag — stdio on /dev/null,
     // own process group (Unix) / detached from the console (Windows) — and exit,
     // returning the shell prompt while the window lives on.

@@ -40,6 +40,7 @@ pub struct Row {
 
 impl Vault {
     pub fn scan(root: impl Into<PathBuf>) -> Self {
+        let t0 = crate::perf::t0();
         let root = root.into();
         let mut tree = build_dir(&root);
         let mut files = Vec::new();
@@ -51,6 +52,7 @@ impl Vault {
         if !children.is_empty() {
             tree.push(Entry::Dir { name: "Trash".into(), path: trash, children });
         }
+        crate::perf::scan_done(t0, files.len());
         Self { root, tree, files }
     }
 

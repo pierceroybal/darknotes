@@ -1,0 +1,4 @@
+[alias]
+# Perf build: release optimizations plus the in-app instrumentation that
+# plain --release strips. See docs/perf.md.
+perf = "run --release --features perf"
