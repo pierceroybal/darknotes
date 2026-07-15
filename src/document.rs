@@ -105,6 +105,10 @@ pub struct Document {
     /// this buffer (an external watcher sets this — see `Editor::poll_fs_events`).
     /// Content is kept as last known; `save` recreates the file and clears it.
     missing: bool,
+    /// Hash of the file content as this buffer last read or wrote it
+    /// (`open`/`save`). The watcher compares disk against this to tell a
+    /// genuine external change from an echo of our own write.
+    disk_hash: u64,
     /// Content generation, drawn from a process-wide counter so no two
     /// documents (or states of one document) ever share a value. Bumped on
     /// every content change — including undo/redo, which can restore
@@ -137,6 +141,7 @@ impl Document {
             path: None,
             dirty: false,
             missing: false,
+            disk_hash: Self::hash_text(text),
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -160,6 +165,7 @@ impl Document {
             path: Some(path),
             dirty: false,
             missing: false,
+            disk_hash: Self::hash_text(&text),
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -174,9 +180,11 @@ impl Document {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(path, self.rope.to_string())?;
+            let text = self.rope.to_string();
+            std::fs::write(path, &text)?;
             self.dirty = false;
             self.missing = false;
+            self.disk_hash = Self::hash_text(&text);
         }
         Ok(())
     }
@@ -198,6 +206,25 @@ impl Document {
 
     pub fn set_missing(&mut self, missing: bool) {
         self.missing = missing;
+    }
+
+    /// Fingerprint used for buffer-vs-disk comparison (see the `disk_hash`
+    /// field doc). Callers hash disk content with `hash_text` to compare.
+    pub fn disk_hash(&self) -> u64 {
+        self.disk_hash
+    }
+
+    /// Record a disk state observed but not adopted (the W12 dirty-buffer
+    /// case), so duplicate events for the same change don't re-warn.
+    pub fn set_disk_hash(&mut self, hash: u64) {
+        self.disk_hash = hash;
+    }
+
+    pub fn hash_text(text: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        h.finish()
     }
 
     /// Content generation — changes iff the rope changed. See the field doc.
@@ -1746,6 +1773,26 @@ mod tests {
 
         let reopened = Document::open(&path).unwrap();
         assert_eq!(reopened.rope.to_string(), "hello");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disk_hash_tells_own_save_from_external_write() {
+        let mut path = std::env::temp_dir();
+        path.push("darknotes_disk_hash_test.md");
+
+        let mut d = Document::open(&path).unwrap();
+        d.insert("hello");
+        d.save().unwrap();
+        // Watcher event echoing our own save: disk matches disk_hash.
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Document::hash_text(&disk), d.disk_hash());
+
+        // Genuine external write: disk no longer matches.
+        std::fs::write(&path, "changed elsewhere").unwrap();
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert_ne!(Document::hash_text(&disk), d.disk_hash());
 
         let _ = std::fs::remove_file(&path);
     }

@@ -515,11 +515,12 @@ impl Editor {
     /// once per batch for anything else (create/delete/rename anywhere under
     /// the vault root).
     ///
-    /// Existence is checked directly on disk (`path.exists()`) rather than by
-    /// branching on the event's kind — atomic saves (write-to-temp-then-rename)
-    /// and backend-specific event shapes make "was this a delete?" unreliable
-    /// to infer from the event alone, but the end state on disk is always
-    /// unambiguous.
+    /// For a path backing an open buffer, the file is read once and that read
+    /// answers everything — existence, and (by hashing against the document's
+    /// `disk_hash`) whether the content actually differs from what this
+    /// buffer last loaded or saved. Event kinds are never trusted: atomic
+    /// saves and backend quirks make them unreliable, and our own `save`
+    /// echoes back through the watcher looking just like an external edit.
     fn poll_fs_events(&mut self, cx: &mut Context<Self>) {
         let Some(watcher) = self.watcher.as_ref() else { return };
         let events = watcher.drain();
@@ -536,19 +537,37 @@ impl Editor {
                     tree_changed = true;
                     continue;
                 };
-                if !path.exists() {
-                    // Already flagged: don't re-warn on every duplicate
-                    // remove event some backends fire for one deletion.
-                    if !self.buffers[i].doc.is_missing() {
-                        self.buffers[i].doc.set_missing(true);
-                        let name = self.buffer_display(&self.buffers[i]);
-                        self.message = Some(format!("file deleted: {name}"));
+                let disk = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Already flagged: don't re-warn on every duplicate
+                        // remove event some backends fire for one deletion.
+                        if !self.buffers[i].doc.is_missing() {
+                            self.buffers[i].doc.set_missing(true);
+                            let name = self.buffer_display(&self.buffers[i]);
+                            self.message = Some(format!("file deleted: {name}"));
+                            repaint = true;
+                        }
+                        continue;
+                    }
+                    // Transient (permissions, mid-rename); a follow-up event
+                    // will re-check.
+                    Err(_) => continue,
+                };
+                let hash = Document::hash_text(&disk);
+                if hash == self.buffers[i].doc.disk_hash() {
+                    // Disk holds exactly what this buffer last loaded or
+                    // saved — the event is an echo of our own write (or a
+                    // content-identical external one). Nothing to report.
+                    if self.buffers[i].doc.is_missing() {
+                        self.buffers[i].doc.set_missing(false);
                         repaint = true;
                     }
                     continue;
                 }
                 if self.buffers[i].doc.is_dirty() {
                     self.buffers[i].doc.set_missing(false); // back, even if we won't reload it
+                    self.buffers[i].doc.set_disk_hash(hash); // dedupe repeat events
                     let name = self.buffer_display(&self.buffers[i]);
                     self.message =
                         Some(format!("W12: {name} changed on disk (unsaved changes kept)"));
