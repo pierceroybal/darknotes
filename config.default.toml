@@ -46,7 +46,7 @@ cursor_blink_interval = 500
 # held before repeating starts; key_repeat_interval is the gap between
 # repeats after that. Set key_repeat_interval = 0 to fall back to whatever
 # the OS/platform backend does natively.
-key_repeat_delay = 150
+key_repeat_delay = 500
 key_repeat_interval = 30
 
 # Reload open buffers and refresh the sidebar when something outside

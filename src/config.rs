@@ -137,7 +137,7 @@ impl Default for Config {
             wrap: true,
             cursor_blink: true,
             cursor_blink_interval: 500,
-            key_repeat_delay: 150,
+            key_repeat_delay: 500,
             key_repeat_interval: 30,
             watch_files: true,
             keymap: Keymap::default(),
@@ -265,7 +265,7 @@ mod tests {
         assert!(c.keymap.insert.is_empty());
         assert!(c.cursor_blink);
         assert_eq!(c.cursor_blink_interval, 500);
-        assert_eq!(c.key_repeat_delay, 150);
+        assert_eq!(c.key_repeat_delay, 500);
         assert_eq!(c.key_repeat_interval, 30);
         assert!(c.watch_files);
     }
