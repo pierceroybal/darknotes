@@ -39,6 +39,16 @@ wrap = true
 cursor_blink = true
 cursor_blink_interval = 500
 
+# Held-key auto-repeat (e.g. `j`/`k` held to scroll). darknotes drives this
+# itself instead of trusting the OS — native repeat is slow on macOS and much
+# faster on X11/WSL, so without this a held key would move at different
+# speeds on different machines. key_repeat_delay is how long the key must be
+# held before repeating starts; key_repeat_interval is the gap between
+# repeats after that. Set key_repeat_interval = 0 to fall back to whatever
+# the OS/platform backend does natively.
+key_repeat_delay = 150
+key_repeat_interval = 30
+
 # Reload open buffers and refresh the sidebar when something outside
 # darknotes changes a file under the vault — an agent, a script,
 # `git checkout`. A buffer with unsaved changes is never overwritten; the

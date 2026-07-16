@@ -43,6 +43,16 @@ pub struct Config {
     /// Length in milliseconds of each blink phase (visible / hidden).
     /// 0 also disables blinking.
     pub cursor_blink_interval: u64,
+    /// Milliseconds a held key waits before it starts auto-repeating (e.g.
+    /// `j`/`k` held to scroll). darknotes drives this itself rather than
+    /// trusting the OS, whose native repeat is slow on macOS and much faster
+    /// (and unthrottled) on X11/WSL — so held-key behavior is identical on
+    /// every platform.
+    pub key_repeat_delay: u64,
+    /// Milliseconds between repeats once a held key starts repeating. 0
+    /// disables darknotes' own repeat handling, falling back to whatever the
+    /// OS/platform backend does natively.
+    pub key_repeat_interval: u64,
     /// Reload open buffers and refresh the sidebar when something outside
     /// darknotes changes a file under the vault (an agent, a script,
     /// `git checkout`). Buffers with unsaved changes are never overwritten.
@@ -130,6 +140,8 @@ impl Default for Config {
             wrap: true,
             cursor_blink: true,
             cursor_blink_interval: 500,
+            key_repeat_delay: 150,
+            key_repeat_interval: 30,
             watch_files: true,
             keymap: Keymap::default(),
             search: Search::default(),
@@ -256,6 +268,8 @@ mod tests {
         assert!(c.keymap.insert.is_empty());
         assert!(c.cursor_blink);
         assert_eq!(c.cursor_blink_interval, 500);
+        assert_eq!(c.key_repeat_delay, 150);
+        assert_eq!(c.key_repeat_interval, 30);
         assert!(c.watch_files);
     }
 

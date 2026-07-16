@@ -12,7 +12,8 @@ use gpui::{
     ClipboardItem, ContentMask, Context, Corners, Div, Edges, FocusHandle, Focusable, Font,
     FontId, FontStyle,
     FontWeight,
-    GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, Keystroke, LayoutId,
+    GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, KeyUpEvent, Keystroke,
+    LayoutId,
     MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
     TextRun, TransformationMatrix, UniformListScrollHandle, Window,
 };
@@ -313,6 +314,23 @@ pub struct Editor {
     /// replacing it cancels the timer (gpui cancels a dropped `Task`). On fire
     /// the buffered keys replay through the grammar as ordinary input.
     seq_timer: Option<Task<()>>,
+    /// `key_repeat_delay`/`key_repeat_interval` (ms), from config. darknotes
+    /// drives its own repeat cadence for held keys rather than trusting the
+    /// OS/platform backend — see `on_key`. `key_repeat_interval == 0`
+    /// disables this and falls back to raw passthrough of whatever repeat
+    /// events the backend generates natively.
+    key_repeat_delay: u64,
+    key_repeat_interval: u64,
+    /// The keystroke we're currently auto-repeating, or `None`. Cleared by
+    /// `on_key_up` (or on window deactivation, so alt-tabbing away mid-hold
+    /// can't strand it set). Comparing incoming `KeyDown`s against this is
+    /// what lets `on_key` tell an OS repeat-echo from a deliberate second
+    /// press — the latter is always preceded by a `KeyUp` — even on backends
+    /// like X11 that never set `KeyDownEvent::is_held`.
+    repeat_stroke: Option<Keystroke>,
+    /// Pending repeat cadence. Replacing/clearing cancels the timer (gpui
+    /// cancels a dropped `Task`), like `blink_timer`/`seq_timer`.
+    repeat_timer: Option<Task<()>>,
     /// Open fuzzy picker, or `None`. Routes keys when `Some`.
     picker: Option<Picker>,
     /// Drives the picker results list scroll (scroll-to-selected).
@@ -352,8 +370,13 @@ impl Editor {
         cx.observe_window_bounds(window, |_, _, cx| cx.notify()).detach();
         // OS focus dims the caret (render reads `is_window_active`); repaint on
         // the change, and restart the blink phase so re-focusing shows it solid.
+        // Also drop any in-flight key-repeat: alt-tabbing away mid-hold can
+        // lose the matching `KeyUp`, which would otherwise strand
+        // `repeat_stroke` set and silently swallow that key's next real press.
         cx.observe_window_activation(window, |this, _, cx| {
             this.arm_blink(cx);
+            this.repeat_stroke = None;
+            this.repeat_timer = None;
             cx.notify();
         })
         .detach();
@@ -451,6 +474,10 @@ impl Editor {
             keymap,
             timeoutlen: config.keymap.timeoutlen,
             seq_timer: None,
+            key_repeat_delay: config.key_repeat_delay,
+            key_repeat_interval: config.key_repeat_interval,
+            repeat_stroke: None,
+            repeat_timer: None,
             picker: None,
             picker_scroll: UniformListScrollHandle::new(),
             search: SearchState::default(),
@@ -1923,7 +1950,65 @@ impl Editor {
         self.rescan_vault();
     }
 
+    /// Entry point for every raw `KeyDown`. darknotes drives its own repeat
+    /// cadence instead of trusting the OS/platform backend, which is wildly
+    /// inconsistent across them: macOS's native auto-repeat is gated by
+    /// System Settings and stays slow even at its fastest slider, while
+    /// gpui's X11 backend (WSLg included) never marks a repeat at all —
+    /// every pulse the X server's own auto-repeat generates arrives here
+    /// looking like a fresh press.
+    ///
+    /// So a `KeyDown` for the stroke we're already repeating (`repeat_stroke`)
+    /// is treated as exactly that: an echo from the backend, not a new press,
+    /// and swallowed — `arm_key_repeat`'s own timer is what drives the
+    /// cadence from here. A deliberate second tap of the same key is never
+    /// swallowed because it's always preceded by a `KeyUp` (see `on_key_up`),
+    /// which clears `repeat_stroke` first.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.key_repeat_interval > 0 && self.repeat_stroke.as_ref() == Some(&ev.keystroke) {
+            return;
+        }
+        self.handle_key(ev, window, cx);
+        if self.key_repeat_interval > 0 {
+            self.arm_key_repeat(ev.keystroke.clone(), window, cx);
+        }
+    }
+
+    /// A physical key release: stop repeating it, if it was the one
+    /// repeating (only one stroke repeats at a time, so a `KeyUp` for
+    /// anything else is a no-op here).
+    fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        if self.repeat_stroke.as_ref() == Some(&ev.keystroke) {
+            self.repeat_stroke = None;
+            self.repeat_timer = None;
+        }
+    }
+
+    /// (Re)arm `stroke`'s auto-repeat: after `key_repeat_delay`, replay it
+    /// through `handle_key` every `key_repeat_interval` until `on_key_up` (or
+    /// a window-activation change) clears `repeat_stroke`. Mirrors
+    /// `arm_blink`/`arm_fs_watch`'s bridge from gpui's background executor
+    /// back onto the entity; replacing `repeat_timer` cancels whatever was
+    /// running before (a different key was already repeating).
+    fn arm_key_repeat(&mut self, stroke: Keystroke, window: &Window, cx: &mut Context<Self>) {
+        self.repeat_stroke = Some(stroke.clone());
+        let delay = Duration::from_millis(self.key_repeat_delay);
+        let interval = Duration::from_millis(self.key_repeat_interval);
+        self.repeat_timer = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            loop {
+                let ev = KeyDownEvent { keystroke: stroke.clone(), is_held: true };
+                let alive =
+                    this.update_in(cx, |this, window, cx| this.handle_key(&ev, window, cx));
+                if alive.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(interval).await;
+            }
+        }));
+    }
+
+    fn handle_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         crate::perf::key(&ev.keystroke.key, window);
         self.message = None; // a fresh keystroke clears the previous result
         self.arm_blink(cx); // caret solid while typing; the phase restarts after
@@ -2790,6 +2875,7 @@ impl Render for Editor {
         div()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_key_up(cx.listener(Self::on_key_up))
             .size_full()
             .relative() // positioning context for the switcher overlay
             .flex()
