@@ -14,7 +14,8 @@ use gpui::{
     FontWeight,
     GlobalElementId, GlyphId, Hsla, InspectorElementId, KeyDownEvent, KeyUpEvent, Keystroke,
     LayoutId,
-    MouseButton, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString, Style, Task,
+    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, ScrollStrategy, ShapedLine, SharedString,
+    Style, Task,
     TextRun, TransformationMatrix, UniformListScrollHandle, Window,
 };
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -803,6 +804,101 @@ impl Editor {
                 s
             }
         }
+    }
+
+    /// Left click in the text area: place the caret at the clicked spot.
+    /// Hit-testing reads the rendered rows cache — the exact geometry on
+    /// screen — and re-shapes only the clicked row to turn x into a column.
+    /// Insert mode stays in insert (click to focus, keep typing); any other
+    /// mode resets to normal, dropping a visual selection or pending
+    /// operator like a motion-aborting Esc.
+    // ponytail: single click only; drag-select and double-click word
+    // select when they're missed.
+    fn click_to_caret(&mut self, pos: gpui::Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        // Modal UI owns the mouse: the picker overlays the list, a file-op
+        // prompt is mid-edit, command mode is mid-`:`/search.
+        if self.picker.is_some() || self.prompt.is_some() || self.vim.mode == Mode::Command {
+            return;
+        }
+        let (rows, line_rows) = match &self.rows_cache {
+            Some(c) => (c.rows.clone(), c.line_rows.clone()),
+            None => return,
+        };
+        let (bounds, offset) = {
+            let s = self.scroll.0.borrow();
+            (s.base_handle.bounds(), s.base_handle.offset())
+        };
+        // Same fixed ratio the render pass sets as the list's line height.
+        let line_h = px(self.font_size * 22.0 / 15.0);
+        // offset.y is ≤ 0 once scrolled; a click past EOF (overscroll rows)
+        // clamps to the last real row, vim-style.
+        let y = pos.y - bounds.origin.y - offset.y;
+        let row = ((y / line_h) as usize).min(rows.len().saturating_sub(1));
+        let Some(el) = rows.get(row) else { return };
+
+        // Visual row → logical line + the line's first visual row.
+        let (mut line, mut first) = (0usize, 0usize);
+        while line + 1 < line_rows.len() && first + line_rows[line] as usize <= row {
+            first += line_rows[line] as usize;
+            line += 1;
+        }
+
+        // x → byte within this row's display text, mirroring paint's origin:
+        // past the gutter, inset when the row sits in a code band, shifted by
+        // the horizontal scroll.
+        let font = gpui::font(self.font_family.clone());
+        let font_size = px(self.font_size);
+        let theme = *cx.global::<Theme>();
+        let gutter_w = el.gutter.as_ref().map_or(Pixels::ZERO, |(text, _)| {
+            let runs = [run(&font, text.len(), theme.foreground)];
+            window.text_system().shape_line(text.clone(), font_size, &runs, None).width
+        });
+        let pad = match el.decor {
+            Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
+            _ => Pixels::ZERO,
+        };
+        let runs = segments_to_runs(&el.text, &el.segments, &font, theme.foreground, &theme);
+        let shaped =
+            window.text_system().shape_line(el.text.clone(), font_size * el.scale, &runs, None);
+        let x = pos.x - bounds.origin.x - gutter_w - pad + self.scroll_x.get();
+        let byte_in_row = shaped.closest_index_for_x(x.max(Pixels::ZERO));
+
+        // Byte within the line's display text: earlier rows are earlier
+        // slices of it, so their lengths accumulate.
+        let n = line_rows[line] as usize;
+        let display_byte =
+            rows[first..row].iter().map(|r| r.text.len()).sum::<usize>() + byte_in_row;
+
+        // Display byte → source char column. A revealed line (cursor line,
+        // fence reveal, markdown off) displays its source verbatim — compare
+        // instead of re-deriving reveal state. A concealed line re-runs the
+        // conceal for its source→display map and inverts it: the last source
+        // byte mapping at or before the display byte is the kept char there
+        // (dropped marker bytes collapse onto the *next* kept byte, so they
+        // sort before it and lose).
+        let src = line_text(&self.doc().rope, line);
+        let display: String = rows[first..first + n].iter().map(|r| r.text.as_ref()).collect();
+        let source_byte = if display == src {
+            display_byte
+        } else {
+            let spans = self.spans();
+            let segs = markdown::flatten(src.len(), spans.get(line).map_or(&[][..], Vec::as_slice));
+            display_to_source(&markdown::conceal(&src, &segs).map, display_byte)
+        };
+        let col = src[..source_byte.min(src.len())].chars().count();
+
+        let at = self.doc().rope.line_to_char(line) + col;
+        if self.vim.mode != Mode::Insert {
+            self.vim.reset();
+        }
+        self.doc_mut().jump_to(at);
+        if self.vim.mode != Mode::Insert {
+            self.doc_mut().clamp_caret_to_line();
+        }
+        self.pane = Pane::Editor;
+        window.focus(&self.focus);
+        self.arm_blink(cx);
+        cx.notify();
     }
 
     /// Assemble the per-build inputs shared by every line. `window` shapes
@@ -3091,7 +3187,13 @@ impl Render for Editor {
                                 .collect()
                         })
                         .track_scroll(self.scroll.clone())
-                        .flex_1(),
+                        .flex_1()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                this.click_to_caret(ev.position, window, cx);
+                            }),
+                        ),
                     )
                     .child(
                         div()
@@ -3723,6 +3825,14 @@ fn line_text(rope: &ropey::Rope, i: usize) -> String {
     rope.line(i).chars().filter(|c| *c != '\n').collect()
 }
 
+/// Invert a conceal source→display byte map: the source byte displayed at
+/// `display_byte`. Dropped marker bytes collapse onto the display position of
+/// the next kept byte, so among equal map entries the last one is the kept
+/// char — the one a click on that display position means.
+fn display_to_source(map: &[usize], display_byte: usize) -> usize {
+    map.partition_point(|&m| m <= display_byte).saturating_sub(1)
+}
+
 /// Which columns of line `i` fall inside the selection char-range `[lo, hi)`.
 /// `to_eol` is set when the range reaches into this line's newline, so the
 /// highlight should fill past the last char (selected blank space / joined line).
@@ -3913,7 +4023,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, clip_row_highlight, fence_block, filter_items, find_matches, match_buffer,
+        caret_bytes, clip_row_highlight, display_to_source, fence_block, filter_items,
+        find_matches, match_buffer,
         next_match, heading_scale, rel_display, remap_highlight, resolve, resolve_link,
         row_decor, search_sensitive, segment_style, slice_segments, unique_dest, wrap_columns,
         Highlight, PickItem, RowDecor,
@@ -4079,6 +4190,21 @@ mod tests {
         assert_eq!(caret_bytes("aé", 1), (1, Some(3)));
         assert_eq!(caret_bytes("aé", 2), (3, None));
         assert_eq!(caret_bytes("", 0), (0, None));
+    }
+
+    #[test]
+    fn display_to_source_lands_on_kept_bytes() {
+        // "# Title" conceals to "Title": clicking display 0 must land on 'T'
+        // (source 2), not the dropped '#'; each later display byte maps 1:1;
+        // one past display end maps one past source end.
+        let rope = Rope::from_str("# Title\n");
+        let spans = markdown::parse(&rope);
+        let segs = markdown::flatten("# Title".len(), &spans[0]);
+        let c = markdown::conceal("# Title", &segs);
+        assert_eq!(c.text, "Title");
+        assert_eq!(display_to_source(&c.map, 0), 2);
+        assert_eq!(display_to_source(&c.map, 4), 6);
+        assert_eq!(display_to_source(&c.map, 5), 7);
     }
 
     #[test]
