@@ -1958,14 +1958,24 @@ impl Editor {
     /// every pulse the X server's own auto-repeat generates arrives here
     /// looking like a fresh press.
     ///
-    /// So a `KeyDown` for the stroke we're already repeating (`repeat_stroke`)
-    /// is treated as exactly that: an echo from the backend, not a new press,
-    /// and swallowed — `arm_key_repeat`'s own timer is what drives the
-    /// cadence from here. A deliberate second tap of the same key is never
-    /// swallowed because it's always preceded by a `KeyUp` (see `on_key_up`),
-    /// which clears `repeat_stroke` first.
+    /// So a `KeyDown` for the physical key we're already repeating
+    /// (`repeat_stroke`) is treated as exactly that: an echo from the
+    /// backend, not a new press, and swallowed — `arm_key_repeat`'s own timer
+    /// is what drives the cadence from here. A deliberate second tap of the
+    /// same key is never swallowed because it's always preceded by a `KeyUp`
+    /// (see `on_key_up`), which clears `repeat_stroke` first.
+    ///
+    /// Matching only compares `keystroke.key` (the physical key: `"a"`), not
+    /// the full `Keystroke` (which also carries `modifiers`/`key_char`).
+    /// Holding a chord like Shift-A and releasing the two keys in either
+    /// order changes what the `KeyUp`'s modifiers/`key_char` look like
+    /// (shift may already be up by the time `a` releases) — comparing the
+    /// full struct would then miss the match, leaving `repeat_stroke` set
+    /// forever and `A` repeating without end.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.key_repeat_interval > 0 && self.repeat_stroke.as_ref() == Some(&ev.keystroke) {
+        if self.key_repeat_interval > 0
+            && self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key)
+        {
             return;
         }
         self.handle_key(ev, window, cx);
@@ -1976,9 +1986,9 @@ impl Editor {
 
     /// A physical key release: stop repeating it, if it was the one
     /// repeating (only one stroke repeats at a time, so a `KeyUp` for
-    /// anything else is a no-op here).
+    /// anything else is a no-op here). Compares `key` only — see `on_key`.
     fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        if self.repeat_stroke.as_ref() == Some(&ev.keystroke) {
+        if self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key) {
             self.repeat_stroke = None;
             self.repeat_timer = None;
         }
