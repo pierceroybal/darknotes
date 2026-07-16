@@ -139,21 +139,8 @@ impl Scan {
         } else if let Some(marker_len) = list_marker(trimmed) {
             spans.push(Span { range: 0..len, kind: SpanKind::ListItem });
             spans.push(Span { range: indent..indent + marker_len, kind: SpanKind::Marker });
-            // GFM task box directly after the marker's space: `[ ]`/`[x]`,
-            // then a space or end-of-line.
-            let at = indent + marker_len + 1;
-            let rest = &text.as_bytes()[at..];
-            let checked = if rest.starts_with(b"[ ]") {
-                Some(false)
-            } else if rest.starts_with(b"[x]") || rest.starts_with(b"[X]") {
-                Some(true)
-            } else {
-                None
-            };
-            if let Some(checked) = checked {
-                if rest.get(3).map_or(true, |&b| b == b' ') {
-                    spans.push(Span { range: at..at + 3, kind: SpanKind::Task(checked) });
-                }
+            if let Some((at, checked)) = task_box(text) {
+                spans.push(Span { range: at..at + 3, kind: SpanKind::Task(checked) });
             }
         }
         scan_inline(text, &mut spans);
@@ -192,6 +179,24 @@ fn list_marker(trimmed: &str) -> Option<usize> {
 /// this to decide whether Tab shifts the whole line or inserts at the caret.
 pub fn is_list_item(line: &str) -> bool {
     list_marker(line.trim_start()).is_some()
+}
+
+/// The GFM task box on `line` (newline stripped): byte offset of its `[` and
+/// the checked state. A box is `[ ]`/`[x]`/`[X]` directly after a list
+/// marker's space, followed by a space or end-of-line. Shared by the span
+/// scanner, `Document::toggle_task`, and the editor's checkbox-click test.
+pub fn task_box(line: &str) -> Option<(usize, bool)> {
+    let trimmed = line.trim_start();
+    let at = (line.len() - trimmed.len()) + list_marker(trimmed)? + 1;
+    let rest = line.as_bytes().get(at..)?;
+    let checked = if rest.starts_with(b"[ ]") {
+        false
+    } else if rest.starts_with(b"[x]") || rest.starts_with(b"[X]") {
+        true
+    } else {
+        return None;
+    };
+    (rest.get(3).map_or(true, |&b| b == b' ')).then_some((at, checked))
 }
 
 /// Ordered-list item as `(number, digit count)`; `None` for unordered items
@@ -610,6 +615,17 @@ mod tests {
         let c = conceal(line, &segs);
         assert_eq!(c.text, line);
         assert!(c.segments.iter().any(|s| s.kind == Some(SpanKind::Task(false))));
+    }
+
+    #[test]
+    fn task_box_positions_and_state() {
+        assert_eq!(task_box("- [ ] a"), Some((2, false)));
+        assert_eq!(task_box("  - [x] a"), Some((4, true)));
+        assert_eq!(task_box("1. [X] a"), Some((3, true)));
+        assert_eq!(task_box("- [ ]"), Some((2, false))); // box ends the line
+        assert_eq!(task_box("- [y] a"), None);
+        assert_eq!(task_box("- [ ]x"), None); // needs a space after the box
+        assert_eq!(task_box("[ ] a"), None); // needs a list marker
     }
 
     #[test]

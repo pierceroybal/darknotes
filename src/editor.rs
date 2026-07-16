@@ -863,6 +863,27 @@ impl Editor {
         let x = pos.x - bounds.origin.x - gutter_w - pad + self.scroll_x.get();
         let byte_in_row = shaped.closest_index_for_x(x.max(Pixels::ZERO));
 
+        // A click on the painted task box toggles it, caret untouched. The
+        // row's cached segments are exactly what paint saw: a Task segment
+        // means a box was drawn over those bytes. A revealed line (caret
+        // line, fence reveal, markdown off) remaps Task→Marker at row build,
+        // so its raw `[ ]` takes the caret like any other text.
+        let mut seg_start = 0;
+        for seg in el.segments.iter() {
+            if byte_in_row < seg_start + seg.len {
+                if matches!(seg.kind, Some(SpanKind::Task(_))) {
+                    self.toggle_task(line);
+                    self.pane = Pane::Editor;
+                    window.focus(&self.focus);
+                    self.arm_blink(cx);
+                    cx.notify();
+                    return;
+                }
+                break;
+            }
+            seg_start += seg.len;
+        }
+
         // Byte within the line's display text: earlier rows are earlier
         // slices of it, so their lengths accumulate.
         let n = line_rows[line] as usize;
@@ -899,6 +920,19 @@ impl Editor {
         window.focus(&self.focus);
         self.arm_blink(cx);
         cx.notify();
+    }
+
+    /// Flip the task box on `line` (normal-mode Enter, a click on the box,
+    /// the `toggle-task` command). Checkpoint policy lives here: undo records
+    /// only when the line actually has a box, so a stray Enter on a plain
+    /// line never pushes a no-op undo step.
+    fn toggle_task(&mut self, line: usize) {
+        let on_box = self.doc().is_markdown()
+            && markdown::task_box(&line_text(&self.doc().rope, line)).is_some();
+        if on_box {
+            self.doc_mut().checkpoint();
+            self.doc_mut().toggle_task(line);
+        }
     }
 
     /// Assemble the per-build inputs shared by every line. `window` shapes
@@ -2315,6 +2349,10 @@ impl Editor {
             Action::BufferNext => self.buffer_next(window),
             Action::BufferPrev => self.buffer_prev(window),
             Action::FollowLink => self.follow_link(window, cx),
+            Action::ToggleTask => {
+                let line = self.doc().caret_line_col().0;
+                self.toggle_task(line);
+            }
         }
         // A delete can remove or merge list items; the surviving block renumbers.
         if renumbers && self.doc().is_markdown() {

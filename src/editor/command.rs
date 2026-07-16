@@ -161,6 +161,16 @@ pub(super) const COMMANDS: &[Command] = &[
         },
     },
     Command {
+        name: "toggle-task",
+        ex: &[],
+        takes_arg: false,
+        // Same flip as normal-mode Enter, for the palette and custom bindings.
+        run: |ed, _a, _win, _cx| {
+            let line = ed.doc().caret_line_col().0;
+            ed.toggle_task(line);
+        },
+    },
+    Command {
         name: "refresh",
         ex: &["refresh"],
         takes_arg: false,

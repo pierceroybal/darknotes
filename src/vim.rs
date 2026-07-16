@@ -60,6 +60,11 @@ pub enum Action {
     /// `gd`/`gf`/`gx`: follow the link under the caret (wikilink → note,
     /// URL → browser). Link detection lives in the editor.
     FollowLink,
+    /// Normal-mode Enter: flip the `[ ]`/`[x]` task box on the caret's line.
+    /// The editor owns detection (the grammar can't see buffer text) and
+    /// checkpoints undo only when a box is present — which is why this is
+    /// deliberately absent from `mutates()`.
+    ToggleTask,
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -405,6 +410,11 @@ impl Vim {
             }
             ("n", false) => vec![Action::SearchNext { reverse: false, count: self.take_count() }],
             ("n", true) => vec![Action::SearchNext { reverse: true, count: self.take_count() }],
+            // Enter: toggle the task box on the caret's line (no-op off one).
+            ("enter", _) => {
+                self.count = None;
+                vec![Action::ToggleTask]
+            }
             _ => {
                 self.count = None;
                 vec![]
@@ -709,6 +719,16 @@ mod tests {
     /// Default test grammar: 2-space tabs.
     fn vim() -> Vim {
         Vim::new(2)
+    }
+
+    #[test]
+    fn normal_enter_emits_toggle_task() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ToggleTask]);
+        // A pending count clears rather than leaking onto the next command.
+        assert!(v.on_key(&k("3")).is_empty());
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ToggleTask]);
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
     }
 
     #[test]

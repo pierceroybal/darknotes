@@ -418,6 +418,26 @@ impl Document {
         end
     }
 
+    /// Flip the GFM task box on `line` (`[ ]` ↔ `[x]`; `[X]` unchecks).
+    /// Markdown-only, like the other list conveniences. The caret stays put —
+    /// one char replaces one char, so every offset stays valid. Returns
+    /// whether a box was found and flipped.
+    pub fn toggle_task(&mut self, line: usize) -> bool {
+        if !self.is_markdown() || line >= self.rope.len_lines() {
+            return false;
+        }
+        let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
+        let Some((at, checked)) = markdown::task_box(&text) else {
+            return false;
+        };
+        // `at` is the `[`'s byte offset; the flipped char sits one past it.
+        let inner = self.rope.line_to_char(line) + text[..at].chars().count() + 1;
+        self.rope.remove(inner..inner + 1);
+        self.rope.insert(inner, if checked { " " } else { "x" });
+        self.touch();
+        true
+    }
+
     /// Backspace: remove the char before the caret (crosses lines).
     pub fn delete_backward(&mut self) {
         let at = self.caret();
@@ -1561,6 +1581,20 @@ mod tests {
         assert_eq!(d.caret_line_col(), (0, 0)); // caret drops to selection start
         d.paste(true); // p after caret
         assert_eq!(d.rope.to_string(), "aabcbcdef");
+    }
+
+    #[test]
+    fn toggle_task_flips_box_and_keeps_caret() {
+        let mut d = Document::new("- [ ] a\nplain\n  1. [X] b");
+        d.jump_to(6); // the 'a'
+        assert!(d.toggle_task(0));
+        assert_eq!(d.rope.line(0).to_string(), "- [x] a\n");
+        assert_eq!(d.caret_offset(), 6);
+        assert!(d.toggle_task(0));
+        assert_eq!(d.rope.line(0).to_string(), "- [ ] a\n");
+        assert!(!d.toggle_task(1)); // no box on a plain line
+        assert!(d.toggle_task(2)); // indented ordered item, capital X unchecks
+        assert_eq!(d.rope.line(2).to_string(), "  1. [ ] b");
     }
 
     #[test]
