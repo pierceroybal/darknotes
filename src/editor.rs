@@ -1958,24 +1958,29 @@ impl Editor {
     /// every pulse the X server's own auto-repeat generates arrives here
     /// looking like a fresh press.
     ///
-    /// So a `KeyDown` for the physical key we're already repeating
-    /// (`repeat_stroke`) is treated as exactly that: an echo from the
-    /// backend, not a new press, and swallowed — `arm_key_repeat`'s own timer
-    /// is what drives the cadence from here. A deliberate second tap of the
-    /// same key is never swallowed because it's always preceded by a `KeyUp`
-    /// (see `on_key_up`), which clears `repeat_stroke` first.
+    /// So a `KeyDown` while we're already repeating something (`repeat_stroke`
+    /// is `Some`) is treated as an echo from the backend, not a new press,
+    /// and swallowed — `arm_key_repeat`'s own timer is what drives the
+    /// cadence from here.
     ///
-    /// Matching only compares `keystroke.key` (the physical key: `"a"`), not
-    /// the full `Keystroke` (which also carries `modifiers`/`key_char`).
-    /// Holding a chord like Shift-A and releasing the two keys in either
-    /// order changes what the `KeyUp`'s modifiers/`key_char` look like
-    /// (shift may already be up by the time `a` releases) — comparing the
-    /// full struct would then miss the match, leaving `repeat_stroke` set
-    /// forever and `A` repeating without end.
+    /// Swallowing prefers `is_held`, the backend's own repeat flag, over
+    /// matching `keystroke.key` against what we stored: for a Shift-modified
+    /// symbol key (`;`/`:`, `1`/`!`, `,`/`<`, …) macOS folds Shift into `key`
+    /// itself rather than keeping it a separate modifier the way it does for
+    /// letters (`vim.rs`'s `motion` table relies on that letters-only split).
+    /// So if Shift comes up mid-hold before the base key does, the *next*
+    /// native repeat pulse for the still-held key reports a different `key`
+    /// than the original press did (`;` instead of `:`) — matching on `key`
+    /// alone would then misread that pulse as a brand-new keystroke,
+    /// inserting a stray character and restarting the repeat loop under the
+    /// new key. `is_held` sidesteps that entirely, since the backend already
+    /// knows it's a repeat regardless of what it renamed the key to. Only
+    /// X11 never sets `is_held` (`gpui`'s X11 backend hardcodes it to
+    /// `false`), so `key` is kept as a fallback for that backend alone.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.key_repeat_interval > 0
-            && self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key)
-        {
+        let same_key = self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key);
+        let is_echo = self.repeat_stroke.is_some() && (ev.is_held || same_key);
+        if self.key_repeat_interval > 0 && is_echo {
             return;
         }
         self.handle_key(ev, window, cx);
@@ -1984,14 +1989,20 @@ impl Editor {
         }
     }
 
-    /// A physical key release: stop repeating it, if it was the one
-    /// repeating (only one stroke repeats at a time, so a `KeyUp` for
-    /// anything else is a no-op here). Compares `key` only — see `on_key`.
-    fn on_key_up(&mut self, ev: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        if self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key) {
-            self.repeat_stroke = None;
-            self.repeat_timer = None;
-        }
+    /// A physical key released: whatever we're repeating is done. This
+    /// doesn't check *which* key came up against `repeat_stroke` — for the
+    /// same reason `on_key` prefers `is_held` over matching `key`, a
+    /// Shift-modified symbol's `KeyUp` can report a different `key` than its
+    /// `KeyDown` did. We only ever track one repeating key at a time, so any
+    /// `KeyUp` arriving while one is armed is overwhelmingly it being
+    /// released; the rare false positive (some other key tapped while this
+    /// one is still held) just costs one extra `on_key` "fresh press" — the
+    /// next native repeat pulse of the still-held key re-arms it correctly —
+    /// which is far cheaper than the alternative of a repeat that never
+    /// stops.
+    fn on_key_up(&mut self, _ev: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.repeat_stroke = None;
+        self.repeat_timer = None;
     }
 
     /// (Re)arm `stroke`'s auto-repeat: after `key_repeat_delay`, replay it
