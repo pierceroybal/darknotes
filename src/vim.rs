@@ -525,7 +525,12 @@ impl Vim {
 
         // Plain printable input (jk-style exit sequences are the keymap
         // layer's job, resolved in the editor before keys reach the grammar).
-        if !m.control && !m.platform && !m.alt {
+        // Tab/Enter are excluded even though gpui's macOS backend populates
+        // `key_char` for them (`\t`/`\n`) — its Linux backend doesn't, since
+        // both are control characters there. Matching on `key` instead of
+        // `key_char` keeps their smart-indent/newline handling below
+        // platform-independent instead of degrading to a literal char on Mac.
+        if !m.control && !m.platform && !m.alt && ks.key != "tab" && ks.key != "enter" {
             if let Some(s) = &ks.key_char {
                 return vec![Action::InsertText(s.clone())];
             }
@@ -1012,6 +1017,27 @@ mod tests {
             modifiers: Modifiers { shift: true, ..Default::default() },
         };
         assert_eq!(v.on_key(&shift_tab), vec![Action::Tab { width: 2, dedent: true }]);
+    }
+
+    #[test]
+    fn tab_and_enter_emit_actions_even_with_key_char_set() {
+        // gpui's macOS backend populates `key_char` ("\t"/"\n") for Tab/Enter,
+        // unlike its Linux backend — insert_key must match on `key`, not take
+        // the key_char fast path, or these degrade to a literal-char insert.
+        let mut v = vim();
+        v.on_key(&k("i"));
+        let mac_tab = Keystroke {
+            key: "tab".into(),
+            key_char: Some("\t".into()),
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(v.on_key(&mac_tab), vec![Action::Tab { width: 2, dedent: false }]);
+        let mac_enter = Keystroke {
+            key: "enter".into(),
+            key_char: Some("\n".into()),
+            modifiers: Modifiers::default(),
+        };
+        assert_eq!(v.on_key(&mac_enter), vec![Action::Newline { clear_empty: true }]);
     }
 
     #[test]
