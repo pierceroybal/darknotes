@@ -1265,6 +1265,20 @@ impl Editor {
         self.show_preview(Document::new(""), window);
     }
 
+    /// `:today` — open today's daily note, creating `daily/YYYY-MM-DD.md`
+    /// (seeded from `templates/daily.md` when present) on first use. Local
+    /// date, so the note rolls over at the user's midnight, not UTC's.
+    fn today(&mut self, window: &mut Window) {
+        let date = jiff::Zoned::now().date().to_string();
+        match create_daily(&self.vault.root, &date) {
+            Ok(path) => {
+                self.rescan_vault(); // the sidebar shows a first-of-the-day note immediately
+                self.open_path(path, window);
+            }
+            Err(e) => self.message = Some(format!("create failed: {e}")),
+        }
+    }
+
     /// Tab / `:b`-match display name: vault-relative path (`.md` dropped) for
     /// pathed buffers, `[No Name]` for scratch.
     fn buffer_display(&self, b: &Buffer) -> String {
@@ -2633,6 +2647,22 @@ fn open_or_empty(path: &Path) -> Document {
         eprintln!("darknotes: could not open {}: {e}", path.display());
         Document::new("")
     })
+}
+
+/// The daily note for `date` (`daily/{date}.md` under `root`), created if
+/// missing — seeded from `templates/daily.md` when that file exists, empty
+/// otherwise. An existing note is never touched.
+// ponytail: template is copied verbatim; variable substitution rides the
+// general templates feature when it lands.
+fn create_daily(root: &Path, date: &str) -> std::io::Result<PathBuf> {
+    let path = root.join("daily").join(format!("{date}.md"));
+    if !path.exists() {
+        let seed =
+            std::fs::read_to_string(root.join("templates/daily.md")).unwrap_or_default();
+        std::fs::create_dir_all(root.join("daily"))?;
+        std::fs::write(&path, seed)?;
+    }
+    Ok(path)
 }
 
 /// Vault-relative path of `path`, forward-slashed — the switcher match key and
@@ -4061,8 +4091,8 @@ fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, clip_row_highlight, display_to_source, fence_block, filter_items,
-        find_matches, match_buffer,
+        caret_bytes, clip_row_highlight, create_daily, display_to_source, fence_block,
+        filter_items, find_matches, match_buffer,
         next_match, heading_scale, rel_display, remap_highlight, resolve, resolve_link,
         row_decor, search_sensitive, segment_style, slice_segments, unique_dest, wrap_columns,
         Highlight, PickItem, RowDecor,
@@ -4072,6 +4102,31 @@ mod tests {
     use gpui::Hsla;
     use ropey::Rope;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn create_daily_seeds_from_template_and_keeps_existing() {
+        let root = std::env::temp_dir().join("darknotes_create_daily_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // No template: created empty, `daily/` made on the way.
+        let p = create_daily(&root, "2026-07-17").unwrap();
+        assert_eq!(p, root.join("daily").join("2026-07-17.md"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+
+        // An existing note is never overwritten.
+        std::fs::write(&p, "notes").unwrap();
+        create_daily(&root, "2026-07-17").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "notes");
+
+        // A template seeds new days verbatim.
+        std::fs::create_dir_all(root.join("templates")).unwrap();
+        std::fs::write(root.join("templates").join("daily.md"), "# Log\n").unwrap();
+        let p2 = create_daily(&root, "2026-07-18").unwrap();
+        assert_eq!(std::fs::read_to_string(&p2).unwrap(), "# Log\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn unique_dest_numbers_taken_names() {

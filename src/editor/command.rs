@@ -50,6 +50,12 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, _a, win, _cx| ed.enew(win),
     },
     Command {
+        name: "today",
+        ex: &["today"],
+        takes_arg: false,
+        run: |ed, _a, win, _cx| ed.today(win),
+    },
+    Command {
         name: "buffer",
         ex: &["b", "bu", "buffer"],
         takes_arg: true,

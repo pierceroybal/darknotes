@@ -10,6 +10,7 @@ perf = []
 
 [dependencies]
 gpui = "0.2"
+jiff = "0.2.32"
 notify = "8"
 nucleo-matcher = "0.3"
 ropey = "1"
