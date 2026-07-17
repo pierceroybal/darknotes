@@ -28,6 +28,9 @@ pub enum Action {
     /// Visual `>`/`<`: shift every selected line by `width` spaces (a count
     /// multiplies the width, vim's `2>`).
     IndentSelection { width: usize, dedent: bool },
+    /// Normal `>>`/`<<`: shift the caret's line plus `count - 1` below it by
+    /// `width` spaces (vim: the count names lines, not widths).
+    IndentLines { width: usize, dedent: bool, count: usize },
     /// Collapse the selection back to a caret (leaving visual mode).
     CollapseSelection,
     InsertText(String),
@@ -60,6 +63,10 @@ pub enum Action {
     /// `gd`/`gf`/`gx`: follow the link under the caret (wikilink → note,
     /// URL → browser). Link detection lives in the editor.
     FollowLink,
+    /// `gj`/`gk`: move one *visual* row (a wrapped line's rows count
+    /// individually). Resolved by the editor — only its row cache knows
+    /// wrap boundaries.
+    MoveDisplay { down: bool },
     /// Normal-mode Enter: flip the `[ ]`/`[x]` task box on the caret's line.
     /// The editor owns detection (the grammar can't see buffer text) and
     /// checkpoints undo only when a box is present — which is why this is
@@ -89,6 +96,7 @@ impl Action {
                 | Action::DeleteObject { .. }
                 | Action::DeleteSelection { .. }
                 | Action::IndentSelection { .. }
+                | Action::IndentLines { .. }
                 | Action::Paste { .. }
                 | Action::InsertText(..)
                 | Action::Newline { .. }
@@ -177,6 +185,8 @@ enum Pending {
     GPrefix,
     /// `z` was pressed; the next key completes a `z`-sequence (`zz`/`zt`/`zb`).
     ZPrefix,
+    /// `>`/`<` awaiting its double (`>>`/`<<`); any other key aborts.
+    Indent { dedent: bool },
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
@@ -315,6 +325,7 @@ impl Vim {
             Pending::Object { op, around } => return self.apply_object(op, around, key),
             Pending::GPrefix => return self.complete_g_prefix(key, shift),
             Pending::ZPrefix => return self.complete_z_prefix(key),
+            Pending::Indent { dedent } => return self.complete_indent(dedent, key),
             // Till is resolved above, before count parsing.
             Pending::Till { .. } | Pending::None => {}
         }
@@ -351,6 +362,10 @@ impl Vim {
             }
             ("c", false) => {
                 self.pending = Pending::Operator(Op::Change);
+                vec![]
+            }
+            (">", _) | ("<", _) => {
+                self.pending = Pending::Indent { dedent: key == "<" };
                 vec![]
             }
             ("y", true) => vec![Action::YankLines(self.take_count())], // Y == yy
@@ -645,16 +660,30 @@ impl Vim {
     }
 
     /// Complete a `g`-sequence: `gg` jumps to file start, `gt`/`gT` cycle
-    /// buffers, `gd`/`gf`/`gx` follow the link under the caret; anything else
-    /// aborts.
+    /// buffers, `gd`/`gf`/`gx` follow the link under the caret, `gj`/`gk`
+    /// move by visual row; anything else aborts.
     fn complete_g_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
-        self.count = None; // ponytail: `2gg`/`2gt` (go to line/tab N) ignored.
+        self.count = None; // ponytail: `2gg`/`2gt`/`3gj` (counts) ignored.
         match (key, shift) {
             ("g", _) => vec![Action::Move(Motion::FileStart, 1)],
             ("t", false) => vec![Action::BufferNext],
             ("t", true) => vec![Action::BufferPrev],
             ("d" | "f" | "x", false) => vec![Action::FollowLink],
+            ("j", false) => vec![Action::MoveDisplay { down: true }],
+            ("k", false) => vec![Action::MoveDisplay { down: false }],
             _ => vec![],
+        }
+    }
+
+    /// Complete `>`/`<`: the doubled key shifts `count` lines by one tab
+    /// width; anything else aborts. Motion targets (`>j`, `>ap`) wait until
+    /// they're missed.
+    fn complete_indent(&mut self, dedent: bool, key: &str) -> Vec<Action> {
+        let count = self.take_count();
+        if key == if dedent { "<" } else { ">" } {
+            vec![Action::IndentLines { width: self.tab_width, dedent, count }]
+        } else {
+            vec![]
         }
     }
 
@@ -1139,6 +1168,40 @@ mod tests {
             vec![Action::IndentSelection { width: 4, dedent: true }]
         );
         assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn double_indent_shifts_lines() {
+        // `>>` indents one line by tab_width; the count names lines (`3<<`).
+        let mut v = vim();
+        assert!(v.on_key(&shift(">", ">")).is_empty()); // awaiting the double
+        assert_eq!(
+            v.on_key(&shift(">", ">")),
+            vec![Action::IndentLines { width: 2, dedent: false, count: 1 }]
+        );
+
+        v.on_key(&k("3"));
+        v.on_key(&shift("<", "<"));
+        assert_eq!(
+            v.on_key(&shift("<", "<")),
+            vec![Action::IndentLines { width: 2, dedent: true, count: 3 }]
+        );
+
+        // A mismatched second key aborts, dropping the count with it.
+        let mut v = vim();
+        v.on_key(&k("3"));
+        v.on_key(&shift(">", ">"));
+        assert!(v.on_key(&shift("<", "<")).is_empty());
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
+    }
+
+    #[test]
+    fn gj_gk_move_by_display_row() {
+        let mut v = vim();
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true }]);
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("k")), vec![Action::MoveDisplay { down: false }]);
     }
 
     #[test]

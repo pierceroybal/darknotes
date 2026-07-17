@@ -890,24 +890,7 @@ impl Editor {
         let display_byte =
             rows[first..row].iter().map(|r| r.text.len()).sum::<usize>() + byte_in_row;
 
-        // Display byte → source char column. A revealed line (cursor line,
-        // fence reveal, markdown off) displays its source verbatim — compare
-        // instead of re-deriving reveal state. A concealed line re-runs the
-        // conceal for its source→display map and inverts it: the last source
-        // byte mapping at or before the display byte is the kept char there
-        // (dropped marker bytes collapse onto the *next* kept byte, so they
-        // sort before it and lose).
-        let src = line_text(&self.doc().rope, line);
-        let display: String = rows[first..first + n].iter().map(|r| r.text.as_ref()).collect();
-        let source_byte = if display == src {
-            display_byte
-        } else {
-            let spans = self.spans();
-            let segs = markdown::flatten(src.len(), spans.get(line).map_or(&[][..], Vec::as_slice));
-            display_to_source(&markdown::conceal(&src, &segs).map, display_byte)
-        };
-        let col = src[..source_byte.min(src.len())].chars().count();
-
+        let col = self.display_source_col(line, &rows[first..first + n], display_byte);
         let at = self.doc().rope.line_to_char(line) + col;
         if self.vim.mode != Mode::Insert {
             self.vim.reset();
@@ -920,6 +903,75 @@ impl Editor {
         window.focus(&self.focus);
         self.arm_blink(cx);
         cx.notify();
+    }
+
+    /// Byte offset within `line`'s display text (`line_rows` = its rendered
+    /// rows, in order) → source char column. A revealed line (cursor line,
+    /// fence reveal, markdown off) displays its source verbatim — compare
+    /// instead of re-deriving reveal state. A concealed line re-runs the
+    /// conceal for its source→display map and inverts it: the last source
+    /// byte mapping at or before the display byte is the kept char there
+    /// (dropped marker bytes collapse onto the *next* kept byte, so they
+    /// sort before it and lose).
+    fn display_source_col(
+        &mut self,
+        line: usize,
+        line_rows: &[LineElement],
+        display_byte: usize,
+    ) -> usize {
+        let src = line_text(&self.doc().rope, line);
+        let display: String = line_rows.iter().map(|r| r.text.as_ref()).collect();
+        let source_byte = if display == src {
+            display_byte
+        } else {
+            let spans = self.spans();
+            let segs = markdown::flatten(src.len(), spans.get(line).map_or(&[][..], Vec::as_slice));
+            display_to_source(&markdown::conceal(&src, &segs).map, display_byte)
+        };
+        src[..source_byte.min(src.len())].chars().count()
+    }
+
+    /// `gj`/`gk`: move the caret one *visual* row, keeping its column within
+    /// the row. Lives here rather than in `Document` because only the rows
+    /// cache knows wrap boundaries; the cache is current because the two
+    /// grammar keys (`g`, then `j`/`k`) moved nothing since the last render.
+    /// The column maps through the conceal machinery like a click, so landing
+    /// on a concealed line puts the caret on the source char displayed there.
+    // ponytail: no display goal column — each step re-derives the column
+    // from the caret, so a run of gj across a short row drifts left (vim
+    // would return to the goal column). Track one if it grates.
+    fn move_display(&mut self, down: bool) {
+        let Some(c) = &self.rows_cache else { return };
+        let (rows, line_rows, cur_row) = (c.rows.clone(), c.line_rows.clone(), c.cur_row);
+        let target = if down { cur_row + 1 } else { cur_row.wrapping_sub(1) };
+        if target >= rows.len() {
+            return; // first/last row (wrapping_sub underflows past the top)
+        }
+
+        // Char column within the caret's current row. Its line is revealed,
+        // so display chars are source chars.
+        let (line, col) = self.doc().caret_line_col();
+        let first: usize = line_rows[..line].iter().map(|&n| n as usize).sum();
+        let before: usize = rows[first..cur_row].iter().map(|r| r.text.chars().count()).sum();
+        let col_in_row = col.saturating_sub(before);
+
+        // Target row → its logical line + that line's first row.
+        let (mut tline, mut tfirst) = (0usize, 0usize);
+        while tline + 1 < line_rows.len() && tfirst + line_rows[tline] as usize <= target {
+            tfirst += line_rows[tline] as usize;
+            tline += 1;
+        }
+        // Same char column in the target row (clamped to its end), as a byte
+        // offset into the target line's display text.
+        let row = &rows[target];
+        let byte_in_row =
+            row.text.char_indices().nth(col_in_row).map_or(row.text.len(), |(b, _)| b);
+        let display_byte =
+            rows[tfirst..target].iter().map(|r| r.text.len()).sum::<usize>() + byte_in_row;
+        let n = line_rows[tline] as usize;
+        let tcol = self.display_source_col(tline, &rows[tfirst..tfirst + n], display_byte);
+        let at = self.doc().rope.line_to_char(tline) + tcol;
+        self.doc_mut().jump_to(at); // feed_vim clamps to the line after us
     }
 
     /// Flip the task box on `line` (normal-mode Enter, a click on the box,
@@ -2313,6 +2365,11 @@ impl Editor {
             Action::IndentSelection { width, dedent } => {
                 self.doc_mut().indent_selection(width, dedent)
             }
+            Action::IndentLines { width, dedent, count } => {
+                let line = self.doc().caret_line_col().0;
+                self.doc_mut().indent_lines(line, line + count - 1, width, dedent);
+            }
+            Action::MoveDisplay { down } => self.move_display(down),
             Action::CollapseSelection => self.doc_mut().collapse_selection(),
             Action::DeleteMotion(m, n) => self.doc_mut().delete_motion(m, n),
             Action::DeleteLines(n) => self.doc_mut().delete_lines(n),

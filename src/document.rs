@@ -530,14 +530,20 @@ impl Document {
         self.set_caret(start.min(self.rope.len_chars()));
     }
 
-    /// Visual `>`/`<`: shift every selected line right by `width` spaces, or
-    /// left by up to `width` leading spaces (`dedent`). Empty lines stay put
-    /// (vim behavior). Drops the caret on the first line's first non-blank,
-    /// collapsing the selection.
+    /// Visual `>`/`<`: shift every selected line, collapsing the selection.
     pub fn indent_selection(&mut self, width: usize, dedent: bool) {
         let r = self.selections[0].range();
         let l0 = self.rope.char_to_line(r.start);
         let l1 = self.rope.char_to_line(r.end);
+        self.indent_lines(l0, l1, width, dedent);
+    }
+
+    /// Shift lines `l0..=l1` (`l1` clamps to the buffer) right by `width`
+    /// spaces, or left by up to `width` leading spaces (`dedent`). Empty
+    /// lines stay put (vim behavior). Drops the caret on the first line's
+    /// first non-blank. Backs visual `>`/`<` and normal `>>`/`<<`.
+    pub fn indent_lines(&mut self, l0: usize, l1: usize, width: usize, dedent: bool) {
+        let l1 = l1.min(self.rope.len_lines().saturating_sub(1));
         // Bottom-up so earlier lines' char offsets stay valid mid-edit.
         for line in (l0..=l1).rev() {
             let start = self.rope.line_to_char(line);
@@ -1729,6 +1735,19 @@ mod tests {
         d.indent_selection(2, true);
         assert_eq!(d.rope.to_string(), "- a\n  - b");
         assert_eq!(d.caret_line_col(), (0, 0));
+    }
+
+    #[test]
+    fn indent_lines_shifts_line_range() {
+        // `>>`-style: an explicit line range, caret to l0's first non-blank.
+        let mut d = Document::new("- a\n- b\n- c");
+        d.indent_lines(0, 1, 2, false);
+        assert_eq!(d.rope.to_string(), "  - a\n  - b\n- c");
+        assert_eq!(d.caret_line_col(), (0, 2));
+
+        // A range past EOF clamps instead of panicking (`5>>` near the end).
+        d.indent_lines(2, 9, 2, true);
+        assert_eq!(d.rope.to_string(), "  - a\n  - b\n- c");
     }
 
     #[test]
