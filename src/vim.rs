@@ -72,6 +72,10 @@ pub enum Action {
     /// checkpoints undo only when a box is present — which is why this is
     /// deliberately absent from `mutates()`.
     ToggleTask,
+    /// `.`: replay the last change. The editor owns the recording (it sees
+    /// the applied actions, insert session included) and expands this before
+    /// dispatch; the grammar only names the request.
+    Repeat,
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -382,6 +386,11 @@ impl Vim {
             ("u", false) => {
                 self.count = None;
                 vec![Action::Undo]
+            }
+            // ponytail: count (`3.`) ignored — repeat once.
+            (".", _) => {
+                self.count = None;
+                vec![Action::Repeat]
             }
             ("i", false) => self.enter_insert(vec![]),
             ("i", true) => self.enter_insert(vec![Action::Move(Motion::LineStart, 1)]),
@@ -1034,6 +1043,16 @@ mod tests {
     fn u_undoes() {
         let mut v = vim();
         assert_eq!(v.on_key(&k("u")), vec![Action::Undo]);
+    }
+
+    #[test]
+    fn dot_emits_repeat() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&k(".")), vec![Action::Repeat]);
+        // A pending count is dropped, not leaked onto the next command.
+        v.on_key(&k("3"));
+        assert_eq!(v.on_key(&k(".")), vec![Action::Repeat]);
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
     }
 
     #[test]

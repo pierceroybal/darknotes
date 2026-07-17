@@ -235,6 +235,14 @@ pub struct Editor {
     /// when a `:bd` shifts indices.
     alternate: Option<usize>,
     vim: Vim,
+    /// The last completed change as its emitted actions — what `.` replays.
+    /// A change that entered insert mode carries the whole insert session
+    /// (recorded via `pending_change`, sealed when insert exits).
+    last_change: Option<Vec<Action>>,
+    /// Change being recorded while insert mode is open: the entering command's
+    /// actions, growing with each insert keystroke until exit seals it into
+    /// `last_change`.
+    pending_change: Option<Vec<Action>>,
     focus: FocusHandle,
     vault: Vault,
     /// Recursive watch on the vault root for external changes (an agent, a
@@ -434,6 +442,8 @@ impl Editor {
             active,
             alternate: None,
             vim,
+            last_change: None,
+            pending_change: None,
             focus: cx.focus_handle(),
             vault,
             watcher: None,
@@ -2295,7 +2305,13 @@ impl Editor {
         // command, or on entering insert (the whole insert session coalesces
         // into that one checkpoint).
         let mode_before = self.vim.mode;
-        let actions = self.vim.on_key(ks);
+        let mut actions = self.vim.on_key(ks);
+        // `.`: splice in the recorded last change. Everything below —
+        // checkpoint, register mirror, renumber, re-recording — then treats
+        // it exactly like freshly typed input.
+        if let [Action::Repeat] = actions[..] {
+            actions = self.last_change.clone().unwrap_or_default();
+        }
         let entering_insert = mode_before == Mode::Normal && self.vim.mode == Mode::Insert;
         // Checkpoint a single undoable unit. Insert-mode edits are excluded so the
         // whole session coalesces into the entering-insert checkpoint; everything
@@ -2303,6 +2319,24 @@ impl Editor {
         let mutates = mode_before != Mode::Insert && actions.iter().any(Action::mutates);
         if entering_insert || mutates {
             self.doc_mut().checkpoint();
+        }
+        // Record for `.`: a completed normal-mode change is repeatable as-is;
+        // one that enters insert keeps recording the session (typed text,
+        // exit nudge included) until insert exits and seals it.
+        // ponytail: visual-mode changes aren't recorded — vim's `.`-on-a-
+        // same-sized-region semantics need selection synthesis; add if missed.
+        match (mode_before, self.vim.mode) {
+            (Mode::Normal, Mode::Insert) => self.pending_change = Some(actions.clone()),
+            (Mode::Normal, _) if mutates => self.last_change = Some(actions.clone()),
+            (Mode::Insert, mode) => {
+                if let Some(rec) = &mut self.pending_change {
+                    rec.extend(actions.iter().cloned());
+                    if mode == Mode::Normal {
+                        self.last_change = self.pending_change.take();
+                    }
+                }
+            }
+            _ => {}
         }
         let wrote_register = actions.iter().any(Action::writes_register);
         for action in actions {
@@ -2424,6 +2458,9 @@ impl Editor {
                 let line = self.doc().caret_line_col().0;
                 self.toggle_task(line);
             }
+            // Expanded into the recorded change in `feed_vim`, before dispatch;
+            // never reaches here.
+            Action::Repeat => {}
         }
         // A delete can remove or merge list items; the surviving block renumbers.
         if renumbers && self.doc().is_markdown() {
