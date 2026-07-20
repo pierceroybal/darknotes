@@ -46,6 +46,10 @@ pub struct Theme {
     /// painted in `background`, so these must keep it readable.
     pub mode_insert: Hsla,
     pub mode_visual: Hsla,
+    /// VIEW (read-only posture) pill. Blue in every built-in palette — the
+    /// hue the other pills leave free (green insert, purple visual, amber
+    /// normal).
+    pub mode_view: Hsla,
 }
 
 impl Global for Theme {}
@@ -99,6 +103,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0x98c379).into(),
             mode_visual: rgb(0xc678dd).into(),
+            mode_view: rgb(0x61afef).into(),
         }
     }
 
@@ -128,6 +133,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0x87d96c).into(),
             mode_visual: rgb(0xdfbfff).into(),
+            mode_view: rgb(0x73d0ff).into(),
         }
     }
 
@@ -156,6 +162,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0x98bb6c).into(),
             mode_visual: rgb(0x957fb8).into(),
+            mode_view: rgb(0x7e9cd8).into(),
         }
     }
 
@@ -185,6 +192,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0xa7c080).into(),
             mode_visual: rgb(0xd699b6).into(),
+            mode_view: rgb(0x7fbbb3).into(),
         }
     }
 
@@ -214,6 +222,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0xa9b665).into(),
             mode_visual: rgb(0xd3869b).into(),
+            mode_view: rgb(0x7daea3).into(),
         }
     }
 
@@ -245,6 +254,7 @@ impl Theme {
             hover: hsla(0., 0., 1., 0.06),
             mode_insert: rgb(0xa6e3a1).into(),
             mode_visual: rgb(0xcba6f7).into(),
+            mode_view: rgb(0x89b4fa).into(),
         }
     }
 
@@ -273,6 +283,8 @@ impl Theme {
             hover: hsla(0., 0., 0., 0.05),
             mode_insert: rgb(0x3d8a3d).into(),
             mode_visual: rgb(0x8f4bab).into(),
+            // Dark enough that the near-white `background` pill text reads.
+            mode_view: rgb(0x2a6fb0).into(),
         }
     }
 }

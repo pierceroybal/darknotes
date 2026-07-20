@@ -48,6 +48,14 @@ pub enum Action {
     /// Reposition the viewport around the caret line (`zz`/`zt`/`zb`). The editor
     /// owns the scroll handle; the grammar only names the alignment.
     Scroll(Scroll),
+    /// `Ctrl-E`/`Ctrl-Y`: slide the viewport `count` visual rows down/up. The
+    /// caret stays put until the view would drop it, then it's pulled to the
+    /// nearest edge. Resolved by the editor — only its row cache knows visual
+    /// rows and viewport height.
+    ScrollLines { down: bool, count: usize },
+    /// `Ctrl-D`/`Ctrl-U`: half a viewport down/up, caret and view moving
+    /// together so the caret keeps its screen position.
+    ScrollHalf { down: bool },
     /// A submitted `:` command line (without the leading colon). The editor,
     /// not the grammar, decides what `w`/`q`/… mean.
     ExecuteCommand(String),
@@ -207,6 +215,11 @@ pub struct Vim {
     prompt: char,
     /// Tab width in spaces (markdown has no literal tabs).
     pub tab_width: usize,
+    /// Read-only reading posture (`:view`): `on_key` drops buffer-mutating
+    /// actions and makes insert entry a dead end, leaving navigation, yanks,
+    /// search, `:` commands, and task toggling live. A posture, not a mode —
+    /// it survives `reset()` (buffer switches) like config does.
+    pub view: bool,
 }
 
 impl Vim {
@@ -218,6 +231,7 @@ impl Vim {
             command: String::new(),
             prompt: ':',
             tab_width,
+            view: false,
         }
     }
 
@@ -260,13 +274,28 @@ impl Vim {
     }
 
     pub fn on_key(&mut self, ks: &Keystroke) -> Vec<Action> {
-        match self.mode {
+        let mut actions = match self.mode {
             Mode::Insert => self.insert_key(ks),
             Mode::Normal => self.normal_key(ks),
             Mode::Command => self.command_key(ks),
             Mode::Visual => self.visual_key(ks, false),
             Mode::VisualLine => self.visual_key(ks, true),
+        };
+        // View filter — the one choke point every mode's commands exit
+        // through. A command that would enter insert is a dead end (its setup
+        // motions drop with the rest). `mutates()` is maintained for undo
+        // checkpointing, so it already names every buffer-editing action;
+        // `Undo`/`Repeat` edit without being in it (undo applies history,
+        // repeat expands in the editor), so they're named here. `ToggleTask`
+        // passing through is deliberate: checking a box isn't editing.
+        if self.view {
+            if self.mode == Mode::Insert {
+                self.mode = Mode::Normal;
+                return vec![];
+            }
+            actions.retain(|a| !a.mutates() && !matches!(a, Action::Undo | Action::Repeat));
         }
+        actions
     }
 
     fn take_count(&mut self) -> usize {
@@ -284,13 +313,25 @@ impl Vim {
             return vec![];
         }
 
-        // Chord combos (Ctrl/Alt/Cmd) have no normal-mode vim command yet, and
-        // the editor intercepts the ones it cares about (Ctrl-S/N/P) first.
-        // Without this, `Ctrl-a` would fall through and trigger `a`.
+        // The viewport scrolls are the only chord commands; every other combo
+        // (Ctrl/Alt/Cmd) clears state and drops — the editor intercepts the
+        // chords it cares about (Ctrl-S/N/P) before the grammar, and without
+        // the drop `Ctrl-a` would fall through and trigger `a`.
         if m.control || m.alt || m.platform {
-            self.count = None;
             self.pending = Pending::None;
-            return vec![];
+            let acts = if m.control && !m.alt && !m.platform {
+                match key {
+                    "d" => vec![Action::ScrollHalf { down: true }],
+                    "u" => vec![Action::ScrollHalf { down: false }],
+                    "e" => vec![Action::ScrollLines { down: true, count: self.take_count() }],
+                    "y" => vec![Action::ScrollLines { down: false, count: self.take_count() }],
+                    _ => vec![],
+                }
+            } else {
+                vec![]
+            };
+            self.count = None;
+            return acts;
         }
 
         // A pending `t` target consumes this key as a literal char — before
@@ -1263,6 +1304,46 @@ mod tests {
         };
         assert!(v.on_key(&ctrl_a).is_empty());
         assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_scroll_commands() {
+        let mut v = vim();
+        let ctrl = |key: &str| Keystroke {
+            key: key.into(),
+            key_char: Some(key.into()),
+            modifiers: Modifiers { control: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&ctrl("d")), vec![Action::ScrollHalf { down: true }]);
+        assert_eq!(v.on_key(&ctrl("u")), vec![Action::ScrollHalf { down: false }]);
+        assert_eq!(v.on_key(&ctrl("e")), vec![Action::ScrollLines { down: true, count: 1 }]);
+        // A count multiplies the line scroll.
+        v.on_key(&k("3"));
+        assert_eq!(v.on_key(&ctrl("y")), vec![Action::ScrollLines { down: false, count: 3 }]);
+    }
+
+    #[test]
+    fn view_drops_mutations_keeps_navigation() {
+        let mut v = vim();
+        v.view = true;
+        // Navigation, task toggling, and scrolling stay live.
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ToggleTask]);
+        // Yanks stay live (copying while reading).
+        v.on_key(&k("y"));
+        assert_eq!(v.on_key(&k("y")), vec![Action::YankLines(1)]);
+        // Edits drop: x, p, u, dd.
+        assert!(v.on_key(&k("x")).is_empty());
+        assert!(v.on_key(&k("p")).is_empty());
+        assert!(v.on_key(&k("u")).is_empty());
+        v.on_key(&k("d"));
+        assert!(v.on_key(&k("d")).is_empty());
+        // Insert entry is a dead end: `o` emits nothing, mode stays normal.
+        assert!(v.on_key(&k("o")).is_empty());
+        assert_eq!(v.mode, Mode::Normal);
+        // The `:` prompt still works (it's how `:view` exits).
+        v.on_key(&k(":"));
+        assert_eq!(v.mode, Mode::Command);
     }
 
     #[test]

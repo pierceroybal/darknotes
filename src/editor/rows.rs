@@ -30,6 +30,8 @@ pub(super) struct RowsKey {
     pub(super) revision: u64,
     pub(super) caret: usize,
     pub(super) mode: Mode,
+    /// View posture: nothing reveals, the caret renders on concealed text.
+    pub(super) view: bool,
     /// Visual-mode selection span (`None` outside visual mode).
     pub(super) sel: Option<(usize, usize)>,
     /// The query whose matches are highlighted (incsearch preview or lit
@@ -65,6 +67,8 @@ pub(super) struct RowCtx {
     /// column budget for code-band lines, which wrap inside the band's border.
     pub(super) mono_band_cols: Option<usize>,
     pub(super) mode: Mode,
+    /// View posture: no line reveals its source, the cursor line included.
+    pub(super) view: bool,
     pub(super) cur_line: usize,
     pub(super) cur_col: usize,
     /// Fence lines of the block the caret sits in, revealed along with the
@@ -165,6 +169,7 @@ impl Editor {
             mono_cols: mono.map(|(c, _)| c),
             mono_band_cols: mono.map(|(_, c)| c),
             mode,
+            view: self.vim.view,
             cur_line,
             cur_col,
             reveal_fences,
@@ -238,11 +243,20 @@ impl Editor {
         // so caret geometry and scroll_x math never see a non-body size.
         // Scale is a pure function of the concealed segments — the same value
         // the wrap cache keys on — so cached boundaries stay consistent.
-        let revealed = i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i));
+        let revealed = !ctx.view && (i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i)));
+        let mut cur_col = ctx.cur_col;
         let (text, segments, selection, search, scale, decor) = if self.render_markdown
             && !revealed
         {
             let c = markdown::conceal(&text, &segs);
+            // View posture is the one way the *cursor* line renders
+            // concealed; its source caret column maps onto the display text
+            // like any highlight (source col → source byte → display byte →
+            // display char col).
+            if i == ctx.cur_line {
+                let d = c.map[caret_bytes(&text, cur_col).0];
+                cur_col = c.text[..d].chars().count();
+            }
             let selection = selection.and_then(|h| remap_highlight(h, &text, &c));
             let search =
                 search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
@@ -352,7 +366,7 @@ impl Editor {
         // The caret's row: the last row starting at or before its byte (a
         // byte on a boundary belongs to the row the boundary opens).
         let caret_row = (i == ctx.cur_line).then(|| {
-            let byte = caret_bytes(&text, ctx.cur_col).0;
+            let byte = caret_bytes(&text, cur_col).0;
             row_starts.partition_point(|&b| b <= byte) - 1
         });
 
@@ -385,7 +399,7 @@ impl Editor {
                 text: text[b0..b1].to_string().into(),
                 segments: slice_segments(&segments, b0, b1),
                 caret: (caret_row == Some(k)).then(|| LineCaret {
-                    col: ctx.cur_col - c0,
+                    col: cur_col - c0,
                     block: ctx.mode != Mode::Insert,
                 }),
                 selection: selection.and_then(|h| clip_row_highlight(h, c0, c1, k == last)),
@@ -441,6 +455,7 @@ pub(super) fn caret_only_change(old: &RowsKey, new: &RowsKey) -> bool {
     old.revision == new.revision
         && old.wrap_width == new.wrap_width
         && old.mode == new.mode
+        && old.view == new.view
         && old.sel.is_none()
         && new.sel.is_none()
         && old.q.is_empty()

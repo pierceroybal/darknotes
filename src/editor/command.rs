@@ -130,10 +130,24 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, _a, _win, _cx| ed.search.hl = false,
     },
     Command {
+        name: "view",
+        ex: &["view", "vw"],
+        takes_arg: false,
+        // Toggle the read-only reading posture: the grammar drops mutating
+        // commands (`Vim::view`), nothing reveals its concealed source
+        // (`rows.rs`), and task toggling stays live.
+        run: |ed, _a, _win, _cx| ed.vim.view = !ed.vim.view,
+    },
+    Command {
         name: "insert-link",
         ex: &[],
         takes_arg: false,
-        run: |ed, _a, _win, _cx| ed.open_insert_link_picker(),
+        // The picker inserts text on pick — a buffer edit, dead in view.
+        run: |ed, _a, _win, _cx| {
+            if !ed.vim.view {
+                ed.open_insert_link_picker()
+            }
+        },
     },
     Command {
         name: "open-file",
@@ -145,7 +159,13 @@ pub(super) const COMMANDS: &[Command] = &[
         name: "redo",
         ex: &[],
         takes_arg: false,
-        run: |ed, _a, _win, _cx| ed.doc_mut().redo(),
+        // A buffer edit, so dead in view posture (like `u`, which the
+        // grammar filters).
+        run: |ed, _a, _win, _cx| {
+            if !ed.vim.view {
+                ed.doc_mut().redo()
+            }
+        },
     },
     Command {
         name: "command-palette",

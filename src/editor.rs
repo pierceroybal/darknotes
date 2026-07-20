@@ -666,18 +666,28 @@ impl Editor {
     // would return to the goal column). Track one if it grates.
     fn move_display(&mut self, down: bool) {
         let Some(c) = &self.rows_cache else { return };
-        let (rows, line_rows, cur_row) = (c.rows.clone(), c.line_rows.clone(), c.cur_row);
-        let target = if down { cur_row + 1 } else { cur_row.wrapping_sub(1) };
-        if target >= rows.len() {
+        let target = if down { c.cur_row + 1 } else { c.cur_row.wrapping_sub(1) };
+        if target >= c.rows.len() {
             return; // first/last row (wrapping_sub underflows past the top)
         }
+        self.move_to_row(target);
+    }
 
-        // Char column within the caret's current row. Its line is revealed,
-        // so display chars are source chars.
-        let (line, col) = self.doc().caret_line_col();
-        let first: usize = line_rows[..line].iter().map(|&n| n as usize).sum();
-        let before: usize = rows[first..cur_row].iter().map(|r| r.text.chars().count()).sum();
-        let col_in_row = col.saturating_sub(before);
+    /// Land the caret on visual row `target` (clamped to the buffer), keeping
+    /// its display column — the shared engine under `gj`/`gk` and the
+    /// viewport scrolls.
+    fn move_to_row(&mut self, target: usize) {
+        let Some(c) = &self.rows_cache else { return };
+        let (rows, line_rows, cur_row) = (c.rows.clone(), c.line_rows.clone(), c.cur_row);
+        let target = target.min(rows.len() - 1);
+        if target == cur_row {
+            return;
+        }
+
+        // Display char column within the caret's row, read from the built row
+        // itself — correct whether the line rendered revealed (source text)
+        // or concealed (view mode remaps the caret at row build).
+        let col_in_row = rows[cur_row].caret.as_ref().map_or(0, |lc| lc.col);
 
         // Target row → its logical line + that line's first row.
         let (mut tline, mut tfirst) = (0usize, 0usize);
@@ -696,6 +706,60 @@ impl Editor {
         let tcol = self.display_source_col(tline, &rows[tfirst..tfirst + n], display_byte);
         let at = self.doc().rope.line_to_char(tline) + tcol;
         self.doc_mut().jump_to(at); // feed_vim clamps to the line after us
+    }
+
+    /// The editor list's fixed row height (tracks font size, same ratio the
+    /// render styles the list with).
+    fn line_h(&self) -> Pixels {
+        px(self.font_size * 22.0 / 15.0)
+    }
+
+    /// Rows that fit fully in the viewport (1 before first layout).
+    fn viewport_rows(&self, line_h: Pixels) -> usize {
+        self.scroll
+            .0
+            .borrow()
+            .last_item_size
+            .map_or(1, |s| (s.item.height / line_h).floor() as usize)
+            .max(1)
+    }
+
+    /// `Ctrl-E/Y/D/U`: slide the viewport `n` visual rows (negative = up).
+    /// `with_caret` (half-page) moves the caret the same distance so it keeps
+    /// its screen position; otherwise the caret stays put until the view
+    /// would drop it, then it's pulled to the nearest edge (vim's line-scroll
+    /// rule). The offset is written directly; the render's caret auto-scroll
+    /// only fires when the caret row moved and no-ops while it's visible, so
+    /// the two don't fight.
+    fn scroll_rows(&mut self, n: isize, with_caret: bool) {
+        let Some(c) = &self.rows_cache else { return };
+        let cur_row = c.cur_row;
+        let line_h = self.line_h();
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let mut off = handle.offset();
+        let floor = -handle.max_offset().height;
+        off.y = off.y - line_h * n as f32;
+        if off.y < floor {
+            off.y = floor;
+        }
+        if off.y > Pixels::ZERO {
+            off.y = Pixels::ZERO;
+        }
+        handle.set_offset(off);
+        if with_caret {
+            self.move_to_row(cur_row.saturating_add_signed(n));
+        } else {
+            let fit = self.viewport_rows(line_h);
+            // First fully visible row at the new offset (a fractional row at
+            // the top edge counts as hidden).
+            let top = (-off.y / line_h).ceil() as usize;
+            let bottom = top + fit - 1;
+            if cur_row < top {
+                self.move_to_row(top);
+            } else if cur_row > bottom {
+                self.move_to_row(bottom);
+            }
+        }
     }
 
     /// Flip the task box on `line` (normal-mode Enter, a click on the box,
@@ -1101,6 +1165,14 @@ impl Editor {
                 };
                 self.scroll.scroll_to_item_strict(self.last_row, strategy);
             }
+            Action::ScrollLines { down, count } => {
+                let n = count as isize;
+                self.scroll_rows(if down { n } else { -n }, false);
+            }
+            Action::ScrollHalf { down } => {
+                let n = (self.viewport_rows(self.line_h()) / 2).max(1) as isize;
+                self.scroll_rows(if down { n } else { -n }, true);
+            }
             Action::ExecuteCommand(cmd) => self.exec_command(&cmd, window, cx),
             Action::Search { query, backward } => self.do_search(query, backward),
             Action::SearchNext { reverse, count } => self.search_next(reverse, count),
@@ -1315,6 +1387,7 @@ impl Render for Editor {
             revision: self.doc().revision(),
             caret: self.doc().caret_offset(),
             mode: self.vim.mode,
+            view: self.vim.view,
             sel: self
                 .vim
                 .mode
@@ -1402,7 +1475,7 @@ impl Render for Editor {
         // moving up, clamped so the caret itself stays visible when a single
         // line wraps taller than the viewport. One scroll_to_item call only —
         // gpui keeps a single deferred scroll per frame, last call wins.
-        let line_h = px(self.font_size * 22.0 / 15.0);
+        let line_h = self.line_h();
         if self.center_on_render {
             self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center);
             self.center_on_render = false;
@@ -1411,14 +1484,7 @@ impl Render for Editor {
             let line = self.doc().rope.char_to_line(c.key.caret);
             let first: usize = c.line_rows[..line].iter().map(|&n| n as usize).sum();
             let last = first + c.line_rows[line] as usize - 1;
-            // Rows that fit fully in the viewport (1 before first layout).
-            let fit = self
-                .scroll
-                .0
-                .borrow()
-                .last_item_size
-                .map_or(1, |s| (s.item.height / line_h).floor() as usize)
-                .max(1);
+            let fit = self.viewport_rows(line_h);
             if cur_row > self.last_row {
                 let target = last.min(cur_row + fit - 1);
                 self.scroll.scroll_to_item(target, ScrollStrategy::Bottom);
@@ -1468,6 +1534,9 @@ impl Render for Editor {
                 Mode::Insert => ("INSERT", theme.mode_insert),
                 Mode::Visual => ("VISUAL", theme.mode_visual),
                 Mode::VisualLine => ("VISUAL LINE", theme.mode_visual),
+                // The read-only posture reads as its own mode, whatever the
+                // grammar mode underneath.
+                _ if self.vim.view => ("VIEW", theme.mode_view),
                 _ => ("NORMAL", theme.accent),
             };
             (Some(pill), self.message.clone().unwrap_or_default())
