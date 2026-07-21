@@ -2,6 +2,7 @@ mod buffers;
 mod command;
 mod line_element;
 mod picker;
+mod row_list;
 mod rows;
 mod search;
 mod sidebar;
@@ -23,11 +24,12 @@ use crate::keymap::{Ctx, Resolver};
 use buffers::{open_or_empty, rel_display, resolve, resolve_link, unique_dest, with_md_ext, Buffer};
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
-    caret_bytes, fence_block, heading_scale, row_decor, run, segments_to_runs, CaretPaint,
+    caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, CaretPaint,
     Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
 };
 use picker::Picker;
-use rows::{caret_only_change, RowsCache, RowsKey, ShapeWrapCache};
+use row_list::row_list;
+use rows::{caret_only_change, row_offsets, RowsCache, RowsKey, ShapeWrapCache};
 use search::{find_matches, search_sensitive, SearchState};
 use sidebar::{expand_ancestors, FilePrompt, PromptAction};
 use crate::markdown::{self, SpanKind};
@@ -544,20 +546,21 @@ impl Editor {
         if self.picker.is_some() || self.prompt.is_some() || self.vim.mode == Mode::Command {
             return;
         }
-        let (rows, line_rows) = match &self.rows_cache {
-            Some(c) => (c.rows.clone(), c.line_rows.clone()),
+        let (rows, line_rows, offsets) = match &self.rows_cache {
+            Some(c) => (c.rows.clone(), c.line_rows.clone(), c.offsets.clone()),
             None => return,
         };
         let (bounds, offset) = {
             let s = self.scroll.0.borrow();
             (s.base_handle.bounds(), s.base_handle.offset())
         };
-        // Same fixed ratio the render pass sets as the list's line height.
-        let line_h = px(self.font_size * 22.0 / 15.0);
-        // offset.y is ≤ 0 once scrolled; a click past EOF (overscroll rows)
-        // clamps to the last real row, vim-style.
+        // offset.y is ≤ 0 once scrolled; a click past EOF (the overscroll
+        // room) clamps to the last real row, vim-style.
         let y = pos.y - bounds.origin.y - offset.y;
-        let row = ((y / line_h) as usize).min(rows.len().saturating_sub(1));
+        let row = offsets
+            .partition_point(|&o| o <= y)
+            .saturating_sub(1)
+            .min(rows.len().saturating_sub(1));
         let Some(el) = rows.get(row) else { return };
 
         // Visual row → logical line + the line's first visual row.
@@ -708,20 +711,27 @@ impl Editor {
         self.doc_mut().jump_to(at); // feed_vim clamps to the line after us
     }
 
-    /// The editor list's fixed row height (tracks font size, same ratio the
-    /// render styles the list with).
+    /// The editor's base row height — a scale-1 body row (tracks font size,
+    /// same ratio the render styles the list with). Heading rows are taller:
+    /// `LineElement::height`, positioned by the rows cache's offset table.
     fn line_h(&self) -> Pixels {
         px(self.font_size * 22.0 / 15.0)
     }
 
-    /// Rows that fit fully in the viewport (1 before first layout).
-    fn viewport_rows(&self, line_h: Pixels) -> usize {
+    /// The editor viewport height (one base row before first layout).
+    fn viewport_h(&self) -> Pixels {
         self.scroll
             .0
             .borrow()
             .last_item_size
-            .map_or(1, |s| (s.item.height / line_h).floor() as usize)
-            .max(1)
+            .map_or(self.line_h(), |s| s.item.height)
+    }
+
+    /// *Base* rows that fit fully in the viewport (1 before first layout) —
+    /// the vim half-page distance. Heading rows are taller, so this
+    /// overcounts slightly across them; motions count lines anyway.
+    fn viewport_rows(&self, line_h: Pixels) -> usize {
+        ((self.viewport_h() / line_h).floor() as usize).max(1)
     }
 
     /// `Ctrl-E/Y/D/U`: slide the viewport `n` visual rows (negative = up).
@@ -734,10 +744,13 @@ impl Editor {
     fn scroll_rows(&mut self, n: isize, with_caret: bool) {
         let Some(c) = &self.rows_cache else { return };
         let cur_row = c.cur_row;
+        let offsets = c.offsets.clone();
         let line_h = self.line_h();
         let handle = self.scroll.0.borrow().base_handle.clone();
         let mut off = handle.offset();
         let floor = -handle.max_offset().height;
+        // The viewport slides in base-row steps; a taller heading row just
+        // takes two of them to clear, like a wrapped line takes two rows.
         off.y = off.y - line_h * n as f32;
         if off.y < floor {
             off.y = floor;
@@ -749,11 +762,12 @@ impl Editor {
         if with_caret {
             self.move_to_row(cur_row.saturating_add_signed(n));
         } else {
-            let fit = self.viewport_rows(line_h);
-            // First fully visible row at the new offset (a fractional row at
-            // the top edge counts as hidden).
-            let top = (-off.y / line_h).ceil() as usize;
-            let bottom = top + fit - 1;
+            // First and last fully visible rows at the new offset (a
+            // fraction of a row at either edge counts as hidden).
+            let (top_y, viewport) = (-off.y, self.viewport_h());
+            let top = offsets.partition_point(|&o| o < top_y);
+            let bottom = offsets.partition_point(|&o| o <= top_y + viewport).saturating_sub(2);
+            let bottom = bottom.max(top);
             if cur_row < top {
                 self.move_to_row(top);
             } else if cur_row > bottom {
@@ -1451,20 +1465,26 @@ impl Render for Editor {
                 let cur_row = c.line_rows[..new_line].iter().map(|&n| n as usize).sum::<usize>()
                     + caret_in_line;
                 let rows = Rc::new(rows);
-                self.rows_cache =
-                    Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows: c.line_rows });
+                let offsets = row_offsets(&rows, self.line_h());
+                self.rows_cache = Some(RowsCache {
+                    key,
+                    rows: rows.clone(),
+                    cur_row,
+                    line_rows: c.line_rows,
+                    offsets,
+                });
                 (rows, cur_row)
             }
             Plan::Full => {
                 let ctx = self.row_ctx(wrap_width, &theme, window);
                 let (rows, cur_row, line_rows) = self.build_rows(&ctx, window);
                 let rows = Rc::new(rows);
+                let offsets = row_offsets(&rows, self.line_h());
                 self.rows_cache =
-                    Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows });
+                    Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows, offsets });
                 (rows, cur_row)
             }
         };
-        let editor_row_count = lines.len();
 
         // Keep the caret on screen, but only when its row actually moved — so
         // the mouse wheel can scroll freely without snapping back every frame.
@@ -1472,24 +1492,35 @@ impl Render for Editor {
         // holds the old buffer's offset). Like vim, landing on a soft-wrapped
         // line pulls the whole line into view, not just the caret's row: the
         // scroll target is the line's last visual row moving down, its first
-        // moving up, clamped so the caret itself stays visible when a single
-        // line wraps taller than the viewport. One scroll_to_item call only —
-        // gpui keeps a single deferred scroll per frame, last call wins.
+        // moving up, clamped (in pixels, rows vary in height) so the caret
+        // itself stays visible when a single line runs taller than the
+        // viewport. One scroll_to_item call only — gpui keeps a single
+        // deferred scroll per frame, last call wins.
         let line_h = self.line_h();
         if self.center_on_render {
             self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center);
             self.center_on_render = false;
         } else if cur_row != self.last_row {
+            let viewport = self.viewport_h();
             let c = self.rows_cache.as_ref().unwrap();
             let line = self.doc().rope.char_to_line(c.key.caret);
             let first: usize = c.line_rows[..line].iter().map(|&n| n as usize).sum();
             let last = first + c.line_rows[line] as usize - 1;
-            let fit = self.viewport_rows(line_h);
+            let offs = &c.offsets;
             if cur_row > self.last_row {
-                let target = last.min(cur_row + fit - 1);
+                // Deepest row whose bottom edge keeps the caret row's top
+                // within one viewport when scrolled to the bottom.
+                let deep = offs
+                    .partition_point(|&o| o <= offs[cur_row] + viewport)
+                    .saturating_sub(2);
+                let target = last.min(deep.max(cur_row));
                 self.scroll.scroll_to_item(target, ScrollStrategy::Bottom);
             } else {
-                let target = first.max(cur_row.saturating_sub(fit - 1));
+                // Shallowest row whose top edge keeps the caret row's bottom
+                // within one viewport when scrolled to the top.
+                let shallow =
+                    offs.partition_point(|&o| o < offs[cur_row + 1] - viewport);
+                let target = first.max(shallow.min(cur_row));
                 self.scroll.scroll_to_item(target, ScrollStrategy::Top);
             }
         }
@@ -1518,8 +1549,6 @@ impl Render for Editor {
         }
 
         let mode = self.vim.mode;
-        let scroll_x = self.scroll_x.clone();
-        let caret_paint = self.caret_paint.clone();
 
         // Mode reads as a colored pill; command mode keeps the raw `:` prompt
         // and a file-op prompt shows its hint instead. The filename (and dirty
@@ -1578,18 +1607,6 @@ impl Render for Editor {
         let caret_h = px(self.font_size);
         let row_count = rows.len();
         let entity = cx.entity();
-
-        // Blank phantom lines past EOF give the list overscroll room, vim-style:
-        // `zz`/`zt` keep working near the bottom of the file, and the wheel can
-        // scroll until the last real line sits at the top of the viewport. Sized
-        // from the previous frame's viewport height (zero before first layout).
-        let overscroll = self
-            .scroll
-            .0
-            .borrow()
-            .last_item_size
-            .map_or(0, |s| (s.item.height / line_h).ceil() as usize)
-            .saturating_sub(1);
 
         div()
             .track_focus(&self.focus)
@@ -1786,29 +1803,12 @@ impl Render for Editor {
                     .flex_col()
                     .child(tabline)
                     .child(
-                        uniform_list("lines", editor_row_count + overscroll, move |range, _win, _cx| {
-                            range
-                                .map(|i| {
-                                    // Phantom overscroll row past EOF: blank, no gutter.
-                                    if i >= editor_row_count {
-                                        return LineElement {
-                                            text: "".into(),
-                                            segments: Vec::new(),
-                                            caret: None,
-                                            selection: None,
-                                            search: Vec::new(),
-                                            scroll_x: scroll_x.clone(),
-                                            caret_paint: caret_paint.clone(),
-                                            gutter: None,
-                                            follow_h: false,
-                                            scale: 1.0,
-                                            decor: None,
-                                        };
-                                    }
-                                    lines[i].clone()
-                                })
-                                .collect()
-                        })
+                        row_list(
+                            "lines",
+                            lines,
+                            self.rows_cache.as_ref().unwrap().offsets.clone(),
+                            line_h,
+                        )
                         .track_scroll(self.scroll.clone())
                         .flex_1()
                         .on_mouse_down(

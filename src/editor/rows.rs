@@ -1,5 +1,7 @@
-//! The visual-row pipeline: each logical line becomes one or more fixed-height
-//! `LineElement` rows, sliced at soft-wrap boundaries. Output is memoized
+//! The visual-row pipeline: each logical line becomes one or more
+//! `LineElement` rows, sliced at soft-wrap boundaries. Row heights are a pure
+//! function of each row's content (heading scale + top margin), tabulated
+//! into the offsets table `RowList` places rows by. Output is memoized
 //! against `RowsKey`; caret-only changes patch a small line set instead of
 //! rebuilding. Perf invariants live in docs/line-wrap.md — read before editing.
 //!
@@ -16,7 +18,7 @@ use crate::theme::Theme;
 use crate::vim::Mode;
 
 use super::{
-    caret_bytes, fence_block, find_matches, heading_scale, line_text, row_decor, run,
+    caret_bytes, fence_block, find_matches, heading_metrics, line_text, row_decor, run,
     search_sensitive, segments_to_runs, Editor, Highlight, LineCaret, LineElement, RowDecor,
     CODE_MARGIN, CODE_PAD,
 };
@@ -48,6 +50,25 @@ pub(super) struct RowsCache {
     pub(super) rows: Rc<Vec<LineElement>>,
     pub(super) cur_row: usize,
     pub(super) line_rows: Vec<u32>,
+    /// Each row's top edge, plus the total content height as the last entry
+    /// (`len == rows.len() + 1`) — the `RowList` placement table, also what
+    /// click/scroll math resolves y-coordinates against.
+    pub(super) offsets: Rc<Vec<Pixels>>,
+}
+
+/// Prefix-sum y offsets for `rows` (see `RowsCache::offsets`). Rebuilt
+/// whenever the rows do; scroll-only frames reuse the cached table.
+// ponytail: O(rows) adds per caret move (the patch path rebuilds it whole);
+// splice incrementally if a profile ever blames it.
+pub(super) fn row_offsets(rows: &[LineElement], line_h: Pixels) -> Rc<Vec<Pixels>> {
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    let mut y = Pixels::ZERO;
+    offsets.push(y);
+    for row in rows {
+        y += row.height(line_h);
+        offsets.push(y);
+    }
+    Rc::new(offsets)
 }
 
 /// Inputs to `append_line_rows` that are uniform across lines within one
@@ -59,6 +80,8 @@ pub(super) struct RowCtx {
     pub(super) theme: Theme,
     pub(super) font: Font,
     pub(super) font_size: Pixels,
+    /// Base (scale-1) row height; heading top margins are fractions of it.
+    pub(super) line_h: Pixels,
     pub(super) wrap_width: Option<Pixels>,
     /// Columns per row when the font probed monospace; the plain-ASCII
     /// column-walk wrap path.
@@ -165,6 +188,7 @@ impl Editor {
             theme: *theme,
             font,
             font_size,
+            line_h: self.line_h(),
             wrap_width,
             mono_cols: mono.map(|(c, _)| c),
             mono_band_cols: mono.map(|(_, c)| c),
@@ -183,8 +207,8 @@ impl Editor {
     /// index, and each logical line's row count. With soft-wrap on, a logical
     /// line becomes one element per wrapped row, its display text, styling
     /// segments, highlights, and caret sliced to each row. `LineElement`
-    /// stays a fixed-height single row, which is what keeps `uniform_list`'s
-    /// virtualization valid.
+    /// stays a single row of known height (`LineElement::height`), which is
+    /// what keeps `RowList`'s offset-table virtualization valid.
     ///
     /// Runs only when a `RowsKey` input changed beyond a caret move (render
     /// memoizes and caret moves patch single lines via `append_line_rows`).
@@ -238,14 +262,15 @@ impl Editor {
             .iter()
             .filter_map(|&(lo, hi)| line_highlight(&ctx.rope, i, lo, hi))
             .collect();
-        // Concealed heading lines shape larger inside the fixed line box.
-        // Concealed only: the cursor line (revealed source) keeps body size,
-        // so caret geometry and scroll_x math never see a non-body size.
-        // Scale is a pure function of the concealed segments — the same value
-        // the wrap cache keys on — so cached boundaries stay consistent.
+        // Heading lines shape larger in a taller row, the revealed cursor
+        // line included — its source segments carry `Heading` too, so both
+        // branches agree and row heights never change on a caret move (no
+        // layout shift as j/k crosses an H1). Scale/pad are pure functions
+        // of the segments the wrap cache keys on, so cached boundaries stay
+        // consistent. Markdown rendering off is all body size.
         let revealed = !ctx.view && (i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i)));
         let mut cur_col = ctx.cur_col;
-        let (text, segments, selection, search, scale, decor) = if self.render_markdown
+        let (text, segments, selection, search, (scale, pad), decor) = if self.render_markdown
             && !revealed
         {
             let c = markdown::conceal(&text, &segs);
@@ -260,14 +285,16 @@ impl Editor {
             let selection = selection.and_then(|h| remap_highlight(h, &text, &c));
             let search =
                 search.into_iter().filter_map(|h| remap_highlight(h, &text, &c)).collect();
-            let scale = heading_scale(&c.segments);
-            (c.text, c.segments, selection, search, scale, row_decor(&ctx.spans, i))
+            let metrics = heading_metrics(&c.segments);
+            (c.text, c.segments, selection, search, metrics, row_decor(&ctx.spans, i))
         } else {
             // Source view (revealed line, or markdown rendering off): a task
             // box's `[ ]` shows its source bytes styled like any other marker
             // instead of the transparent box span. The code band is the one
             // decoration that survives reveal — code text isn't concealed
             // anyway, and the block should read as one unit while edited.
+            let metrics =
+                if self.render_markdown { heading_metrics(&segs) } else { (1.0, 0.0) };
             let segs = segs
                 .into_iter()
                 .map(|s| match s.kind {
@@ -280,8 +307,11 @@ impl Editor {
                 .then(|| row_decor(&ctx.spans, i))
                 .flatten()
                 .filter(|d| matches!(d, RowDecor::CodeBand { .. }));
-            (text, segs, selection, search, 1.0, decor)
+            (text, segs, selection, search, metrics, decor)
         };
+        // Breathing room above a heading — on the line's first visual row
+        // only; wrapped continuation rows keep just the scaled box.
+        let pad_top = (ctx.line_h * pad).round();
 
         // Byte offset where each visual row starts: 0, plus one per wrap
         // boundary (the boundary glyph opens the next row). Plain ASCII
@@ -412,6 +442,7 @@ impl Editor {
                 gutter,
                 follow_h: ctx.wrap_width.is_none(),
                 scale,
+                pad_top: if k == 0 { pad_top } else { Pixels::ZERO },
                 // A wrapped band line closes its border only on its outermost
                 // visual rows; middle rows keep the sides running through.
                 decor: match decor {

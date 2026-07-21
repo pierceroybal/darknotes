@@ -1,6 +1,7 @@
-//! `LineElement`: the fixed-height visual-row element the editor list is
-//! made of — layout/paint for one wrapped row — plus the per-segment text
-//! styling (runs, heading scale, decor bands) it and the row builder share.
+//! `LineElement`: the visual-row element the editor list is made of —
+//! layout/paint for one wrapped row, at a height known from its content
+//! alone (`height`) — plus the per-segment text styling (runs, heading
+//! metrics, decor bands) it and the row builder share.
 //!
 //! A child module of `editor` so paint can reach private `Editor` state.
 
@@ -82,9 +83,14 @@ pub(super) struct LineElement {
     /// only. A wrapped row never overflows, and its caret reaching the right
     /// edge must not shift the pane. Only the caret row acts on it.
     pub(super) follow_h: bool,
-    /// Font-size multiplier for this row (concealed heading lines shape
-    /// larger). 1.0 everywhere else; the gutter always stays at body size.
+    /// Font-size multiplier for this row (heading lines shape larger, the
+    /// cursor line included). 1.0 everywhere else; the gutter always stays
+    /// at body size.
     pub(super) scale: f32,
+    /// Extra breathing room above the text — a heading line's first visual
+    /// row carries rendered markdown's top margin. Zero everywhere else.
+    /// Included in `height`; text and quads paint below it.
+    pub(super) pad_top: Pixels,
     /// Block-level paint decoration (code band / quote bar / rule hairline).
     /// `None` on the cursor line and with markdown rendering off.
     pub(super) decor: Option<RowDecor>,
@@ -108,6 +114,16 @@ pub(super) struct LinePrepaint {
     /// paints centered in it. `None` when the row has none (or shows source —
     /// those rows carry Marker, not Task).
     task: Option<(Pixels, Pixels, bool)>,
+}
+
+impl LineElement {
+    /// This row's height: the scaled line box plus the heading top margin,
+    /// rounded to whole pixels so abutting rows meet on crisp boundaries.
+    /// `RowList`'s offset table and `request_layout` must agree, so both
+    /// call this.
+    pub(super) fn height(&self, line_h: Pixels) -> Pixels {
+        (line_h * self.scale).round() + self.pad_top
+    }
 }
 
 impl IntoElement for LineElement {
@@ -138,7 +154,7 @@ impl Element for LineElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
+        style.size.height = self.height(window.line_height()).into();
         (window.request_layout(style, [], cx), ())
     }
 
@@ -280,12 +296,15 @@ impl Element for LineElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let line_height = window.line_height();
+        // The glyph box: the row minus any heading top margin. Text, quads,
+        // and the gutter all center in it, sitting below the pad.
+        let line_height = bounds.size.height - self.pad_top;
+        let oy = bounds.origin.y + self.pad_top;
         let theme = *cx.global::<Theme>();
         // The gutter sits flush left and never scrolls; paint it first, outside
         // the text's clip so scrolled text can't bleed over it.
         if let Some(gutter) = &prepaint.gutter {
-            let _ = gutter.paint(bounds.origin, line_height, window, cx);
+            let _ = gutter.paint(point(bounds.origin.x, oy), line_height, window, cx);
         }
         // Text starts past the gutter and shifts left by the horizontal scroll
         // offset; clip to the area right of the gutter so left-overflow stops at
@@ -354,14 +373,14 @@ impl Element for LineElement {
             // highlight, caret quad, the line, the inverted caret glyph, and
             // the task box over its transparent source bytes.
             for &(x, width) in &prepaint.search {
-                let origin = point(ox + x, bounds.origin.y);
+                let origin = point(ox + x, oy);
                 window.paint_quad(fill(
                     Bounds::new(origin, size(width, line_height)),
                     theme.search_match,
                 ));
             }
             if let Some((x, width)) = prepaint.selection {
-                let origin = point(ox + x, bounds.origin.y);
+                let origin = point(ox + x, oy);
                 window.paint_quad(fill(
                     Bounds::new(origin, size(width, line_height)),
                     theme.selection,
@@ -375,7 +394,7 @@ impl Element for LineElement {
                     } else {
                         theme.accent
                     };
-                    let origin = point(ox + x, bounds.origin.y);
+                    let origin = point(ox + x, oy);
                     window.paint_quad(fill(
                         Bounds::new(origin, size(width, line_height)),
                         color,
@@ -383,7 +402,7 @@ impl Element for LineElement {
                 }
             }
             let shaped = &prepaint.shaped;
-            let _ = shaped.paint(point(ox, bounds.origin.y), line_height, window, cx);
+            let _ = shaped.paint(point(ox, oy), line_height, window, cx);
             // A hidden caret's block quad isn't there, so keep the glyph in
             // its normal color instead of repainting it dark.
             if let Some((font_id, glyph_id, gx)) =
@@ -392,7 +411,7 @@ impl Element for LineElement {
                 // Match the baseline `ShapedLine::paint` uses: line is vertically
                 // centered, glyph sits on the baseline (`paint_glyph` y is baseline).
                 let padding_top = (line_height - shaped.ascent - shaped.descent) / 2.;
-                let baseline = point(ox + gx, bounds.origin.y + padding_top + shaped.ascent);
+                let baseline = point(ox + gx, oy + padding_top + shaped.ascent);
                 let _ =
                     window.paint_glyph(baseline, font_id, glyph_id, shaped.font_size, theme.background);
             }
@@ -405,7 +424,7 @@ impl Element for LineElement {
                 let b = Bounds::new(
                     point(
                         (ox + (x0 + x1 - s) / 2.).round(),
-                        (bounds.origin.y + (line_height - s) / 2.).round(),
+                        (oy + (line_height - s) / 2.).round(),
                     ),
                     size(s, s),
                 );
@@ -467,20 +486,22 @@ pub(super) fn segments_to_runs(
         .collect()
 }
 
-/// Font-size multiplier for a concealed line's segments: H1 1.2×, H2 1.1×,
-/// everything else (H3+ included) body size — the fixed 22/15 line box caps
-/// how large a row can shape. A heading whose every byte is covered by a
+/// `(font-size multiplier, top-margin factor in lines)` for a heading line's
+/// segments: H1 1.5×, H2 1.3×, H3 1.15×, everything else body size. H1/H2
+/// carry 0.6 of a line of breathing room above, H3 0.3 — applied to the
+/// line's first visual row only. A heading whose every byte is covered by a
 /// higher-priority span (e.g. `# **all bold**`) flattens with no Heading
 /// segment left and stays at body size — rare enough to ignore.
-pub(super) fn heading_scale(segments: &[Segment]) -> f32 {
+pub(super) fn heading_metrics(segments: &[Segment]) -> (f32, f32) {
     let level = segments.iter().find_map(|s| match s.kind {
         Some(SpanKind::Heading(n)) => Some(n),
         _ => None,
     });
     match level {
-        Some(1) => 1.2,
-        Some(2) => 1.1,
-        _ => 1.0,
+        Some(1) => (1.5, 0.6),
+        Some(2) => (1.3, 0.6),
+        Some(3) => (1.15, 0.3),
+        _ => (1.0, 0.0),
     }
 }
 
@@ -622,7 +643,7 @@ pub(super) fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, fence_block, heading_scale, row_decor, segment_style, RowDecor,
+        caret_bytes, fence_block, heading_metrics, row_decor, segment_style, RowDecor,
     };
     use crate::markdown::{self, SpanKind};
     use gpui::Hsla;
@@ -642,17 +663,18 @@ mod tests {
     }
 
     #[test]
-    fn heading_scale_steps_down_by_level() {
+    fn heading_metrics_step_down_by_level() {
         let seg = |kind| markdown::Segment { len: 4, kind };
-        assert_eq!(heading_scale(&[seg(Some(SpanKind::Heading(1)))]), 1.2);
+        assert_eq!(heading_metrics(&[seg(Some(SpanKind::Heading(1)))]), (1.5, 0.6));
         // Level wins even after inline spans (e.g. Strong) split the line.
         assert_eq!(
-            heading_scale(&[seg(Some(SpanKind::Heading(2))), seg(Some(SpanKind::Strong))]),
-            1.1
+            heading_metrics(&[seg(Some(SpanKind::Heading(2))), seg(Some(SpanKind::Strong))]),
+            (1.3, 0.6)
         );
-        assert_eq!(heading_scale(&[seg(Some(SpanKind::Heading(3)))]), 1.0);
-        assert_eq!(heading_scale(&[seg(None)]), 1.0);
-        assert_eq!(heading_scale(&[]), 1.0);
+        assert_eq!(heading_metrics(&[seg(Some(SpanKind::Heading(3)))]), (1.15, 0.3));
+        assert_eq!(heading_metrics(&[seg(Some(SpanKind::Heading(4)))]), (1.0, 0.0));
+        assert_eq!(heading_metrics(&[seg(None)]), (1.0, 0.0));
+        assert_eq!(heading_metrics(&[]), (1.0, 0.0));
     }
 
     #[test]
