@@ -430,7 +430,7 @@ impl Element for LineElement {
                 );
                 if checked {
                     window.paint_quad(fill(b, theme.accent).corner_radii(px(3.)));
-                    // Lucide check through the Phase-4 icon pipeline; its
+                    // Lucide check through the sidebar-icon asset pipeline; its
                     // 24-viewBox padding insets the stroke, so it paints
                     // across the full box.
                     let _ = window.paint_svg(
