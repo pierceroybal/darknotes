@@ -47,6 +47,11 @@ pub enum Motion {
     /// end of the current word (trailing whitespace and the newline stay);
     /// on whitespace it sweeps like `w`. Only the change operator emits it.
     ChangeWord,
+    /// `{`/`}`: to the previous/next empty line past the current paragraph
+    /// (file edge when none). Strict vim: whitespace-only lines are not
+    /// boundaries. From a blank line the motion first skips the blank run.
+    ParaBackward,
+    ParaForward,
     LineStart,
     LineEnd,
     FileStart,
@@ -1007,6 +1012,31 @@ impl Document {
                 let last = self.rope.len_lines().saturating_sub(1);
                 self.rope.line_to_char(last)
             }
+            Motion::ParaForward => {
+                let (mut line, _) = self.line_col_of(from);
+                let last = self.rope.len_lines().saturating_sub(1);
+                for _ in 0..count {
+                    while line < last && self.line_len_chars(line) == 0 {
+                        line += 1;
+                    }
+                    while line < last && self.line_len_chars(line) != 0 {
+                        line += 1;
+                    }
+                }
+                self.rope.line_to_char(line)
+            }
+            Motion::ParaBackward => {
+                let (mut line, _) = self.line_col_of(from);
+                for _ in 0..count {
+                    while line > 0 && self.line_len_chars(line) == 0 {
+                        line -= 1;
+                    }
+                    while line > 0 && self.line_len_chars(line) != 0 {
+                        line -= 1;
+                    }
+                }
+                self.rope.line_to_char(line)
+            }
             Motion::WordForward => {
                 let mut p = from;
                 for _ in 0..count {
@@ -1231,6 +1261,22 @@ mod tests {
         let d = Document::new("foo bar baz");
         assert_eq!(d.motion_target(Motion::WordForward, 0, 1), 4);
         assert_eq!(d.motion_target(Motion::WordForward, 0, 2), 8);
+    }
+
+    #[test]
+    fn paragraph_motions() {
+        // Lines: 0 "one", 1 "two", 2 "", 3 "three", 4 "", 5 "", 6 "four".
+        let d = Document::new("one\ntwo\n\nthree\n\n\nfour");
+        let at = |l: usize| d.rope.line_to_char(l);
+        assert_eq!(d.motion_target(Motion::ParaForward, 0, 1), at(2));
+        assert_eq!(d.motion_target(Motion::ParaForward, 0, 2), at(4));
+        // From a blank line: past the blank run and the next paragraph.
+        assert_eq!(d.motion_target(Motion::ParaForward, at(2), 1), at(4));
+        // No boundary left: clamp to the file edge.
+        assert_eq!(d.motion_target(Motion::ParaForward, at(6), 1), at(6));
+        assert_eq!(d.motion_target(Motion::ParaBackward, at(1), 1), 0);
+        assert_eq!(d.motion_target(Motion::ParaBackward, at(6), 1), at(5));
+        assert_eq!(d.motion_target(Motion::ParaBackward, at(5), 1), at(2));
     }
 
     #[test]

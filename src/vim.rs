@@ -772,6 +772,8 @@ fn motion(key: &str, shift: bool) -> Option<MotionSpec> {
         ("e", _) => (Motion::WordEnd, false),
         ("0", _) => (Motion::LineStart, true),
         ("$", _) => (Motion::LineEnd, true),
+        ("{", _) => (Motion::ParaBackward, true),
+        ("}", _) => (Motion::ParaForward, true),
         ("g", true) => (Motion::FileEnd, false),
         _ => return None,
     };
