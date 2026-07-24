@@ -1,8 +1,16 @@
 //! Performance instrumentation, active only with `--features perf` (the
 //! `cargo perf` alias). Without the feature every function here is an empty
 //! inline no-op, so debug and release builds carry no measurement code.
-//! Measurements print as `perf:`-prefixed lines on stderr; targets and how to
-//! read the output live in `docs/perf.md`.
+//! Measurements print as `perf:`-prefixed lines on stderr.
+//!
+//! Targets: cold startup under ~200ms to first frame, input latency sub-frame
+//! (< 16.7ms), idle memory in tens of MB rather than hundreds, idle CPU ~0%.
+//!
+//! Reading the numbers depends on the rig. Under WSLg without GPU passthrough
+//! the Vulkan driver is llvmpipe — software rendering — so every frame,
+//! memory, and CPU figure is a floor: a pass there holds on real hardware, but
+//! a miss may be llvmpipe's rather than the code's. Get a native datapoint
+//! before optimizing against one.
 
 #[cfg(feature = "perf")]
 pub use real::*;

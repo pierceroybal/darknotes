@@ -1,9 +1,27 @@
 //! The visual-row pipeline: each logical line becomes one or more
 //! `LineElement` rows, sliced at soft-wrap boundaries. Row heights are a pure
 //! function of each row's content (heading scale + top margin), tabulated
-//! into the offsets table `RowList` places rows by. Output is memoized
-//! against `RowsKey`; caret-only changes patch a small line set instead of
-//! rebuilding. Perf invariants live in docs/line-wrap.md — read before editing.
+//! into the offsets table `RowList` places rows by.
+//!
+//! Four perf invariants hold this together; each one has cost real frame time
+//! when broken:
+//!
+//! - Output is memoized against `RowsKey` — document revision, caret, mode,
+//!   selection span, highlight query, wrap width. Scroll-only frames rebuild
+//!   nothing. Anything new that changes row *content* belongs in that key.
+//! - A caret-only key change patches at most six lines — the old and new
+//!   cursor lines plus the fences their enclosing code blocks reveal — through
+//!   `append_line_rows`, spliced into `RowsCache.line_rows`. Visual-mode
+//!   sweeps and insert typing still take the full rebuild.
+//! - Plain-ASCII monospace lines get their wrap boundaries from
+//!   `wrap_columns`, a pure column walk with zero platform shaping. Only what
+//!   changes glyph advances — non-ASCII, tabs, bold — falls back to real
+//!   shaping, memoized in `ShapeWrapCache` by (text, segments). Decoration
+//!   that leaves advances alone must stay off that list: strikethrough paints
+//!   a rule and keeps the cheap walk.
+//! - `LineElement::height` stays a function of content alone. `RowList`
+//!   virtualizes from a prefix-sum offsets table and never lazily measures, so
+//!   a height that depends on caret or scroll state invalidates the table.
 //!
 //! A child module of `editor` so methods can touch private `Editor` state.
 

@@ -1,4 +1,5 @@
 [alias]
 # Perf build: release optimizations plus the in-app instrumentation that
-# plain --release strips. See docs/perf.md.
+# plain --release strips. Prints `perf:`-prefixed lines on stderr; the targets
+# they're read against, and the software-rendering caveat, are in `src/perf.rs`.
 perf = "run --release --features perf"
