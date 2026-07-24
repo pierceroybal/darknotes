@@ -38,6 +38,11 @@ pub enum SpanKind {
     Task(bool),
     /// Syntactic punctuation (`##`, `**`, backticks, bullets) — rendered muted.
     Marker,
+    /// `~~struck~~` content. Unlike every other kind this one claims no bytes:
+    /// `flatten` diverts it into `Segment::struck`, so a strike composes with
+    /// whatever the text also is (bold, a link, code) instead of replacing it.
+    /// Never appears in a `Segment::kind`.
+    Strike,
 }
 
 /// One styled stretch, in byte coordinates **within a single line** (matching
@@ -56,6 +61,9 @@ pub struct Span {
 pub struct Segment {
     pub len: usize,
     pub kind: Option<SpanKind>,
+    /// Struck through, orthogonal to `kind` — `SpanKind::Strike` and checked
+    /// task lines both set it, and it survives whatever kind won the bytes.
+    pub struck: bool,
 }
 
 /// Classify every line of the document into styled spans. Document-level because
@@ -141,6 +149,19 @@ impl Scan {
             spans.push(Span { range: indent..indent + marker_len, kind: SpanKind::Marker });
             if let Some((at, checked)) = task_box(text) {
                 spans.push(Span { range: at..at + 3, kind: SpanKind::Task(checked) });
+                // A checked item strikes its text. The range starts past the box
+                // — covering the `Task` bytes would rule through the painted
+                // checkbox — and stops at the last non-blank, so the line
+                // neither begins in the gap after the box nor trails past the
+                // text. `- [x]` with nothing after it gets no span.
+                if checked {
+                    let rest = &text[at + 3..];
+                    let body = at + 3 + (rest.len() - rest.trim_start().len());
+                    let end = at + 3 + rest.trim_end().len();
+                    if body < end {
+                        spans.push(Span { range: body..end, kind: SpanKind::Strike });
+                    }
+                }
             }
         }
         scan_inline(text, &mut spans);
@@ -240,20 +261,26 @@ pub fn list_continuation(line: &str) -> ListContinuation {
     ListContinuation::Item { prefix: format!("{indent}{next} "), empty }
 }
 
-/// Single left-to-right pass for inline `code`, `**strong**`, `[[wikilinks]]`,
-/// `[text](url)` links, and bare `http(s)://` URLs, emitting a `Marker` for
-/// each delimiter and the kind for the inner text. Positional scanning gives
-/// precedence to whatever opens first — a backtick consumes past any `[[` or
-/// URL inside it, so code spans stay literal. ASCII delimiters only, so
-/// scanning raw bytes is safe across multi-byte chars (continuation bytes are
-/// ≥ 0x80, never a delimiter byte).
+/// Single left-to-right pass for inline `code`, `**strong**`, `~~strike~~`,
+/// `[[wikilinks]]`, `[text](url)` links, and bare `http(s)://` URLs, emitting a
+/// `Marker` for each delimiter and the kind for the inner text. Positional
+/// scanning gives precedence to whatever opens first — a backtick consumes past
+/// any `[[` or URL inside it, so code spans stay literal. `~~` is the one arm
+/// that resumes inside its own run rather than past it, so strike composes with
+/// the emphasis nested in it. ASCII delimiters only, so scanning raw bytes is
+/// safe across multi-byte chars (continuation bytes are ≥ 0x80, never a
+/// delimiter byte).
 ///
-// ponytail: single `*`/`_` emphasis, escapes, and nesting are new SpanKind
-// cases here — model and renderer already handle them.
+// ponytail: single `*`/`_` emphasis and escapes are new SpanKind cases here —
+// model and renderer already handle them.
 fn scan_inline(text: &str, out: &mut Vec<Span>) {
     let b = text.as_bytes();
     let n = b.len();
     let mut i = 0;
+    // Where the open `~~` run closes, so the scan recognizes that delimiter as
+    // a closer rather than opening a second run at it — the `~~` arm keeps
+    // scanning *inside* its run, unlike the arms that jump past their content.
+    let mut strike_close = None;
     while i < n {
         if b[i] == b'`' {
             if let Some(end) = (i + 1..n).find(|&j| b[j] == b'`') {
@@ -273,6 +300,25 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 }
                 out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
                 i = end + 2;
+                continue;
+            }
+        } else if b[i] == b'~' && i + 1 < n && b[i + 1] == b'~' {
+            if strike_close == Some(i) {
+                strike_close = None; // this run's closer; its spans are out already
+                i += 2;
+                continue;
+            }
+            if let Some(end) = find_double(b, i + 2, b'~') {
+                out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
+                if end > i + 2 {
+                    out.push(Span { range: i + 2..end, kind: SpanKind::Strike });
+                }
+                out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
+                // Resume just past the opener, not past the run: `~~**x**~~`
+                // needs its inner delimiters scanned, and Strike claims no
+                // bytes so it can't collide with what they claim.
+                strike_close = Some(end);
+                i += 2;
                 continue;
             }
         } else if b[i] == b'[' && i + 1 < n && b[i + 1] == b'[' {
@@ -411,9 +457,16 @@ pub fn flatten(line_len: usize, spans: &[Span]) -> Vec<Segment> {
     // ponytail: O(line_len × spans) per-byte paint; lines are short. A sweep over
     // sorted boundaries if a pathological line ever shows up in a profile.
     let mut bytes: Vec<Option<SpanKind>> = vec![None; line_len];
+    let mut struck = vec![false; line_len];
     for s in spans {
         for byte in s.range.clone() {
             if byte >= line_len {
+                continue;
+            }
+            // Strike is a decoration, not a claim on the byte: it sets the bit
+            // and leaves the winning kind (and its color/weight) alone.
+            if s.kind == SpanKind::Strike {
+                struck[byte] = true;
                 continue;
             }
             bytes[byte] = Some(match bytes[byte] {
@@ -425,12 +478,12 @@ pub fn flatten(line_len: usize, spans: &[Span]) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < line_len {
-        let kind = bytes[i];
+        let (kind, st) = (bytes[i], struck[i]);
         let mut j = i + 1;
-        while j < line_len && bytes[j] == kind {
+        while j < line_len && bytes[j] == kind && struck[j] == st {
             j += 1;
         }
-        out.push(Segment { len: j - i, kind });
+        out.push(Segment { len: j - i, kind, struck: st });
         i = j;
     }
     out
@@ -496,6 +549,8 @@ fn keep_marker(marker: &str) -> bool {
 
 fn priority(k: SpanKind) -> u8 {
     match k {
+        // Never ranked — `flatten` diverts Strike into the struck bit first.
+        SpanKind::Strike => 0,
         SpanKind::Marker | SpanKind::Task(_) => 4,
         SpanKind::Strong | SpanKind::Code | SpanKind::Link => 3,
         SpanKind::CodeFence | SpanKind::CodeText => 2,
@@ -511,15 +566,19 @@ fn priority(k: SpanKind) -> u8 {
 mod tests {
     use super::*;
 
-    fn kind_at(segs: &[Segment], byte: usize) -> Option<SpanKind> {
+    fn seg_at(segs: &[Segment], byte: usize) -> Segment {
         let mut acc = 0;
         for s in segs {
             if byte < acc + s.len {
-                return s.kind;
+                return *s;
             }
             acc += s.len;
         }
-        None
+        Segment { len: 0, kind: None, struck: false }
+    }
+
+    fn kind_at(segs: &[Segment], byte: usize) -> Option<SpanKind> {
+        seg_at(segs, byte).kind
     }
 
     #[test]
@@ -618,6 +677,31 @@ mod tests {
     }
 
     #[test]
+    fn checked_tasks_strike_their_text_only() {
+        // "- [x] done  ": box at 2..5, text "done" at 6..10, trailing blanks.
+        let line = "- [x] done  ";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert!(seg_at(&segs, 6).struck); // 'd'
+        assert!(!seg_at(&segs, 5).struck); // gap after the box
+        assert!(!seg_at(&segs, 10).struck); // trailing blank
+        // The box itself is never struck — a rule there crosses the painted
+        // checkbox drawn over these bytes.
+        assert!(!seg_at(&segs, 3).struck);
+
+        // Unchecked items are untouched; so is a box with no text after it.
+        for line in ["- [ ] todo", "- [x]"] {
+            let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+            assert!(!segs.iter().any(|s| s.struck), "{line}");
+        }
+
+        // Strike composes: the wikilink keeps its Link kind and gains the rule.
+        let line = "- [x] read [[note]]";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(kind_at(&segs, 13), Some(SpanKind::Link)); // 'n' of note
+        assert!(seg_at(&segs, 13).struck);
+    }
+
+    #[test]
     fn task_box_positions_and_state() {
         assert_eq!(task_box("- [ ] a"), Some((2, false)));
         assert_eq!(task_box("  - [x] a"), Some((4, true)));
@@ -700,6 +784,37 @@ mod tests {
         assert!(spans[1].iter().any(|s| s.kind == SpanKind::CodeFence));
         assert!(spans[2].iter().any(|s| s.kind == SpanKind::CodeText));
         assert!(spans[3].iter().any(|s| s.kind == SpanKind::CodeFence));
+    }
+
+    #[test]
+    fn strike_composes_with_nested_spans_and_stops_at_its_run() {
+        //  0123456789..                     1        2
+        //  ~~**bold**~~ and ~~plain~~   →  byte 13 = 'a' of "and"
+        let line = "~~**bold**~~ and ~~plain~~";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        // Strike sets the bit without claiming bytes, so the nested `**` still
+        // wins its kind: "bold" is Strong *and* struck.
+        assert_eq!(kind_at(&segs, 4), Some(SpanKind::Strong));
+        assert!(seg_at(&segs, 4).struck);
+        // Text between two runs stays unstruck — the closing `~~` must not read
+        // as an opener for the next one.
+        assert!(!seg_at(&segs, 13).struck);
+        assert!(seg_at(&segs, 19).struck && kind_at(&segs, 19).is_none()); // "plain"
+        // `~~` and the inner `**` conceal; the strike rides the surviving text.
+        let c = conceal(line, &segs);
+        assert_eq!(c.text, "bold and plain");
+        assert_eq!(c.segments.iter().map(|s| s.len).sum::<usize>(), c.text.len());
+        assert!(seg_at(&c.segments, 0).struck); // 'b' of bold
+        assert!(!seg_at(&c.segments, 5).struck); // 'a' of and
+    }
+
+    #[test]
+    fn unclosed_and_empty_strike_stay_literal() {
+        for line in ["~~oops", "a ~~ b"] {
+            let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+            assert!(!segs.iter().any(|s| s.struck), "{line}");
+            assert_eq!(conceal(line, &segs).text, line, "{line}");
+        }
     }
 
     #[test]

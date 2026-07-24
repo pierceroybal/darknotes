@@ -11,8 +11,8 @@ use std::rc::Rc;
 use gpui::{
     fill, outline, point, prelude::*, px, relative, size, App, BorderStyle, Bounds, ContentMask,
     Corners, Edges, Font, FontId, FontStyle, FontWeight, GlobalElementId, GlyphId, Hsla,
-    InspectorElementId, LayoutId, Pixels, ShapedLine, SharedString, Style, TextRun,
-    TransformationMatrix, Window,
+    InspectorElementId, LayoutId, Pixels, ShapedLine, SharedString, StrikethroughStyle, Style,
+    TextRun, TransformationMatrix, Window,
 };
 
 use crate::markdown::{Segment, Span, SpanKind};
@@ -481,7 +481,12 @@ pub(super) fn segments_to_runs(
             let mut font = font.clone();
             font.weight = weight;
             font.style = style;
-            TextRun { len: seg.len, font, color, background_color, underline: None, strikethrough: None }
+            // `color: None` takes the run's own color, so a struck link keeps
+            // its rule in link color.
+            let strikethrough = seg
+                .struck
+                .then(|| StrikethroughStyle { thickness: px(1.), color: None });
+            TextRun { len: seg.len, font, color, background_color, underline: None, strikethrough }
         })
         .collect()
 }
@@ -603,7 +608,8 @@ fn segment_style(
         // shape (reserving the box's width in the layout) but paint
         // transparent. Source view remaps Task to Marker before this runs.
         SpanKind::Task(_) => (Hsla { a: 0., ..fg }, FontWeight::NORMAL, FontStyle::Normal, None),
-        SpanKind::ListItem => normal,
+        // Strike never reaches a segment's kind — it lives in `Segment::struck`.
+        SpanKind::ListItem | SpanKind::Strike => normal,
     }
 }
 
@@ -664,7 +670,7 @@ mod tests {
 
     #[test]
     fn heading_metrics_step_down_by_level() {
-        let seg = |kind| markdown::Segment { len: 4, kind };
+        let seg = |kind| markdown::Segment { len: 4, kind, struck: false };
         assert_eq!(heading_metrics(&[seg(Some(SpanKind::Heading(1)))]), (1.5, 0.6));
         // Level wins even after inline spans (e.g. Strong) split the line.
         assert_eq!(

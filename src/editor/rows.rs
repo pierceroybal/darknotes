@@ -522,7 +522,7 @@ fn wrap_columns(text: &str, cols: usize) -> Vec<usize> {
 }
 
 /// Slice a line's styling segments down to the byte range `[b0, b1)` of one
-/// wrapped visual row. Kinds are kept; lengths clip to the range.
+/// wrapped visual row. Kinds and decoration are kept; lengths clip to the range.
 fn slice_segments(segments: &[Segment], b0: usize, b1: usize) -> Vec<Segment> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -531,7 +531,7 @@ fn slice_segments(segments: &[Segment], b0: usize, b1: usize) -> Vec<Segment> {
         pos = e;
         let (a, b) = (s.max(b0), e.min(b1));
         if a < b {
-            out.push(Segment { len: b - a, kind: seg.kind });
+            out.push(Segment { len: b - a, ..*seg });
         }
     }
     out
@@ -591,13 +591,17 @@ mod tests {
     fn slice_segments_clips_to_row_range() {
         use markdown::Segment;
         let segs = vec![
-            Segment { len: 3, kind: Some(SpanKind::Marker) },
-            Segment { len: 5, kind: None },
+            Segment { len: 3, kind: Some(SpanKind::Marker), struck: false },
+            Segment { len: 5, kind: None, struck: true },
         ];
-        // Row [2, 6): one byte of the marker, three of the body.
+        // Row [2, 6): one byte of the marker, three of the body. A clipped
+        // segment keeps its decoration, so strike survives a wrap boundary.
         assert_eq!(
             slice_segments(&segs, 2, 6),
-            vec![Segment { len: 1, kind: Some(SpanKind::Marker) }, Segment { len: 3, kind: None }]
+            vec![
+                Segment { len: 1, kind: Some(SpanKind::Marker), struck: false },
+                Segment { len: 3, kind: None, struck: true },
+            ]
         );
         // A row past the segments' end is unstyled.
         assert!(slice_segments(&segs, 8, 12).is_empty());
