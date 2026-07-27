@@ -20,11 +20,20 @@ pub enum Action {
     /// objects and is followed by insert mode).
     DeleteObject { obj: TextObject, change: bool },
     YankObject(TextObject),
+    /// Visual-mode `i`/`a` (`viw`, `va(`): select the object around the caret.
+    SelectObject(TextObject),
     /// `p` (after) / `P` (before).
     Paste { after: bool },
-    /// Visual-mode `d`/`x`/`y` over the current selection.
-    DeleteSelection { linewise: bool },
+    /// Visual-mode `d`/`x`/`y`/`c` over the current selection. `change` (`c`)
+    /// spares a linewise span's last newline and is followed by insert mode.
+    DeleteSelection { linewise: bool, change: bool },
     YankSelection { linewise: bool },
+    /// `J` (`space`) / `gJ`: join `count` lines into one.
+    JoinLines { count: usize, space: bool },
+    /// `r{char}`: overwrite `count` chars at the caret.
+    ReplaceChar(char, usize),
+    /// `~`: flip the case of `count` chars at the caret.
+    ToggleCase(usize),
     /// Visual `>`/`<`: shift every selected line by `width` spaces (a count
     /// multiplies the width, vim's `2>`).
     IndentSelection { width: usize, dedent: bool },
@@ -109,6 +118,9 @@ impl Action {
                 | Action::DeleteSelection { .. }
                 | Action::IndentSelection { .. }
                 | Action::IndentLines { .. }
+                | Action::JoinLines { .. }
+                | Action::ReplaceChar(..)
+                | Action::ToggleCase(..)
                 | Action::Paste { .. }
                 | Action::InsertText(..)
                 | Action::Newline { .. }
@@ -150,6 +162,8 @@ impl Action {
                 | Action::DeleteCharUnder(..)
                 | Action::DeleteObject { .. }
                 | Action::DeleteSelection { .. }
+                // A join can merge two list items into one.
+                | Action::JoinLines { .. }
         )
     }
 }
@@ -186,13 +200,18 @@ enum Pending {
     None,
     /// An operator (`d`/`y`/`c`) awaiting its motion, or a doubled key (`dd`).
     Operator(Op),
-    /// An operator saw `t`; the next key is the literal target char
-    /// (`ct{char}`/`dt{char}`). Carries the count since `apply_operator`
-    /// consumed it when `t` arrived.
-    Till { op: Op, count: usize },
-    /// An operator saw `i`/`a`; the next key names the text object
-    /// (`diw`, `cap`, …).
-    Object { op: Op, around: bool },
+    /// `f`/`F`/`t`/`T` was pressed; the next key is the literal target char.
+    /// `make` builds the motion from it, so the four keys differ only by which
+    /// constructor they park here. `op` is `None` for a bare motion (normal or
+    /// visual mode); the count rides along because whoever armed this consumed
+    /// it.
+    Find { make: fn(char) -> Motion, op: Option<Op>, count: usize },
+    /// `r` was pressed; the next key is the literal replacement char.
+    Replace { count: usize },
+    /// `i`/`a` was pressed; the next key names the text object (`diw`, `cap`,
+    /// `vi(`). `op` is `None` in visual mode, where the object becomes the
+    /// selection instead of an operator's target.
+    Object { op: Option<Op>, around: bool },
     /// `g` was pressed; the next key completes a `g`-sequence (`gg`).
     GPrefix,
     /// `z` was pressed; the next key completes a `z`-sequence (`zz`/`zt`/`zb`).
@@ -215,6 +234,10 @@ pub struct Vim {
     prompt: char,
     /// Tab width in spaces (markdown has no literal tabs).
     pub tab_width: usize,
+    /// The last `f`/`F`/`t`/`T` motion, with its target char, for `;`/`,` to
+    /// repeat. Survives `reset()` (buffer switches) like the settings do —
+    /// vim's `;` reaches across windows too.
+    last_find: Option<Motion>,
     /// Read-only reading posture (`:view`): `on_key` drops buffer-mutating
     /// actions and makes insert entry a dead end, leaving navigation, yanks,
     /// search, `:` commands, and task toggling live. A posture, not a mode —
@@ -231,6 +254,7 @@ impl Vim {
             command: String::new(),
             prompt: ':',
             tab_width,
+            last_find: None,
             view: false,
         }
     }
@@ -334,21 +358,11 @@ impl Vim {
             return acts;
         }
 
-        // A pending `t` target consumes this key as a literal char — before
-        // count parsing, so `dt3` reads `3` as the target, not a count.
-        if let Pending::Till { op, count } = self.pending {
-            self.pending = Pending::None;
-            // `key_char` is the typed char (shift applied); keys that don't
-            // produce one (arrows, enter, …) abort the operator.
-            let Some(ch) = ks.key_char.as_ref().and_then(|s| s.chars().next()) else {
-                return vec![];
-            };
-            let till = Motion::TillChar(ch);
-            return match op {
-                Op::Delete => vec![Action::DeleteMotion(till, count)],
-                Op::Yank => vec![Action::YankMotion(till, count)],
-                Op::Change => self.enter_insert(vec![Action::DeleteMotion(till, count)]),
-            };
+        // A pending literal-char state (`f`/`t`'s target, `r`'s replacement)
+        // consumes this key before count parsing, so `dt3` reads the `3` as the
+        // target rather than as a count.
+        if let Some(actions) = self.resolve_literal(ks) {
+            return actions;
         }
 
         // Count digits. '0' counts only mid-count; with no count pending it's the
@@ -367,19 +381,26 @@ impl Vim {
         // An active sequence (operator-pending, `g`-prefix) consumes this key.
         match std::mem::replace(&mut self.pending, Pending::None) {
             Pending::Operator(op) => return self.apply_operator(op, key, shift),
-            Pending::Object { op, around } => return self.apply_object(op, around, key),
+            Pending::Object { op, around } => {
+                return self.apply_object(op, around, key, shift)
+            }
             Pending::GPrefix => return self.complete_g_prefix(key, shift),
             Pending::ZPrefix => return self.complete_z_prefix(key),
             Pending::Indent { dedent } => return self.complete_indent(dedent, key),
-            // Till is resolved above, before count parsing.
-            Pending::Till { .. } | Pending::None => {}
+            // Resolved above, before count parsing.
+            Pending::Find { .. } | Pending::Replace { .. } | Pending::None => {}
         }
 
         // Motions come from one table shared with visual and operator-pending;
         // letters arrive lowercased with `shift` separate, so capitals match as
         // (key, true).
         if let Some(spec) = motion(key, shift) {
-            return vec![Action::Move(spec.motion, self.take_count())];
+            return self.move_action(spec.motion);
+        }
+        // `f`/`F`/`t`/`T`: the next key is the target char.
+        if let Some(make) = find_ctor(key, shift) {
+            self.pending = Pending::Find { make, op: None, count: self.take_count() };
+            return vec![];
         }
         match (key, shift) {
             // `g` starts a sequence (`gg`); `G` is a single-key motion in the table.
@@ -391,7 +412,23 @@ impl Vim {
                 self.pending = Pending::ZPrefix;
                 vec![]
             }
-            ("x", _) => vec![Action::DeleteCharUnder(self.take_count())],
+            (";", _) | (",", _) => {
+                let n = self.take_count();
+                self.repeat_find(key == ",", None, n)
+            }
+            ("x", false) => vec![Action::DeleteCharUnder(self.take_count())],
+            // `X`: delete the char before the caret — `dh`, which already
+            // stops at the line start rather than joining lines.
+            ("x", true) => vec![Action::DeleteMotion(Motion::CharLeft, self.take_count())],
+            // `r`: the next key is the replacement char.
+            ("r", false) => {
+                self.pending = Pending::Replace { count: self.take_count() };
+                vec![]
+            }
+            ("~", _) => vec![Action::ToggleCase(self.take_count())],
+            // `J`: join lines. The count names lines, so `J` and `2J` both make
+            // one join (`gJ`, the verbatim splice, is a `g`-sequence).
+            ("j", true) => vec![Action::JoinLines { count: self.take_count(), space: true }],
             // `s`: substitute — delete char(s) under cursor, then insert.
             ("s", false) => {
                 let n = self.take_count();
@@ -533,12 +570,27 @@ impl Vim {
 
         if key == "escape" {
             self.count = None;
+            // Mid-sequence (`vf`, `vi`), escape aborts just that sequence and
+            // the selection stays — only a bare escape leaves visual mode.
+            if self.in_sequence() {
+                self.pending = Pending::None;
+                return vec![];
+            }
             self.mode = Mode::Normal;
             return vec![Action::CollapseSelection];
         }
         if m.control || m.alt || m.platform {
             self.count = None;
             return vec![];
+        }
+        // A pending `f`/`t` target consumes this key before count parsing, same
+        // as in normal mode.
+        if let Some(actions) = self.resolve_literal(ks) {
+            return actions;
+        }
+        if let Pending::Object { op, around } = self.pending {
+            self.pending = Pending::None;
+            return self.apply_object(op, around, key, shift);
         }
         // Count digits (mid-count `0` included; a bare `0` is the line-start motion).
         if key.len() == 1 {
@@ -564,10 +616,23 @@ impl Vim {
         match (key, shift) {
             ("v", false) => return toggle(self, if line { Mode::Visual } else { Mode::Normal }),
             ("v", true) => return toggle(self, if line { Mode::Normal } else { Mode::VisualLine }),
-            ("d", false) | ("x", _) => {
+            ("d", false) | ("x", false) => {
                 self.count = None;
                 self.mode = Mode::Normal;
-                return vec![Action::DeleteSelection { linewise: line }];
+                return vec![Action::DeleteSelection { linewise: line, change: false }];
+            }
+            // `X` deletes the selected lines whatever the submode (vim).
+            ("x", true) => {
+                self.count = None;
+                self.mode = Mode::Normal;
+                return vec![Action::DeleteSelection { linewise: true, change: false }];
+            }
+            // `c`: delete the selection and enter insert. A linewise span keeps
+            // one empty line to type into (vim `Vc`).
+            ("c", false) => {
+                self.count = None;
+                return self
+                    .enter_insert(vec![Action::DeleteSelection { linewise: line, change: true }]);
             }
             ("y", false) => {
                 self.count = None;
@@ -579,11 +644,26 @@ impl Vim {
                 self.mode = Mode::Normal;
                 return vec![Action::IndentSelection { width, dedent: key == "<" }];
             }
+            // `i`/`a` start a text object (`viw`, `va(`), which replaces the
+            // selection rather than extending it.
+            ("i", false) | ("a", false) => {
+                self.count = None;
+                self.pending = Pending::Object { op: None, around: key == "a" };
+                return vec![];
+            }
+            (";", _) | (",", _) => {
+                let n = self.take_count();
+                return self.repeat_find(key == ",", None, n);
+            }
             _ => {}
         }
 
         if let Some(spec) = motion(key, shift) {
-            return vec![Action::Move(spec.motion, self.take_count())];
+            return self.move_action(spec.motion);
+        }
+        if let Some(make) = find_ctor(key, shift) {
+            self.pending = Pending::Find { make, op: None, count: self.take_count() };
+            return vec![];
         }
         self.count = None;
         vec![]
@@ -655,15 +735,20 @@ impl Vim {
                 ]),
             };
         }
-        // `t` needs one more key (its target char); park the operator + count.
-        if (key, shift) == ("t", false) {
-            self.pending = Pending::Till { op, count };
+        // `f`/`F`/`t`/`T` need one more key (their target char); park the
+        // operator + count until it arrives.
+        if let Some(make) = find_ctor(key, shift) {
+            self.pending = Pending::Find { make, op: Some(op), count };
             return vec![];
+        }
+        // `;`/`,` repeat the last find as this operator's target (`d;`).
+        if key == ";" || key == "," {
+            return self.repeat_find(key == ",", Some(op), count);
         }
         // `i`/`a` start a text object (`diw`/`dap`); the next key names it.
         // ponytail: the count (`d2iw`) is dropped — objects act once.
         if !shift && (key == "i" || key == "a") {
-            self.pending = Pending::Object { op, around: key == "a" };
+            self.pending = Pending::Object { op: Some(op), around: key == "a" };
             return vec![];
         }
         match motion(key, shift) {
@@ -671,10 +756,11 @@ impl Vim {
                 Op::Delete => vec![Action::DeleteMotion(spec.motion, count)],
                 Op::Yank => vec![Action::YankMotion(spec.motion, count)],
                 Op::Change => {
-                    // `cw` swaps in the ChangeWord motion (vim special case:
-                    // don't take the space/newline after the word).
+                    // `cw`/`cW` swap in the ChangeWord motions (vim special
+                    // case: don't take the space/newline after the word).
                     let m = match spec.motion {
                         Motion::WordForward => Motion::ChangeWord,
+                        Motion::BigWordForward => Motion::ChangeBigWord,
                         m => m,
                     };
                     self.enter_insert(vec![Action::DeleteMotion(m, count)])
@@ -694,34 +780,122 @@ impl Vim {
         }
     }
 
-    /// Resolve a pending text object against the key naming it (`w` word,
-    /// `p` paragraph); anything else aborts the operator.
-    fn apply_object(&mut self, op: Op, around: bool, key: &str) -> Vec<Action> {
-        let obj = match key {
-            "w" => TextObject::Word { around },
-            "p" => TextObject::Paragraph { around },
+    /// Resolve a pending text object against the key naming it; anything else
+    /// aborts. Bracket objects take either delimiter plus vim's `b`/`B`
+    /// aliases — `B` arrives as `b` with shift, unlike `{`/`}`, which the
+    /// backend already reports as the shifted symbol. With no operator (visual
+    /// mode) the object becomes the selection instead.
+    fn apply_object(&mut self, op: Option<Op>, around: bool, key: &str, shift: bool) -> Vec<Action> {
+        let block = |open, close| TextObject::Block { open, close, around };
+        let obj = match (key, shift) {
+            ("w", _) => TextObject::Word { around },
+            ("p", _) => TextObject::Paragraph { around },
+            ("\"", _) | ("'", _) | ("`", _) => {
+                TextObject::Quote { ch: key.chars().next().unwrap(), around }
+            }
+            ("(", _) | (")", _) | ("b", false) => block('(', ')'),
+            ("{", _) | ("}", _) | ("b", true) => block('{', '}'),
+            ("[", _) | ("]", _) => block('[', ']'),
+            ("<", _) | (">", _) => block('<', '>'),
             _ => return vec![],
         };
         match op {
-            Op::Delete => vec![Action::DeleteObject { obj, change: false }],
-            Op::Yank => vec![Action::YankObject(obj)],
-            Op::Change => self.enter_insert(vec![Action::DeleteObject { obj, change: true }]),
+            None => vec![Action::SelectObject(obj)],
+            Some(Op::Delete) => vec![Action::DeleteObject { obj, change: false }],
+            Some(Op::Yank) => vec![Action::YankObject(obj)],
+            Some(Op::Change) => {
+                self.enter_insert(vec![Action::DeleteObject { obj, change: true }])
+            }
         }
     }
 
-    /// Complete a `g`-sequence: `gg` jumps to file start, `gt`/`gT` cycle
-    /// buffers, `gd`/`gf`/`gx` follow the link under the caret, `gj`/`gk`
-    /// move by visual row; anything else aborts.
+    /// Resolve a pending state whose next key is a literal character — the
+    /// target of `f`/`F`/`t`/`T` or the replacement of `r`. `None` means no such
+    /// state is pending and the caller handles the key itself. A key that
+    /// produces no char (arrows, Enter, Escape) aborts.
+    fn resolve_literal(&mut self, ks: &Keystroke) -> Option<Vec<Action>> {
+        let ch = ks.key_char.as_ref().and_then(|s| s.chars().next());
+        match std::mem::replace(&mut self.pending, Pending::None) {
+            Pending::Replace { count } => {
+                Some(ch.map_or(vec![], |c| vec![Action::ReplaceChar(c, count)]))
+            }
+            Pending::Find { make, op, count } => Some(match ch {
+                Some(c) => {
+                    let m = make(c);
+                    self.last_find = Some(m);
+                    self.find_actions(m, op, count)
+                }
+                None => vec![],
+            }),
+            other => {
+                self.pending = other;
+                None
+            }
+        }
+    }
+
+    /// `;`/`,`: re-run the last `f`/`F`/`t`/`T`, `reverse` (`,`) flipping its
+    /// direction. Neither key updates the stored motion, so a chain of `;`
+    /// keeps going the same way.
+    ///
+    /// ponytail: `;` after `t{char}` doesn't skip a match sitting immediately
+    /// ahead, so it can stall one char short (vim's `cpo-;` behavior). Needs
+    /// the repeat to be distinguishable from a first press at the geometry
+    /// layer — a flag on the till motions — if the stall annoys.
+    fn repeat_find(&mut self, reverse: bool, op: Option<Op>, count: usize) -> Vec<Action> {
+        match self.last_find {
+            Some(m) => {
+                let m = if reverse { flip_find(m) } else { m };
+                self.find_actions(m, op, count)
+            }
+            None => vec![],
+        }
+    }
+
+    /// Emit the command for a resolved find motion: an operator sweeps to it,
+    /// otherwise it's a plain move — which visual mode turns into an extend,
+    /// since the editor routes `Move` by the current mode.
+    fn find_actions(&mut self, m: Motion, op: Option<Op>, count: usize) -> Vec<Action> {
+        match op {
+            None => vec![Action::Move(m, count)],
+            Some(Op::Delete) => vec![Action::DeleteMotion(m, count)],
+            Some(Op::Yank) => vec![Action::YankMotion(m, count)],
+            Some(Op::Change) => self.enter_insert(vec![Action::DeleteMotion(m, count)]),
+        }
+    }
+
+    /// A table motion's `Move`, consuming any pending count. `G` and `gg` with
+    /// a count are goto-line instead of a file edge (vim `5G`); the count rides
+    /// in the motion so a bare `G` stays distinct from `1G`.
+    fn move_action(&mut self, m: Motion) -> Vec<Action> {
+        if let (Motion::FileEnd | Motion::FileStart, Some(n)) = (m, self.count) {
+            self.count = None;
+            return vec![Action::Move(Motion::GotoLine(n), 1)];
+        }
+        vec![Action::Move(m, self.take_count())]
+    }
+
+    /// Complete a `g`-sequence: `gg` jumps to file start (or to `{count}gg`'s
+    /// line), `gt`/`gT` cycle buffers, `gd`/`gf`/`gx` follow the link under the
+    /// caret, `gj`/`gk` move by visual row, `gJ` joins lines without a
+    /// separator; anything else aborts.
     fn complete_g_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
-        self.count = None; // ponytail: `2gg`/`2gt`/`3gj` (counts) ignored.
+        // `gg` and `gJ` read the count; the rest ignore it.
+        // ponytail: `2gt`/`3gj` (counts) ignored.
         match (key, shift) {
-            ("g", _) => vec![Action::Move(Motion::FileStart, 1)],
-            ("t", false) => vec![Action::BufferNext],
-            ("t", true) => vec![Action::BufferPrev],
-            ("d" | "f" | "x", false) => vec![Action::FollowLink],
-            ("j", false) => vec![Action::MoveDisplay { down: true }],
-            ("k", false) => vec![Action::MoveDisplay { down: false }],
-            _ => vec![],
+            ("g", _) => self.move_action(Motion::FileStart),
+            ("j", true) => vec![Action::JoinLines { count: self.take_count(), space: false }],
+            _ => {
+                self.count = None;
+                match (key, shift) {
+                    ("t", false) => vec![Action::BufferNext],
+                    ("t", true) => vec![Action::BufferPrev],
+                    ("d" | "f" | "x", false) => vec![Action::FollowLink],
+                    ("j", false) => vec![Action::MoveDisplay { down: true }],
+                    ("k", false) => vec![Action::MoveDisplay { down: false }],
+                    _ => vec![],
+                }
+            }
         }
     }
 
@@ -754,24 +928,57 @@ impl Vim {
 
 /// A cursor motion plus whether it's a valid operator target. One table read by
 /// normal mode, visual mode, and operator-pending — a new motion is one entry
-/// here. `j`/`k`/`e`/`G` are non-targets (`dj` is linewise; `de`/`dG` are just a
-/// flag flip away). `G` (`shift+g`) is file-end; lowercase `g` is a prefix.
+/// here. `j`/`k`/`e`/`G`/`%` are non-targets (`dj` is linewise; `de`/`dG` are
+/// just a flag flip away; `d%`'s span is inclusive at both ends, which the
+/// `[min, max)` sweep can't express). `G` (`shift+g`) is file-end; lowercase
+/// `g` is a prefix. Capitals must match as `(key, true)` explicitly — a `_`
+/// shift pattern would swallow the shifted command on that key (`J` for `j`,
+/// `W` for `w`).
 struct MotionSpec {
     motion: Motion,
     op_target: bool,
+}
+
+/// The motion constructor `f`/`F`/`t`/`T` parks while waiting for its target
+/// char. Tuple-variant constructors double as `fn(char) -> Motion`, so the four
+/// keys differ only by which one they store.
+fn find_ctor(key: &str, shift: bool) -> Option<fn(char) -> Motion> {
+    Some(match (key, shift) {
+        ("f", false) => Motion::FindChar,
+        ("f", true) => Motion::FindCharBack,
+        ("t", false) => Motion::TillChar,
+        ("t", true) => Motion::TillCharBack,
+        _ => return None,
+    })
+}
+
+/// Reverse a find motion's direction, for `,`.
+fn flip_find(m: Motion) -> Motion {
+    match m {
+        Motion::FindChar(c) => Motion::FindCharBack(c),
+        Motion::FindCharBack(c) => Motion::FindChar(c),
+        Motion::TillChar(c) => Motion::TillCharBack(c),
+        Motion::TillCharBack(c) => Motion::TillChar(c),
+        m => m,
+    }
 }
 
 fn motion(key: &str, shift: bool) -> Option<MotionSpec> {
     let (motion, op_target) = match (key, shift) {
         ("h", _) | ("left", _) => (Motion::CharLeft, true),
         ("l", _) | ("right", _) => (Motion::CharRight, true),
-        ("k", _) | ("up", _) => (Motion::LineUp, false),
-        ("j", _) | ("down", _) => (Motion::LineDown, false),
-        ("w", _) => (Motion::WordForward, true),
-        ("b", _) => (Motion::WordBackward, true),
-        ("e", _) => (Motion::WordEnd, false),
+        ("k", false) | ("up", _) => (Motion::LineUp, false),
+        ("j", false) | ("down", _) => (Motion::LineDown, false),
+        ("w", false) => (Motion::WordForward, true),
+        ("w", true) => (Motion::BigWordForward, true),
+        ("b", false) => (Motion::WordBackward, true),
+        ("b", true) => (Motion::BigWordBackward, true),
+        ("e", false) => (Motion::WordEnd, false),
+        ("e", true) => (Motion::BigWordEnd, false),
         ("0", _) => (Motion::LineStart, true),
+        ("^", _) => (Motion::FirstNonBlank, true),
         ("$", _) => (Motion::LineEnd, true),
+        ("%", _) => (Motion::MatchBracket, false),
         ("{", _) => (Motion::ParaBackward, true),
         ("}", _) => (Motion::ParaForward, true),
         ("g", true) => (Motion::FileEnd, false),
@@ -922,6 +1129,262 @@ mod tests {
     }
 
     #[test]
+    fn bare_find_motions() {
+        // `fx` moves onto the char; the target key is literal, so a digit
+        // after `f` is the target rather than a count.
+        let mut v = vim();
+        assert!(v.on_key(&k("f")).is_empty()); // awaiting the target
+        assert_eq!(v.on_key(&k("3")), vec![Action::Move(Motion::FindChar('3'), 1)]);
+
+        // A count before `f` rides through to the motion.
+        v.on_key(&k("2"));
+        v.on_key(&k("f"));
+        assert_eq!(v.on_key(&k("x")), vec![Action::Move(Motion::FindChar('x'), 2)]);
+
+        // Capitals go backward; `t`/`T` land beside the char.
+        v.on_key(&shift("f", "F"));
+        assert_eq!(v.on_key(&k("x")), vec![Action::Move(Motion::FindCharBack('x'), 1)]);
+        v.on_key(&k("t"));
+        assert_eq!(v.on_key(&k("x")), vec![Action::Move(Motion::TillChar('x'), 1)]);
+        v.on_key(&shift("t", "T"));
+        assert_eq!(v.on_key(&k("x")), vec![Action::Move(Motion::TillCharBack('x'), 1)]);
+
+        // A non-printing key aborts, leaving the grammar clean.
+        v.on_key(&k("f"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert_eq!(v.on_key(&k("x")), vec![Action::DeleteCharUnder(1)]);
+    }
+
+    #[test]
+    fn find_as_operator_target() {
+        for (key, ctor) in [
+            ("f", Motion::FindChar as fn(char) -> Motion),
+            ("t", Motion::TillChar),
+        ] {
+            let mut v = vim();
+            v.on_key(&k("d"));
+            assert!(v.on_key(&k(key)).is_empty());
+            assert_eq!(v.on_key(&k("z")), vec![Action::DeleteMotion(ctor('z'), 1)]);
+        }
+        // Backward, and with the change operator entering insert.
+        let mut v = vim();
+        v.on_key(&k("c"));
+        v.on_key(&shift("f", "F"));
+        assert_eq!(
+            v.on_key(&k("z")),
+            vec![Action::DeleteMotion(Motion::FindCharBack('z'), 1)]
+        );
+        assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn semicolon_and_comma_repeat_find() {
+        let mut v = vim();
+        // Nothing recorded yet → no-op.
+        assert!(v.on_key(&k(";")).is_empty());
+
+        v.on_key(&k("f"));
+        v.on_key(&k("x"));
+        assert_eq!(v.on_key(&k(";")), vec![Action::Move(Motion::FindChar('x'), 1)]);
+        // `,` reverses without replacing the stored motion, so `;` still goes
+        // the original way.
+        assert_eq!(v.on_key(&k(",")), vec![Action::Move(Motion::FindCharBack('x'), 1)]);
+        assert_eq!(v.on_key(&k(";")), vec![Action::Move(Motion::FindChar('x'), 1)]);
+        // Counts apply, and the repeat works as an operator target (`d;`).
+        v.on_key(&k("3"));
+        assert_eq!(v.on_key(&k(";")), vec![Action::Move(Motion::FindChar('x'), 3)]);
+        v.on_key(&k("d"));
+        assert_eq!(v.on_key(&k(";")), vec![Action::DeleteMotion(Motion::FindChar('x'), 1)]);
+    }
+
+    #[test]
+    fn shifted_keys_beat_their_motion_table_entry() {
+        // `J`/`W`/`X` must not fall through to `j`/`w`/`x`'s table entry.
+        let mut v = vim();
+        assert_eq!(
+            v.on_key(&shift("j", "J")),
+            vec![Action::JoinLines { count: 1, space: true }]
+        );
+        assert_eq!(v.on_key(&shift("w", "W")), vec![Action::Move(Motion::BigWordForward, 1)]);
+        assert_eq!(v.on_key(&shift("b", "B")), vec![Action::Move(Motion::BigWordBackward, 1)]);
+        assert_eq!(v.on_key(&shift("e", "E")), vec![Action::Move(Motion::BigWordEnd, 1)]);
+        assert_eq!(
+            v.on_key(&shift("x", "X")),
+            vec![Action::DeleteMotion(Motion::CharLeft, 1)]
+        );
+        // Lowercase still reaches the table.
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
+        assert_eq!(v.on_key(&k("w")), vec![Action::Move(Motion::WordForward, 1)]);
+    }
+
+    #[test]
+    fn gj_joins_without_a_separator() {
+        let mut v = vim();
+        v.on_key(&k("g"));
+        assert_eq!(
+            v.on_key(&shift("j", "J")),
+            vec![Action::JoinLines { count: 1, space: false }]
+        );
+        // A count rides along; plain `gj` is still the display move.
+        v.on_key(&k("3"));
+        v.on_key(&k("g"));
+        assert_eq!(
+            v.on_key(&shift("j", "J")),
+            vec![Action::JoinLines { count: 3, space: false }]
+        );
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true }]);
+    }
+
+    #[test]
+    fn count_turns_file_edges_into_goto_line() {
+        // Bare `G`/`gg` stay file edges; a count makes them goto-line, so `1G`
+        // is distinguishable from `G`.
+        let mut v = vim();
+        assert_eq!(v.on_key(&shift("g", "G")), vec![Action::Move(Motion::FileEnd, 1)]);
+        v.on_key(&k("1"));
+        v.on_key(&k("2"));
+        assert_eq!(v.on_key(&shift("g", "G")), vec![Action::Move(Motion::GotoLine(12), 1)]);
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("g")), vec![Action::Move(Motion::FileStart, 1)]);
+        v.on_key(&k("5"));
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("g")), vec![Action::Move(Motion::GotoLine(5), 1)]);
+    }
+
+    #[test]
+    fn replace_char_takes_a_literal_key() {
+        let mut v = vim();
+        assert!(v.on_key(&k("r")).is_empty()); // awaiting the replacement
+        assert_eq!(v.on_key(&k("z")), vec![Action::ReplaceChar('z', 1)]);
+        // The replacement is literal — a digit is not a count.
+        v.on_key(&k("3"));
+        v.on_key(&k("r")); // 3r
+        assert_eq!(v.on_key(&k("4")), vec![Action::ReplaceChar('4', 3)]);
+        // A non-printing key aborts.
+        v.on_key(&k("r"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert_eq!(v.on_key(&k("x")), vec![Action::DeleteCharUnder(1)]);
+    }
+
+    #[test]
+    fn tilde_toggles_case() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&k("~")), vec![Action::ToggleCase(1)]);
+        v.on_key(&k("4"));
+        assert_eq!(v.on_key(&k("~")), vec![Action::ToggleCase(4)]);
+    }
+
+    #[test]
+    fn caret_and_percent_motions() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&k("^")), vec![Action::Move(Motion::FirstNonBlank, 1)]);
+        assert_eq!(v.on_key(&k("%")), vec![Action::Move(Motion::MatchBracket, 1)]);
+        // `^` is an operator target; `%` isn't (its span is inclusive at both
+        // ends, which the sweep can't express), so `d%` aborts.
+        v.on_key(&k("d"));
+        assert_eq!(
+            v.on_key(&k("^")),
+            vec![Action::DeleteMotion(Motion::FirstNonBlank, 1)]
+        );
+        v.on_key(&k("d"));
+        assert!(v.on_key(&k("%")).is_empty());
+    }
+
+    #[test]
+    fn visual_text_objects_replace_the_selection() {
+        let mut v = vim();
+        v.on_key(&k("v"));
+        assert!(v.on_key(&k("i")).is_empty()); // awaiting the object key
+        assert_eq!(
+            v.on_key(&k("w")),
+            vec![Action::SelectObject(TextObject::Word { around: false })]
+        );
+        assert_eq!(v.mode, Mode::Visual); // still selecting
+
+        // Bracket objects and their aliases resolve the same in visual mode.
+        v.on_key(&k("a"));
+        assert_eq!(
+            v.on_key(&k("(")),
+            vec![Action::SelectObject(TextObject::Block {
+                open: '(',
+                close: ')',
+                around: true
+            })]
+        );
+        // Escape mid-sequence aborts the object, keeping the selection.
+        v.on_key(&k("i"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert_eq!(v.mode, Mode::Visual);
+        // A bare escape then leaves visual.
+        assert_eq!(v.on_key(&named("escape")), vec![Action::CollapseSelection]);
+        assert_eq!(v.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn bracket_object_aliases() {
+        // `b`/`B` alias the paren/brace pairs, and either delimiter works.
+        for (key, sh, open, close) in [
+            ("b", false, '(', ')'),
+            (")", false, '(', ')'),
+            ("b", true, '{', '}'),
+            ("}", false, '{', '}'),
+            ("]", false, '[', ']'),
+            ("<", false, '<', '>'),
+            ("\"", false, '"', '"'),
+        ] {
+            let mut v = vim();
+            v.on_key(&k("d"));
+            v.on_key(&k("i"));
+            let ks = if sh { shift(key, "B") } else { k(key) };
+            let obj = if open == '"' {
+                TextObject::Quote { ch: '"', around: false }
+            } else {
+                TextObject::Block { open, close, around: false }
+            };
+            assert_eq!(
+                v.on_key(&ks),
+                vec![Action::DeleteObject { obj, change: false }],
+                "object key {key:?} shift={sh}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_change_enters_insert() {
+        let mut v = vim();
+        v.on_key(&k("v"));
+        assert_eq!(
+            v.on_key(&k("c")),
+            vec![Action::DeleteSelection { linewise: false, change: true }]
+        );
+        assert_eq!(v.mode, Mode::Insert);
+
+        // Linewise `Vc` spares a line to type into.
+        let mut v = vim();
+        v.on_key(&shift("v", "V"));
+        assert_eq!(
+            v.on_key(&k("c")),
+            vec![Action::DeleteSelection { linewise: true, change: true }]
+        );
+        assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn visual_find_extends_the_selection() {
+        // In visual mode a find is still a `Move`; the editor routes it to
+        // `extend_motion` because the mode is visual.
+        let mut v = vim();
+        v.on_key(&k("v"));
+        assert!(v.on_key(&k("f")).is_empty());
+        assert_eq!(v.on_key(&k("z")), vec![Action::Move(Motion::FindChar('z'), 1)]);
+        assert_eq!(v.mode, Mode::Visual);
+        assert_eq!(v.on_key(&k(";")), vec![Action::Move(Motion::FindChar('z'), 1)]);
+        // Shifted motions reach the table from visual mode too.
+        assert_eq!(v.on_key(&shift("w", "W")), vec![Action::Move(Motion::BigWordForward, 1)]);
+    }
+
+    #[test]
     fn text_object_grammar() {
         // diw
         let mut v = vim();
@@ -1007,9 +1470,38 @@ mod tests {
         v.on_key(&k("g"));
         assert!(v.in_sequence()); // next key belongs to the grammar
         v.on_key(&k("f"));
-        assert!(!v.in_sequence()); // sequence resolved
+        assert!(!v.in_sequence()); // `gf` resolved — the `f` never armed a find
         v.on_key(&k("2")); // a bare count is not a sequence
         assert!(!v.in_sequence());
+    }
+
+    #[test]
+    fn literal_targets_are_hidden_from_the_keymap_layer() {
+        // A find's target and `r`'s replacement belong to the grammar, so the
+        // user-keymap resolver must not start a binding match on them — that's
+        // what `in_sequence` gates. Without it, `f,` would fire a `,` leader.
+        let mut v = vim();
+        v.on_key(&k("f"));
+        assert!(v.in_sequence());
+        v.on_key(&k(","));
+        assert!(!v.in_sequence());
+        v.on_key(&k("r"));
+        assert!(v.in_sequence());
+        v.on_key(&k(","));
+        assert!(!v.in_sequence());
+        // The `,` was consumed as data, not as a repeat-find.
+        assert_eq!(v.on_key(&k(";")), vec![Action::Move(Motion::FindChar(','), 1)]);
+    }
+
+    #[test]
+    fn visual_capital_x_deletes_lines() {
+        let mut v = vim();
+        v.on_key(&k("v")); // charwise, but `X` is linewise regardless
+        assert_eq!(
+            v.on_key(&shift("x", "X")),
+            vec![Action::DeleteSelection { linewise: true, change: false }]
+        );
+        assert_eq!(v.mode, Mode::Normal);
     }
 
     #[test]
@@ -1206,7 +1698,7 @@ mod tests {
         assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
         assert_eq!(
             v.on_key(&k("d")),
-            vec![Action::DeleteSelection { linewise: true }]
+            vec![Action::DeleteSelection { linewise: true, change: false }]
         );
         assert_eq!(v.mode, Mode::Normal);
     }

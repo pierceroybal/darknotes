@@ -1125,7 +1125,9 @@ impl Editor {
                     self.doc_mut().move_motion(m, n);
                 }
             }
-            Action::DeleteSelection { linewise } => self.doc_mut().delete_selection(linewise),
+            Action::DeleteSelection { linewise, change } => {
+                self.doc_mut().delete_selection(linewise, change)
+            }
             Action::YankSelection { linewise } => self.doc_mut().yank_selection(linewise),
             Action::IndentSelection { width, dedent } => {
                 self.doc_mut().indent_selection(width, dedent)
@@ -1144,6 +1146,10 @@ impl Editor {
             Action::YankLines(n) => self.doc_mut().yank_lines(n),
             Action::DeleteObject { obj, change } => self.doc_mut().delete_object(obj, change),
             Action::YankObject(obj) => self.doc_mut().yank_object(obj),
+            Action::SelectObject(obj) => self.doc_mut().select_object(obj),
+            Action::JoinLines { count, space } => self.doc_mut().join_lines(count, space),
+            Action::ReplaceChar(ch, n) => self.doc_mut().replace_char(ch, n),
+            Action::ToggleCase(n) => self.doc_mut().toggle_case(n),
             // clipboard=unnamed: an external copy supersedes the internal
             // register. Same content means the register was ours (we mirrored
             // it out), so keep its linewise flag; foreign text guesses linewise

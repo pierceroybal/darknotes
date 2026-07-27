@@ -43,23 +43,45 @@ pub enum Motion {
     WordForward,
     WordBackward,
     WordEnd,
+    /// `W`/`B`/`E`: the same geometry over WORDs — whitespace-delimited runs,
+    /// so punctuation never breaks one (`dW` takes a whole URL).
+    BigWordForward,
+    BigWordBackward,
+    BigWordEnd,
     /// `cw` target: vim's special case — in a word, the change stops at the
     /// end of the current word (trailing whitespace and the newline stay);
     /// on whitespace it sweeps like `w`. Only the change operator emits it.
     ChangeWord,
+    /// `cW` target: `ChangeWord` over WORDs.
+    ChangeBigWord,
     /// `{`/`}`: to the previous/next empty line past the current paragraph
     /// (file edge when none). Strict vim: whitespace-only lines are not
     /// boundaries. From a blank line the motion first skips the blank run.
     ParaBackward,
     ParaForward,
     LineStart,
+    /// `^`: first non-blank char of the line.
+    FirstNonBlank,
     LineEnd,
     FileStart,
     FileEnd,
-    /// `t{char}`: forward to just before the count-th `char` on the caret's
-    /// line. The target offset is the found char itself — exclusive sweeps
-    /// (`ct`/`dt`) stop right before it. Not found → the motion fails.
+    /// `{count}G` / `{count}gg`: the line's first non-blank, 1-based and
+    /// clamped to the buffer. The count rides in the variant, not the motion's
+    /// repeat count, so a bare `G` (file end) stays distinguishable from `1G`.
+    GotoLine(usize),
+    /// `%`: the bracket matching the first one at or after the caret on its
+    /// line. Not an operator target — `d%`'s inclusive-both-ends span has no
+    /// representation in the `[min, max)` sweep, and `di(`/`da(` cover the
+    /// delete-a-block case better.
+    MatchBracket,
+    /// `f{char}`/`F{char}`: onto the count-th `char` forward/backward on the
+    /// caret's line. Inclusive as an operator target — `dfx` takes the `x`.
+    FindChar(char),
+    FindCharBack(char),
+    /// `t{char}`/`T{char}`: to just before/after the count-th `char` on the
+    /// caret's line. Not found → the motion fails and the caret stays.
     TillChar(char),
+    TillCharBack(char),
 }
 
 impl Motion {
@@ -77,6 +99,13 @@ impl Motion {
 pub enum TextObject {
     Word { around: bool },
     Paragraph { around: bool },
+    /// `i"`/`a"`, `i'`, `` i` ``: the run between a pair of `ch` on the caret's
+    /// line. `around` takes the quotes too.
+    Quote { ch: char, around: bool },
+    /// `i(`/`a{`/`i[`/`i<` and their aliases: the innermost `open`/`close`
+    /// pair containing the caret, which may span lines. `around` takes the
+    /// brackets too.
+    Block { open: char, close: char, around: bool },
 }
 
 /// The unnamed register: text from the last delete/yank, replayed by `p`/`P`.
@@ -510,16 +539,26 @@ impl Document {
         }
     }
 
-    /// Visual `d`/`x`: delete the selection into the register, then drop the caret
-    /// on a real char of the resulting line.
-    pub fn delete_selection(&mut self, linewise: bool) {
-        let (start, end) = self.selection_span(linewise);
+    /// Visual `d`/`x`, or `c` when `change`: delete the selection into the
+    /// register, then drop the caret on a real char of the resulting line. A
+    /// linewise change spares the span's last newline, leaving one empty line
+    /// for the insert that follows (vim `Vc`, same rule as `cip`), and leaves
+    /// the caret there rather than snapping it onto a char.
+    pub fn delete_selection(&mut self, linewise: bool, change: bool) {
+        let (start, mut end) = self.selection_span(linewise);
         if start < end {
             self.set_register(self.rope.slice(start..end).to_string(), linewise);
+            if change && linewise && self.rope.char(end - 1) == '\n' {
+                end -= 1;
+            }
             self.rope.remove(start..end);
             self.touch();
         }
         let at = start.min(self.rope.len_chars());
+        if change {
+            self.set_caret(at);
+            return;
+        }
         let (line, _) = self.line_col_of(at);
         let line_start = self.rope.line_to_char(line);
         let last_col = self.line_len_chars(line).saturating_sub(1);
@@ -655,7 +694,112 @@ impl Document {
             TextObject::Paragraph { around } => {
                 self.paragraph_span(around).map(|(a, b)| (a, b, true))
             }
+            TextObject::Quote { ch, around } => {
+                self.quote_span(ch, around).map(|(a, b)| (a, b, false))
+            }
+            TextObject::Block { open, close, around } => {
+                self.block_span(open, close, around).map(|(a, b)| (a, b, false))
+            }
         }
+    }
+
+    /// `i"`/`a"`: the run between a pair of `q` on the caret's line. Quotes are
+    /// paired left to right and the first pair reaching the caret wins, so a
+    /// caret before the opening quote still selects that pair (vim). `around`
+    /// takes the quotes themselves.
+    ///
+    /// ponytail: no escape handling — `\"` inside a string closes the pair.
+    /// Track the backslash if real notes hit it.
+    fn quote_span(&self, q: char, around: bool) -> Option<(usize, usize)> {
+        let (line, col) = self.line_col_of(self.caret());
+        let base = self.rope.line_to_char(line);
+        let n = self.line_len_chars(line);
+        let text = self.rope.line(line);
+        let mut i = 0;
+        while i < n {
+            if text.char(i) != q {
+                i += 1;
+                continue;
+            }
+            // Unterminated opener: no pair on this line at all.
+            let close = (i + 1..n).find(|&j| text.char(j) == q)?;
+            if col <= close {
+                return if around {
+                    Some((base + i, base + close + 1))
+                } else {
+                    (i + 1 < close).then_some((base + i + 1, base + close))
+                };
+            }
+            i = close + 1;
+        }
+        None
+    }
+
+    /// `i(`/`a(`: the innermost `open`/`close` pair containing the caret,
+    /// spanning lines if need be. A caret sitting on either bracket uses that
+    /// pair (vim). `around` takes the brackets themselves; `i` on an empty pair
+    /// selects nothing, so the operator no-ops.
+    fn block_span(&self, open: char, close: char, around: bool) -> Option<(usize, usize)> {
+        let len = self.rope.len_chars();
+        let p = self.caret();
+        let start = if p < len && self.rope.char(p) == open {
+            p
+        } else {
+            // Scan back for an open with no matching close between it and the
+            // caret. A caret on the closing bracket resolves here too: the
+            // pairs between balance out.
+            let mut depth = 0usize;
+            let mut i = p;
+            loop {
+                if i == 0 {
+                    return None;
+                }
+                i -= 1;
+                let c = self.rope.char(i);
+                if c == close {
+                    depth += 1;
+                } else if c == open {
+                    if depth == 0 {
+                        break i;
+                    }
+                    depth -= 1;
+                }
+            }
+        };
+        let mut depth = 0usize;
+        let mut j = start + 1;
+        let end = loop {
+            if j >= len {
+                return None;
+            }
+            let c = self.rope.char(j);
+            if c == open {
+                depth += 1;
+            } else if c == close {
+                if depth == 0 {
+                    break j;
+                }
+                depth -= 1;
+            }
+            j += 1;
+        };
+        if around {
+            Some((start, end + 1))
+        } else {
+            (start + 1 < end).then_some((start + 1, end))
+        }
+    }
+
+    /// Visual-mode text object (`viw`, `va(`): set the selection to the
+    /// object's span. The head sits on the span's last char, since a charwise
+    /// selection includes it.
+    pub fn select_object(&mut self, obj: TextObject) {
+        let Some((start, end, _)) = self.object_span(obj) else {
+            return;
+        };
+        let head = end.saturating_sub(1).max(start);
+        self.selections[0] = Selection { anchor: start, head };
+        self.goal_col = self.line_col_of(head).1;
     }
 
     /// `iw`/`aw`: the same-class run under the caret (a whitespace run counts
@@ -815,6 +959,87 @@ impl Document {
         self.set_caret(from);
     }
 
+    /// `r{char}`: overwrite `count` chars at the caret with `char`. Vim fails
+    /// the whole command when the line is too short rather than replacing what
+    /// fits. The caret stays on the last replaced char.
+    pub fn replace_char(&mut self, ch: char, count: usize) {
+        let count = count.max(1);
+        let from = self.caret();
+        let (line, _) = self.line_col_of(from);
+        let eol = self.rope.line_to_char(line) + self.line_len_chars(line);
+        if from + count > eol {
+            return;
+        }
+        self.rope.remove(from..from + count);
+        self.rope.insert(from, &std::iter::repeat(ch).take(count).collect::<String>());
+        self.touch();
+        self.set_caret(from + count - 1);
+    }
+
+    /// `~`: flip the case of `count` chars at the caret and step past them,
+    /// stopping at end of line. Case mapping keeps one char per char (`ß`
+    /// stays `ß`) so offsets — carets, selections — survive the edit.
+    pub fn toggle_case(&mut self, count: usize) {
+        let from = self.caret();
+        let (line, _) = self.line_col_of(from);
+        let eol = self.rope.line_to_char(line) + self.line_len_chars(line);
+        let to = (from + count.max(1)).min(eol);
+        if from >= to {
+            return;
+        }
+        let flipped: String = self
+            .rope
+            .slice(from..to)
+            .chars()
+            .map(|c| {
+                let mut flip =
+                    if c.is_uppercase() { c.to_lowercase().collect::<Vec<_>>() } else {
+                        c.to_uppercase().collect::<Vec<_>>()
+                    };
+                if flip.len() == 1 { flip.pop().unwrap() } else { c }
+            })
+            .collect();
+        self.rope.remove(from..to);
+        self.rope.insert(from, &flipped);
+        self.touch();
+        // Past the last flipped char; the normal-mode clamp pulls it back at EOL.
+        self.set_caret(to);
+    }
+
+    /// `J`/`gJ`: join the caret's line with the ones below it — `count` names
+    /// lines, so both `J` and `2J` make one join. `space` (plain `J`) collapses
+    /// each joint to a single space, dropping the next line's indent; `gJ`
+    /// splices verbatim. The caret lands on the last joint.
+    ///
+    /// ponytail: vim also suppresses the space before a `)`; add that rule if
+    /// joining wrapped code in notes makes it show.
+    pub fn join_lines(&mut self, count: usize, space: bool) {
+        let (line, _) = self.line_col_of(self.caret());
+        let mut caret = self.caret();
+        for _ in 0..count.max(2) - 1 {
+            if line + 1 >= self.rope.len_lines() {
+                break;
+            }
+            let start = self.rope.line_to_char(line);
+            let eol = start + self.line_len_chars(line);
+            let mut end = self.rope.line_to_char(line + 1);
+            if space {
+                let n = self.line_len_chars(line + 1);
+                end += self.rope.line(line + 1).chars().take(n).take_while(|c| *c == ' ').count();
+            }
+            self.rope.remove(eol..end);
+            // No separator for an empty line on either side, nor a second
+            // space when the joint already has one.
+            let joined_blank = eol >= self.rope.len_chars() || self.rope.char(eol) == '\n';
+            if space && eol > start && !joined_blank && self.rope.char(eol - 1) != ' ' {
+                self.rope.insert(eol, " ");
+            }
+            self.touch();
+            caret = eol;
+        }
+        self.set_caret(caret.min(self.rope.len_chars()));
+    }
+
     /// Snap a caret sitting one past the line's last char back onto it. Normal
     /// mode disallows that column (insert mode needs it for appending), so the
     /// editor calls this after every keystroke that lands in normal mode.
@@ -955,7 +1180,15 @@ impl Document {
     /// newline. Plain caret movement uses `motion_target` directly.
     fn op_motion_target(&self, m: Motion, from: usize, count: usize) -> usize {
         match m {
-            Motion::WordForward => self.word_sweep_end(from, count.max(1)),
+            Motion::WordForward => self.word_sweep_end(from, count.max(1), false),
+            Motion::BigWordForward => self.word_sweep_end(from, count.max(1), true),
+            // Inclusive forward motions: the sweep covers the char the caret
+            // would land on, so `dfx` takes the `x` and `dtx` stops just
+            // before it. A failed find returns `from` and stays a no-op.
+            Motion::FindChar(_) | Motion::TillChar(_) => {
+                let to = self.motion_target(m, from, count);
+                if to > from { to + 1 } else { to }
+            }
             _ => self.motion_target(m, from, count),
         }
     }
@@ -964,15 +1197,120 @@ impl Document {
     /// last repeat is clamped to the end of the line it starts on. Starting
     /// on an empty line the sweep takes exactly that line's newline (vim
     /// `dw` there collapses the line).
-    fn word_sweep_end(&self, from: usize, count: usize) -> usize {
+    fn word_sweep_end(&self, from: usize, count: usize, big: bool) -> usize {
         let mut q = from;
         for _ in 1..count {
-            q = self.next_word_start(q);
+            q = self.next_word_start(q, big);
         }
         let (line, _) = self.line_col_of(q);
         let eol = self.rope.line_to_char(line) + self.line_len_chars(line);
         let stop = if eol == q { q + 1 } else { eol };
-        self.next_word_start(q).min(stop)
+        self.next_word_start(q, big).min(stop)
+    }
+
+    /// `cw`/`cW` target — see `Motion::ChangeWord`. Inside a word the change
+    /// stops at the run's end; from whitespace it sweeps like an operator's `w`.
+    fn change_word_end(&self, from: usize, count: usize, big: bool) -> usize {
+        let len = self.rope.len_chars();
+        if from >= len || self.rope.char(from).is_whitespace() {
+            return self.word_sweep_end(from, count, big);
+        }
+        // Count > 1 spans whole words; the last stops at its run end.
+        let mut p = from;
+        for _ in 1..count {
+            p = self.next_word_start(p, big);
+        }
+        if p >= len {
+            return len;
+        }
+        let cls = class_of(big);
+        let c0 = cls(self.rope.char(p));
+        while p < len {
+            let c = self.rope.char(p);
+            if c.is_whitespace() || cls(c) != c0 {
+                break;
+            }
+            p += 1;
+        }
+        p
+    }
+
+    /// Offset of the count-th `ch` on the caret's line, searching from just
+    /// after `from` (forward) or just before it (backward). `None` when the
+    /// line holds fewer than `count` of them — vim fails the motion outright
+    /// rather than moving partway.
+    fn find_char(&self, from: usize, ch: char, count: usize, forward: bool) -> Option<usize> {
+        let (line, col) = self.line_col_of(from);
+        let base = self.rope.line_to_char(line);
+        let n = self.line_len_chars(line);
+        let text = self.rope.line(line);
+        let scan: Box<dyn Iterator<Item = usize>> =
+            if forward { Box::new(col + 1..n) } else { Box::new((0..col).rev()) };
+        scan.filter(|&i| text.char(i) == ch).nth(count.max(1) - 1).map(|i| base + i)
+    }
+
+    /// `%`: the offset of the bracket matching the first one at or after the
+    /// caret on its line. Nesting-aware over `()`, `[]`, `{}`; no string or
+    /// comment awareness, same as vim's plain `%`.
+    fn match_bracket(&self, from: usize) -> Option<usize> {
+        const PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+        let len = self.rope.len_chars();
+        let (line, _) = self.line_col_of(from);
+        let eol = self.rope.line_to_char(line) + self.line_len_chars(line);
+        let mut at = from;
+        let (open, close, forward) = loop {
+            if at >= eol {
+                return None;
+            }
+            let c = self.rope.char(at);
+            if let Some(&(o, cl)) = PAIRS.iter().find(|&&(o, _)| o == c) {
+                break (o, cl, true);
+            }
+            if let Some(&(o, cl)) = PAIRS.iter().find(|&&(_, cl)| cl == c) {
+                break (o, cl, false);
+            }
+            at += 1;
+        };
+        // Starting on the bracket itself takes depth to 1, so it can't
+        // underflow before the match closes it out.
+        let mut depth = 0usize;
+        if forward {
+            for i in at..len {
+                match self.rope.char(i) {
+                    c if c == open => depth += 1,
+                    c if c == close => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            for i in (0..=at).rev() {
+                match self.rope.char(i) {
+                    c if c == close => depth += 1,
+                    c if c == open => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Offset of the first non-blank char on `line` — its end when the line is
+    /// blank or all whitespace.
+    fn first_non_blank(&self, line: usize) -> usize {
+        let n = self.line_len_chars(line);
+        let lead =
+            self.rope.line(line).chars().take(n).take_while(|c| c.is_whitespace()).count();
+        self.rope.line_to_char(line) + lead
     }
 
     /// Target offset of a motion from `from`, repeated `count` times. Char and
@@ -1003,6 +1341,15 @@ impl Document {
                 let (line, _) = self.line_col_of(from);
                 self.rope.line_to_char(line)
             }
+            Motion::FirstNonBlank => {
+                let (line, _) = self.line_col_of(from);
+                self.first_non_blank(line)
+            }
+            Motion::GotoLine(n) => {
+                let last = self.rope.len_lines().saturating_sub(1);
+                self.first_non_blank(n.saturating_sub(1).min(last))
+            }
+            Motion::MatchBracket => self.match_bracket(from).unwrap_or(from),
             Motion::LineEnd => {
                 let (line, _) = self.line_col_of(from);
                 self.rope.line_to_char(line) + self.line_len_chars(line)
@@ -1037,62 +1384,41 @@ impl Document {
                 }
                 self.rope.line_to_char(line)
             }
-            Motion::WordForward => {
+            Motion::WordForward | Motion::BigWordForward => {
+                let big = m == Motion::BigWordForward;
                 let mut p = from;
                 for _ in 0..count {
-                    p = self.next_word_start(p);
+                    p = self.next_word_start(p, big);
                 }
                 p
             }
-            Motion::WordBackward => {
+            Motion::WordBackward | Motion::BigWordBackward => {
+                let big = m == Motion::BigWordBackward;
                 let mut p = from;
                 for _ in 0..count {
-                    p = self.prev_word_start(p);
+                    p = self.prev_word_start(p, big);
                 }
                 p
             }
-            Motion::WordEnd => {
+            Motion::WordEnd | Motion::BigWordEnd => {
+                let big = m == Motion::BigWordEnd;
                 let mut p = from;
                 for _ in 0..count {
-                    p = self.next_word_end(p);
+                    p = self.next_word_end(p, big);
                 }
                 p
             }
-            Motion::ChangeWord => {
-                let len = self.rope.len_chars();
-                if from >= len || self.rope.char(from).is_whitespace() {
-                    // No word under the cursor to preserve: sweep like an
-                    // operator's `w` (still stops at the end of the line).
-                    return self.word_sweep_end(from, count);
-                }
-                // Count > 1 spans whole words; the last stops at its run end.
-                let mut p = from;
-                for _ in 1..count {
-                    p = self.next_word_start(p);
-                }
-                if p >= len {
-                    return len;
-                }
-                let cls = char_class(self.rope.char(p));
-                while p < len {
-                    let c = self.rope.char(p);
-                    if c.is_whitespace() || char_class(c) != cls {
-                        break;
-                    }
-                    p += 1;
-                }
-                p
-            }
+            Motion::ChangeWord => self.change_word_end(from, count, false),
+            Motion::ChangeBigWord => self.change_word_end(from, count, true),
+            // `t`/`T` land beside the found char; `f`/`F` land on it. A failed
+            // find keeps the caret where it is (vim).
+            Motion::FindChar(ch) => self.find_char(from, ch, count, true).unwrap_or(from),
+            Motion::FindCharBack(ch) => self.find_char(from, ch, count, false).unwrap_or(from),
             Motion::TillChar(ch) => {
-                let (line, col) = self.line_col_of(from);
-                self.rope
-                    .line(line)
-                    .chars()
-                    .enumerate()
-                    .skip(col + 1)
-                    .filter(|&(_, c)| c == ch)
-                    .nth(count - 1)
-                    .map_or(from, |(i, _)| self.rope.line_to_char(line) + i)
+                self.find_char(from, ch, count, true).map_or(from, |p| p - 1)
+            }
+            Motion::TillCharBack(ch) => {
+                self.find_char(from, ch, count, false).map_or(from, |p| p + 1)
             }
         }
     }
@@ -1120,19 +1446,21 @@ impl Document {
     }
 
     /// Start of the next word at/after `from`. Approximates vim `w`: skip the
-    /// current same-class run, then skip whitespace.
-    fn next_word_start(&self, from: usize) -> usize {
+    /// current same-class run, then skip whitespace. `big` is vim `W` — every
+    /// non-blank counts as one class, so punctuation never breaks a run.
+    fn next_word_start(&self, from: usize, big: bool) -> usize {
         let len = self.rope.len_chars();
         let mut p = from;
         if p >= len {
             return len;
         }
+        let cls = class_of(big);
         let c0 = self.rope.char(p);
         if !c0.is_whitespace() {
-            let cls = char_class(c0);
+            let c0 = cls(c0);
             while p < len {
                 let c = self.rope.char(p);
-                if c.is_whitespace() || char_class(c) != cls {
+                if c.is_whitespace() || cls(c) != c0 {
                     break;
                 }
                 p += 1;
@@ -1144,10 +1472,10 @@ impl Document {
         p
     }
 
-    /// End of the next word after `from` (vim `e`): always step forward at least
-    /// one char, skip whitespace, then land on the last char of that word-class
-    /// run. Stays put when no word follows.
-    fn next_word_end(&self, from: usize) -> usize {
+    /// End of the next word after `from` (vim `e`/`E`): always step forward at
+    /// least one char, skip whitespace, then land on the last char of that
+    /// class run. Stays put when no word follows.
+    fn next_word_end(&self, from: usize, big: bool) -> usize {
         let len = self.rope.len_chars();
         let mut p = from + 1;
         while p < len && self.rope.char(p).is_whitespace() {
@@ -1156,10 +1484,11 @@ impl Document {
         if p >= len {
             return from;
         }
-        let cls = char_class(self.rope.char(p));
+        let cls = class_of(big);
+        let c0 = cls(self.rope.char(p));
         while p + 1 < len {
             let next = self.rope.char(p + 1);
-            if next.is_whitespace() || char_class(next) != cls {
+            if next.is_whitespace() || cls(next) != c0 {
                 break;
             }
             p += 1;
@@ -1167,17 +1496,18 @@ impl Document {
         p
     }
 
-    /// Start of the word before `from`. Approximates vim `b`.
-    fn prev_word_start(&self, from: usize) -> usize {
+    /// Start of the word before `from`. Approximates vim `b`/`B`.
+    fn prev_word_start(&self, from: usize, big: bool) -> usize {
         let mut p = from;
         while p > 0 && self.rope.char(p - 1).is_whitespace() {
             p -= 1;
         }
         if p > 0 {
-            let cls = char_class(self.rope.char(p - 1));
+            let cls = class_of(big);
+            let c0 = cls(self.rope.char(p - 1));
             while p > 0 {
                 let prev = self.rope.char(p - 1);
-                if prev.is_whitespace() || char_class(prev) != cls {
+                if prev.is_whitespace() || cls(prev) != c0 {
                     break;
                 }
                 p -= 1;
@@ -1200,6 +1530,16 @@ fn char_class(c: char) -> CharClass {
         CharClass::Word
     } else {
         CharClass::Other
+    }
+}
+
+/// The classifier the word motions compare with: per-char for `w`, or a
+/// constant for `W`, where every non-blank belongs to one run.
+fn class_of(big: bool) -> fn(char) -> CharClass {
+    if big {
+        |_| CharClass::Word
+    } else {
+        char_class
     }
 }
 
@@ -1386,15 +1726,227 @@ mod tests {
     }
 
     #[test]
-    fn till_char_motion() {
+    fn find_and_till_motions() {
+        // "say (hi) x" — indices: s0 a1 y2 _3 (4 h5 i6 )7 _8 x9
         let mut d = Document::new("say (hi) x");
-        // Target is the found char itself — exclusive sweeps stop before it.
-        assert_eq!(d.motion_target(Motion::TillChar('('), 0, 1), 4);
-        // Count picks the n-th occurrence; not found → motion fails.
-        assert_eq!(d.motion_target(Motion::TillChar(')'), 0, 1), 7);
-        assert_eq!(d.motion_target(Motion::TillChar('z'), 0, 1), 0);
-        d.delete_motion(Motion::TillChar('x'), 1); // ct/dt sweep
+        // `f` lands on the char, `t` just before it.
+        assert_eq!(d.motion_target(Motion::FindChar('('), 0, 1), 4);
+        assert_eq!(d.motion_target(Motion::TillChar('('), 0, 1), 3);
+        // A count picks the n-th occurrence on the line.
+        assert_eq!(d.motion_target(Motion::FindChar(')'), 0, 1), 7);
+        // Backward from the tail: `F` onto the char, `T` just after it.
+        assert_eq!(d.motion_target(Motion::FindCharBack('('), 9, 1), 4);
+        assert_eq!(d.motion_target(Motion::TillCharBack('('), 9, 1), 5);
+        // Not found → the motion fails and the caret stays.
+        assert_eq!(d.motion_target(Motion::FindChar('z'), 0, 1), 0);
+        assert_eq!(d.motion_target(Motion::TillCharBack('z'), 9, 1), 9);
+        // A find never leaves the caret's line.
+        let d2 = Document::new("ab\ncx");
+        assert_eq!(d2.motion_target(Motion::FindChar('x'), 0, 1), 0);
+        // Operator sweeps: `dt` stops before the target, `df` takes it.
+        d.delete_motion(Motion::TillChar('x'), 1);
         assert_eq!(d.rope.to_string(), "x");
+        let mut d = Document::new("say (hi) x");
+        d.delete_motion(Motion::FindChar(')'), 1);
+        assert_eq!(d.rope.to_string(), " x");
+    }
+
+    #[test]
+    fn find_operator_sweep_stops_on_the_target() {
+        // "say \"hi (there) x\" ok" — the `x` is col 16, the closing quote 17.
+        // `dfx` is inclusive of the `x` and nothing past it.
+        let mut d = Document::new("say \"hi (there) x\" ok");
+        d.delete_motion(Motion::FindChar('x'), 1);
+        assert_eq!(d.rope.to_string(), "\" ok");
+    }
+
+    #[test]
+    fn till_char_adjacent_is_a_noop() {
+        // `dtx` with the target already next to the caret deletes nothing —
+        // the sweep and the caret coincide.
+        let mut d = Document::new("ax");
+        d.delete_motion(Motion::TillChar('x'), 1);
+        assert_eq!(d.rope.to_string(), "ax");
+    }
+
+    #[test]
+    fn big_word_motions_span_punctuation() {
+        let mut d = Document::new("see http://a.b/c end");
+        d.move_motion(Motion::BigWordForward, 1);
+        assert_eq!(d.caret_line_col(), (0, 4)); // start of the URL
+        // `W` clears the whole URL where `w` would stop at each punctuation run.
+        d.move_motion(Motion::BigWordForward, 1);
+        assert_eq!(d.caret_line_col(), (0, 17)); // "end"
+        d.move_motion(Motion::BigWordBackward, 1);
+        assert_eq!(d.caret_line_col(), (0, 4));
+        d.move_motion(Motion::BigWordEnd, 1);
+        assert_eq!(d.caret_line_col(), (0, 15)); // last char of the URL
+        // Contrast: plain `w` breaks the URL at its punctuation.
+        d.move_motion(Motion::LineStart, 1);
+        d.move_motion(Motion::WordForward, 2);
+        assert_eq!(d.caret_line_col(), (0, 8)); // the `:` run
+    }
+
+    #[test]
+    fn first_non_blank_and_goto_line() {
+        let d = Document::new("a\n    bb\nccc\n");
+        assert_eq!(d.motion_target(Motion::FirstNonBlank, 5, 1), 6);
+        // 1-based, landing on the first non-blank; past the end clamps.
+        assert_eq!(d.motion_target(Motion::GotoLine(2), 0, 1), 6);
+        assert_eq!(d.motion_target(Motion::GotoLine(1), 6, 1), 0);
+        assert_eq!(d.motion_target(Motion::GotoLine(99), 0, 1), 13);
+    }
+
+    #[test]
+    fn match_bracket_motion() {
+        // Nesting-aware, and it jumps both ways.
+        let d = Document::new("f(a(b)c)d");
+        assert_eq!(d.motion_target(Motion::MatchBracket, 0, 1), 7); // scans to `(` at 1
+        assert_eq!(d.motion_target(Motion::MatchBracket, 3, 1), 5);
+        assert_eq!(d.motion_target(Motion::MatchBracket, 7, 1), 1); // from the closer
+        // Spans lines, and fails (staying put) with no bracket on the line.
+        let d = Document::new("x {\n  y\n}\n");
+        assert_eq!(d.motion_target(Motion::MatchBracket, 0, 1), 8);
+        assert_eq!(d.motion_target(Motion::MatchBracket, 4, 1), 4);
+    }
+
+    #[test]
+    fn quote_object_spans() {
+        // `ci"` from inside the string.
+        let mut d = Document::new("say \"hi there\" ok");
+        d.move_motion(Motion::CharRight, 7);
+        d.delete_object(TextObject::Quote { ch: '"', around: false }, true);
+        assert_eq!(d.rope.to_string(), "say \"\" ok");
+
+        // `da\"` takes the quotes; a caret before the opener still finds the pair.
+        let mut d = Document::new("say \"hi\" ok");
+        d.delete_object(TextObject::Quote { ch: '"', around: true }, false);
+        assert_eq!(d.rope.to_string(), "say  ok");
+
+        // An empty pair has no inner span, so `i` no-ops.
+        let mut d = Document::new("a \"\" b");
+        d.move_motion(Motion::CharRight, 3);
+        d.delete_object(TextObject::Quote { ch: '"', around: false }, false);
+        assert_eq!(d.rope.to_string(), "a \"\" b");
+
+        // Unterminated quote: no pair, no edit. And quotes never leave the line.
+        let mut d = Document::new("a \"b\nc\" d");
+        d.move_motion(Motion::CharRight, 3);
+        d.delete_object(TextObject::Quote { ch: '"', around: false }, false);
+        assert_eq!(d.rope.to_string(), "a \"b\nc\" d");
+    }
+
+    #[test]
+    fn block_object_spans() {
+        // `di(` from inside, nesting-aware.
+        let mut d = Document::new("f(a(b)c)d");
+        d.move_motion(Motion::CharRight, 4); // on 'b'
+        d.delete_object(TextObject::Block { open: '(', close: ')', around: false }, false);
+        assert_eq!(d.rope.to_string(), "f(a()c)d");
+
+        // A caret on either bracket uses that pair; `a` takes the brackets.
+        let mut d = Document::new("f(ab)c");
+        d.move_motion(Motion::CharRight, 1); // on '('
+        d.delete_object(TextObject::Block { open: '(', close: ')', around: true }, false);
+        assert_eq!(d.rope.to_string(), "fc");
+        let mut d = Document::new("f(ab)c");
+        d.move_motion(Motion::CharRight, 4); // on ')'
+        d.delete_object(TextObject::Block { open: '(', close: ')', around: false }, false);
+        assert_eq!(d.rope.to_string(), "f()c");
+
+        // Spans lines.
+        let mut d = Document::new("x {\n  y\n} z");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_object(TextObject::Block { open: '{', close: '}', around: false }, false);
+        assert_eq!(d.rope.to_string(), "x {} z");
+
+        // Outside any pair: no edit.
+        let mut d = Document::new("no brackets");
+        d.delete_object(TextObject::Block { open: '(', close: ')', around: false }, false);
+        assert_eq!(d.rope.to_string(), "no brackets");
+    }
+
+    #[test]
+    fn select_object_sets_selection() {
+        // `viw` selects the word, head on its last char (charwise is inclusive).
+        let mut d = Document::new("foo bar baz");
+        d.move_motion(Motion::CharRight, 5); // on 'a' of "bar"
+        d.select_object(TextObject::Word { around: false });
+        assert_eq!(d.selections[0].anchor, 4);
+        assert_eq!(d.selections[0].head, 6);
+        // The span the selection yields matches what the operator would take.
+        assert_eq!(d.selection_span(false), (4, 7));
+    }
+
+    #[test]
+    fn join_lines_collapses_indent() {
+        // `J`: one space at the joint, the next line's indent dropped.
+        let mut d = Document::new("foo\n    bar\nbaz\n");
+        d.join_lines(1, true);
+        assert_eq!(d.rope.to_string(), "foo bar\nbaz\n");
+        assert_eq!(d.caret_offset(), 3); // on the inserted space
+
+        // A count names lines, so `3J` makes two joins.
+        let mut d = Document::new("a\nb\nc\nd\n");
+        d.join_lines(3, true);
+        assert_eq!(d.rope.to_string(), "a b c\nd\n");
+
+        // `gJ` splices verbatim, indent included.
+        let mut d = Document::new("foo\n    bar\n");
+        d.join_lines(1, false);
+        assert_eq!(d.rope.to_string(), "foo    bar\n");
+
+        // No second space when the joint already has one; none for a blank side.
+        let mut d = Document::new("foo \nbar\n");
+        d.join_lines(1, true);
+        assert_eq!(d.rope.to_string(), "foo bar\n");
+        let mut d = Document::new("\nbar\n");
+        d.join_lines(1, true);
+        assert_eq!(d.rope.to_string(), "bar\n");
+
+        // Nothing below: a no-op rather than eating the trailing newline.
+        let mut d = Document::new("only");
+        d.join_lines(1, true);
+        assert_eq!(d.rope.to_string(), "only");
+    }
+
+    #[test]
+    fn replace_char_needs_room() {
+        let mut d = Document::new("abcd\nx");
+        d.replace_char('-', 2);
+        assert_eq!(d.rope.to_string(), "--cd\nx");
+        assert_eq!(d.caret_offset(), 1); // on the last replaced char
+
+        // Vim fails the whole command rather than replacing what fits, and it
+        // never runs past the line into the next one.
+        let mut d = Document::new("ab\nxy");
+        d.replace_char('-', 5);
+        assert_eq!(d.rope.to_string(), "ab\nxy");
+    }
+
+    #[test]
+    fn toggle_case_flips_and_advances() {
+        let mut d = Document::new("aB c");
+        d.toggle_case(2);
+        assert_eq!(d.rope.to_string(), "Ab c");
+        assert_eq!(d.caret_offset(), 2);
+
+        // Stops at end of line instead of flipping into the next.
+        let mut d = Document::new("ab\ncd");
+        d.toggle_case(9);
+        assert_eq!(d.rope.to_string(), "AB\ncd");
+    }
+
+    #[test]
+    fn linewise_change_keeps_a_line_to_type_into() {
+        // `Vjc` clears both lines but leaves one empty for the insert.
+        let mut d = Document::new("aaa\nbbb\nccc\n");
+        d.extend_motion(Motion::LineDown, 1);
+        d.delete_selection(true, true);
+        assert_eq!(d.rope.to_string(), "\nccc\n");
+        assert_eq!(d.caret_offset(), 0);
+        // The register still holds the whole span, newline included.
+        assert_eq!(d.register_text(), "aaa\nbbb\n");
     }
 
     #[test]
@@ -1611,7 +2163,7 @@ mod tests {
         // Anchor on line 0, head dragged to line 1 → `Vjd` deletes both.
         let mut d = Document::new("aaa\nbbb\nccc\n");
         d.extend_motion(Motion::LineDown, 1);
-        d.delete_selection(true);
+        d.delete_selection(true, false);
         assert_eq!(d.rope.to_string(), "ccc\n");
         assert_eq!(d.caret_line_col(), (0, 0));
     }
@@ -1621,7 +2173,7 @@ mod tests {
         // anchor 0, head 2 selects "abc" (char under head included).
         let mut d = Document::new("abcdef");
         d.extend_motion(Motion::CharRight, 2);
-        d.delete_selection(false);
+        d.delete_selection(false, false);
         assert_eq!(d.rope.to_string(), "def");
     }
 
