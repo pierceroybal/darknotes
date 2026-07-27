@@ -244,7 +244,8 @@ pub enum ListContinuation {
 
 /// Decide how Enter / `o` continues a markdown list from `line` (newline
 /// stripped). Ordered markers increment (`1.` → `2.`); unordered repeat the
-/// bullet. Checkbox state isn't modeled, so `- [ ]` continues as a plain bullet.
+/// bullet. A task box counts as part of the marker: it carries onto the next
+/// line always unchecked, and doesn't count as item content.
 pub fn list_continuation(line: &str) -> ListContinuation {
     let trimmed = line.trim_start();
     let Some(marker_len) = list_marker(trimmed) else {
@@ -252,13 +253,17 @@ pub fn list_continuation(line: &str) -> ListContinuation {
     };
     let indent = &line[..line.len() - trimmed.len()];
     let marker = &trimmed[..marker_len];
-    // Content past the marker and its single trailing space (all ASCII so far).
-    let empty = trimmed[marker_len + 1..].trim().is_empty();
+    let task = task_box(line).is_some();
+    // Content past the marker, its single trailing space, and any task box (all
+    // ASCII so far). `- [ ]` with no trailing space ends exactly at the box.
+    let content_at = (marker_len + 1 + if task { 3 } else { 0 }).min(trimmed.len());
+    let empty = trimmed[content_at..].trim().is_empty();
     let next = match marker[..marker_len - 1].parse::<u64>() {
         Ok(n) => format!("{}{}", n + 1, &marker[marker_len - 1..]), // ordered: bump number
         Err(_) => marker.to_string(),                               // unordered: repeat bullet
     };
-    ListContinuation::Item { prefix: format!("{indent}{next} "), empty }
+    let box_str = if task { "[ ] " } else { "" };
+    ListContinuation::Item { prefix: format!("{indent}{next} {box_str}"), empty }
 }
 
 /// Single left-to-right pass for inline `code`, `**strong**`, `~~strike~~`,
@@ -835,6 +840,22 @@ mod tests {
             list_continuation("- "),
             Item { prefix: "- ".into(), empty: true }
         );
+        // Tasks continue as tasks, always unchecked; the box isn't content.
+        assert_eq!(
+            list_continuation("- [x] done"),
+            Item { prefix: "- [ ] ".into(), empty: false }
+        );
+        assert_eq!(
+            list_continuation("  2. [ ] a"),
+            Item { prefix: "  3. [ ] ".into(), empty: false }
+        );
+        for line in ["- [ ] ", "- [ ]"] {
+            assert_eq!(
+                list_continuation(line),
+                Item { prefix: "- [ ] ".into(), empty: true },
+                "{line}"
+            );
+        }
     }
 
     #[test]
