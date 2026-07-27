@@ -142,6 +142,36 @@ impl Editor {
         }
     }
 
+    /// `:capture {text}` — append a task line to the vault's `inbox.md`,
+    /// creating it on first use. Nothing about the current buffer moves: no
+    /// tab, no caret, no focus. That is the whole feature — capture that costs
+    /// navigation doesn't get used.
+    ///
+    /// Text that already opens a markdown list item is appended verbatim, so a
+    /// bare thought (`- idea: …`) rides the same command as a task.
+    pub(super) fn capture(&mut self, text: &str) {
+        let path = self.vault.root.join("inbox.md");
+        let is_new = !path.exists();
+        let line = if text.starts_with(['-', '*', '+']) {
+            text.to_string()
+        } else {
+            format!("- [ ] {text}")
+        };
+        // ponytail: writes disk, not the buffer. An `inbox.md` open and clean
+        // reloads via the watcher; open and dirty gets W12 and shows the line
+        // only after the user resolves it. Same contract as any outside edit —
+        // and the same path a `darknotes capture` CLI would take.
+        match append_line(&path, &line) {
+            Ok(()) => {
+                if is_new {
+                    self.rescan_vault(); // a first-ever capture must show in the sidebar
+                }
+                self.message = Some("captured to inbox.md".into());
+            }
+            Err(e) => self.message = Some(format!("capture failed: {e}")),
+        }
+    }
+
     /// Tab / `:b`-match display name: vault-relative path (`.md` dropped) for
     /// pathed buffers, `[No Name]` for scratch.
     pub(super) fn buffer_display(&self, b: &Buffer) -> String {
@@ -298,6 +328,18 @@ fn create_daily(root: &Path, date: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Append `text` as its own line, creating the file if absent and supplying the
+/// separator when the existing content doesn't end in a newline.
+fn append_line(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let lead = match std::fs::read_to_string(path) {
+        Ok(s) if !s.is_empty() && !s.ends_with('\n') => "\n",
+        _ => "",
+    };
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(f, "{lead}{text}")
+}
+
 /// Vault-relative path of `path`, forward-slashed — the switcher match key and
 /// label. The implied `.md` is dropped (`projects/ideas`); any other extension
 /// is kept (`sql/schema.sql`).
@@ -366,7 +408,9 @@ fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_daily, match_buffer, rel_display, resolve, resolve_link, unique_dest};
+    use super::{
+        append_line, create_daily, match_buffer, rel_display, resolve, resolve_link, unique_dest,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -390,6 +434,29 @@ mod tests {
         std::fs::write(root.join("templates").join("daily.md"), "# Log\n").unwrap();
         let p2 = create_daily(&root, "2026-07-18").unwrap();
         assert_eq!(std::fs::read_to_string(&p2).unwrap(), "# Log\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_line_creates_and_separates() {
+        let root = std::env::temp_dir().join("darknotes_append_line_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("inbox.md");
+
+        // Absent file: created, no leading blank line.
+        append_line(&path, "- [ ] one").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- [ ] one\n");
+
+        // Newline-terminated: appended straight on.
+        append_line(&path, "- [ ] two").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- [ ] one\n- [ ] two\n");
+
+        // No trailing newline: one is supplied, so nothing joins the last line.
+        std::fs::write(&path, "# Inbox").unwrap();
+        append_line(&path, "- [ ] three").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Inbox\n- [ ] three\n");
 
         let _ = std::fs::remove_dir_all(&root);
     }

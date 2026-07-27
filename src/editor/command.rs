@@ -56,6 +56,17 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, _a, win, _cx| ed.today(win),
     },
     Command {
+        name: "capture",
+        ex: &["capture"],
+        takes_arg: true,
+        // Bare (a leader key, or the palette) prefills the ex line as the
+        // capture prompt; with text it appends and stays put.
+        run: |ed, a, _win, _cx| match a.arg.as_deref() {
+            Some(text) => ed.capture(text),
+            None => ed.vim.start_command("capture "),
+        },
+    },
+    Command {
         name: "buffer",
         ex: &["b", "bu", "buffer"],
         takes_arg: true,

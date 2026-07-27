@@ -76,6 +76,7 @@ timeoutlen = 1000
 #
 # [keymap.normal] — vim normal mode only. Space is free (the de-facto leader):
 #   "space f" = "open-file"
+#   "space c" = "capture"    # opens the `:capture ` prompt, ready for the text
 #
 # [keymap.insert] — insert mode only. E.g. jk-to-escape:
 #   "j k" = "normal-mode"
