@@ -24,6 +24,8 @@ pub(super) enum PickItem {
     Buffer(usize),
     /// Insert `[[name]]` at the caret; payload is the `rel_display` name.
     InsertLink(String),
+    /// An agenda task: open its file and put the caret on its line.
+    TaskLine(PathBuf, usize),
 }
 
 /// The open fuzzy picker (file switcher / command palette) — a modal over the
@@ -89,6 +91,36 @@ impl Editor {
             Some(Picker { title: "[[ ", items, query: String::new(), results, selected: 0 });
     }
 
+    /// `:agenda` — today's open tasks, flat and fuzzy-filterable, `Enter` jumps
+    /// to the source line (where the ordinary task-toggle keys then work). The
+    /// bucket label leads each row, so typing `overdue` narrows to that group.
+    /// A flat list is the MVP: no date grouping, no editing from the list.
+    pub(super) fn open_agenda_picker(&mut self) {
+        let today = jiff::Zoned::now().date();
+        let root = self.vault.root.clone();
+        let items: Vec<(String, PickItem)> = crate::tasks::agenda(&self.vault, today)
+            .into_iter()
+            .map(|t| {
+                // `path:line` ahead of the text, grep/quickfix order.
+                let display = format!(
+                    "{:<7} {}:{}  {}",
+                    t.bucket(today).label(),
+                    rel_display(&root, &t.path),
+                    t.line + 1,
+                    t.text
+                );
+                (display, PickItem::TaskLine(t.path, t.line))
+            })
+            .collect();
+        if items.is_empty() {
+            self.message = Some("agenda: nothing due".into());
+            return;
+        }
+        let results = (0..items.len()).collect();
+        self.picker =
+            Some(Picker { title: "agenda> ", items, query: String::new(), results, selected: 0 });
+    }
+
     /// Open the command palette: every registry command, its primary ex alias
     /// appended to the display so typing `:w`-style names finds it too.
     pub(super) fn open_command_palette(&mut self) {
@@ -128,6 +160,15 @@ impl Editor {
                             PickItem::File(path) => self.open_path(path, window), // refocuses the editor
                             PickItem::Command(name) => self.run_picked_command(name, window, cx),
                             PickItem::Buffer(i) => self.activate(i, window),
+                            PickItem::TaskLine(path, line) => {
+                                self.open_path(path, window); // refocuses the editor
+                                // The scan is a snapshot: clamp, in case the
+                                // file shrank since the agenda was opened.
+                                let rope = &self.doc().rope;
+                                let line = line.min(rope.len_lines().saturating_sub(1));
+                                let at = rope.line_to_char(line);
+                                self.doc_mut().jump_to(at);
+                            }
                             PickItem::InsertLink(name) => {
                                 // Bypasses feed_vim's undo checkpointing, so
                                 // checkpoint here or `u` swallows earlier edits.

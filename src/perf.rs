@@ -62,6 +62,15 @@ mod real {
         }
     }
 
+    /// Pair with `t0` around a task scan. Separate from `scan_done` because the
+    /// costs differ in kind: the vault scan walks directories, this one reads
+    /// every note's bytes.
+    pub fn task_scan_done(t0: Option<Instant>, files: usize, tasks: usize) {
+        if let Some(t) = t0 {
+            eprintln!("perf: task scan {files} files, {tasks} tasks in {:.1?}", t.elapsed());
+        }
+    }
+
     /// `", rss 48MB"`, or empty where /proc is unavailable (non-Linux).
     fn rss() -> String {
         std::fs::read_to_string("/proc/self/status")
@@ -101,4 +110,6 @@ mod noop {
     }
     #[inline(always)]
     pub fn scan_done(_: Option<Instant>, _: usize) {}
+    #[inline(always)]
+    pub fn task_scan_done(_: Option<Instant>, _: usize, _: usize) {}
 }

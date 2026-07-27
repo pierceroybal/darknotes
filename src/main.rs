@@ -5,6 +5,7 @@ mod keymap;
 mod markdown;
 mod perf;
 mod session;
+mod tasks;
 mod theme;
 mod vault;
 mod vim;

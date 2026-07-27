@@ -67,6 +67,12 @@ pub(super) const COMMANDS: &[Command] = &[
         },
     },
     Command {
+        name: "agenda",
+        ex: &["agenda"],
+        takes_arg: false,
+        run: |ed, _a, _win, _cx| ed.open_agenda_picker(),
+    },
+    Command {
         name: "buffer",
         ex: &["b", "bu", "buffer"],
         takes_arg: true,
