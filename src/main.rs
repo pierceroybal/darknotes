@@ -1,6 +1,7 @@
 mod config;
 mod document;
 mod editor;
+mod grep;
 mod keymap;
 mod markdown;
 mod perf;

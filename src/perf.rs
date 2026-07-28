@@ -71,6 +71,15 @@ mod real {
         }
     }
 
+    /// Pair with `t0` around a grep snapshot (fires when the content picker
+    /// opens, never per frame or per keystroke). Same cost class as
+    /// `task_scan_done` — reads every note's bytes.
+    pub fn grep_snapshot_done(t0: Option<Instant>, files: usize, lines: usize) {
+        if let Some(t) = t0 {
+            eprintln!("perf: grep snapshot {files} files, {lines} lines in {:.1?}", t.elapsed());
+        }
+    }
+
     /// `", rss 48MB"`, or empty where /proc is unavailable (non-Linux).
     fn rss() -> String {
         std::fs::read_to_string("/proc/self/status")
@@ -112,4 +121,6 @@ mod noop {
     pub fn scan_done(_: Option<Instant>, _: usize) {}
     #[inline(always)]
     pub fn task_scan_done(_: Option<Instant>, _: usize, _: usize) {}
+    #[inline(always)]
+    pub fn grep_snapshot_done(_: Option<Instant>, _: usize, _: usize) {}
 }

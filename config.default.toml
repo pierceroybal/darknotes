@@ -63,8 +63,8 @@ watch_files = true
 timeoutlen = 1000
 
 # Bindings map a key sequence to a command name (browse the command palette,
-# Ctrl-Shift-P, for the full list: save, open-file, command-palette, redo,
-# quit, normal-mode, focus-sidebar, …). A sequence is whitespace-separated
+# Ctrl-Shift-P, for the full list: save, open-file, search-notes,
+# command-palette, redo, quit, normal-mode, focus-sidebar, …). A sequence is whitespace-separated
 # keystrokes, each [ctrl-][alt-][shift-]key: "ctrl-s", "space f", "j k".
 #
 # [keymap.global] — live in every mode. These are the built-in defaults;
@@ -72,10 +72,13 @@ timeoutlen = 1000
 #   "ctrl-s"       = "save"
 #   "ctrl-p"       = "open-file"
 #   "ctrl-shift-p" = "command-palette"
+#   "ctrl-shift-f" = "search-notes"
 #   "ctrl-r"       = "redo"
+#   "ctrl-6"       = "buffer-alternate"
 #
 # [keymap.normal] — vim normal mode only. Space is free (the de-facto leader):
 #   "space f" = "open-file"
+#   "space g" = "search-notes"  # vault-wide content search
 #   "space c" = "capture"    # opens the `:capture ` prompt, ready for the text
 #
 # [keymap.insert] — insert mode only. E.g. jk-to-escape:

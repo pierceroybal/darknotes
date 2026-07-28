@@ -73,6 +73,15 @@ pub(super) const COMMANDS: &[Command] = &[
         run: |ed, _a, _win, _cx| ed.open_agenda_picker(),
     },
     Command {
+        name: "search-notes",
+        ex: &["gr", "grep"],
+        takes_arg: true,
+        // Vim's `:gr[ep]`. With a pattern the picker opens prefiltered; bare —
+        // or from the palette, which pre-fills `:gr ` — it opens empty and the
+        // picker's own query line takes over.
+        run: |ed, a, _win, _cx| ed.open_grep_picker(a.arg.as_deref()),
+    },
+    Command {
         name: "buffer",
         ex: &["b", "bu", "buffer"],
         takes_arg: true,
@@ -238,6 +247,7 @@ pub(super) const DEFAULT_BINDINGS: &[(Ctx, &str, &str)] = &[
     (Ctx::Global, "ctrl-s", "save"),
     (Ctx::Global, "ctrl-p", "open-file"),
     (Ctx::Global, "ctrl-shift-p", "command-palette"),
+    (Ctx::Global, "ctrl-shift-f", "search-notes"),
     (Ctx::Global, "ctrl-r", "redo"),
     // Vim's Ctrl-^ alternate-buffer toggle, on its US-layout key.
     (Ctx::Global, "ctrl-6", "buffer-alternate"),

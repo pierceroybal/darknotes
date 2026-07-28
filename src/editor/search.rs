@@ -56,6 +56,15 @@ impl Editor {
         self.find_and_jump(backward, 1);
     }
 
+    /// Adopt `query` as the search register and light hlsearch, without moving
+    /// the caret — what a content-search pick does so `n`/`N` continue from
+    /// where it landed.
+    pub(super) fn seed_search(&mut self, query: String) {
+        self.search.query = query;
+        self.search.backward = false;
+        self.search.hl = true;
+    }
+
     /// `n`/`N`: repeat the last search; `reverse` flips its stored direction.
     pub(super) fn search_next(&mut self, reverse: bool, count: usize) {
         if self.search.query.is_empty() {
