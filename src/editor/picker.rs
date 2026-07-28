@@ -45,8 +45,8 @@ const ELIDE_AFTER: usize = 48;
 /// length, snapped forward to a word start so a row never opens mid-word.
 const LEAD_CHARS: usize = 32;
 
-/// What a picker row resolves to on Enter. New picker kinds add a variant
-/// (jump-to-heading → `Line(usize)`).
+/// What a picker row resolves to on Enter. A new picker kind either reuses a
+/// variant (an outline picker is a `FileLine` per heading) or adds one.
 pub(super) enum PickItem {
     File(PathBuf),
     /// A registry command, by `Command::name`.
