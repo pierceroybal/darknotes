@@ -93,6 +93,16 @@ pub enum Action {
     /// the applied actions, insert session included) and expands this before
     /// dispatch; the grammar only names the request.
     Repeat,
+    /// `Ctrl-O`/`Ctrl-I`: walk the jump history older/newer. The editor owns
+    /// the list (it spans buffers) and the file switching.
+    JumpBack,
+    JumpForward,
+    /// `m{a}`: name the caret's position. Lowercase marks live on the buffer,
+    /// uppercase on the editor — the editor owns both stores.
+    SetMark(char),
+    /// `` `{a} `` / `'{a}`: to the mark, exactly or to its line's first
+    /// non-blank. `''`/`` `` `` name the jumplist's newest entry.
+    JumpToMark { name: char, line: bool },
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -147,6 +157,19 @@ impl Action {
                 | Action::YankObject(..)
                 | Action::YankSelection { .. }
         )
+    }
+
+    /// Whether this records a jumplist entry — the position it leaves becomes a
+    /// `Ctrl-O` target. Only within-buffer jumps: anything that opens a file by
+    /// path records in `Editor::open_path` instead, and recording a
+    /// `JumpBack`/`JumpForward` would truncate the history being walked.
+    /// `JumpToMark` may or may not cross files, so it records in its handler.
+    pub fn is_jump(&self) -> bool {
+        match self {
+            Action::Move(m, _) => m.is_jump(),
+            Action::Search { .. } | Action::SearchNext { .. } => true,
+            _ => false,
+        }
     }
 
     /// Deletes that can remove or merge list lines — the editor renumbers the
@@ -218,6 +241,10 @@ enum Pending {
     ZPrefix,
     /// `>`/`<` awaiting its double (`>>`/`<<`); any other key aborts.
     Indent { dedent: bool },
+    /// `m` / `'` / `` ` `` was pressed; the next key names the mark. `set`
+    /// distinguishes `m{a}` from a jump, `line` the `'{a}` (first non-blank of
+    /// the line) form from `` `{a} `` (exact position).
+    Mark { set: bool, line: bool },
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
@@ -337,10 +364,11 @@ impl Vim {
             return vec![];
         }
 
-        // The viewport scrolls are the only chord commands; every other combo
-        // (Ctrl/Alt/Cmd) clears state and drops — the editor intercepts the
-        // chords it cares about (Ctrl-S/N/P) before the grammar, and without
-        // the drop `Ctrl-a` would fall through and trigger `a`.
+        // The viewport scrolls and the jumplist walk are the only chord
+        // commands; every other combo (Ctrl/Alt/Cmd) clears state and drops —
+        // the editor intercepts the chords it cares about (Ctrl-S/N/P) before
+        // the grammar, and without the drop `Ctrl-a` would fall through and
+        // trigger `a`.
         if m.control || m.alt || m.platform {
             self.pending = Pending::None;
             let acts = if m.control && !m.alt && !m.platform {
@@ -349,6 +377,11 @@ impl Vim {
                     "u" => vec![Action::ScrollHalf { down: false }],
                     "e" => vec![Action::ScrollLines { down: true, count: self.take_count() }],
                     "y" => vec![Action::ScrollLines { down: false, count: self.take_count() }],
+                    "o" => vec![Action::JumpBack],
+                    // Only `i`. Terminals fold Ctrl-I into Ctrl-Tab; claiming
+                    // `tab` here would squat on the chord that wants to mean
+                    // cycle-tabs (`buffer-next`).
+                    "i" => vec![Action::JumpForward],
                     _ => vec![],
                 }
             } else {
@@ -388,7 +421,8 @@ impl Vim {
             Pending::ZPrefix => return self.complete_z_prefix(key),
             Pending::Indent { dedent } => return self.complete_indent(dedent, key),
             // Resolved above, before count parsing.
-            Pending::Find { .. } | Pending::Replace { .. } | Pending::None => {}
+            Pending::Find { .. } | Pending::Replace { .. } | Pending::Mark { .. }
+            | Pending::None => {}
         }
 
         // Motions come from one table shared with visual and operator-pending;
@@ -423,6 +457,20 @@ impl Vim {
             // `r`: the next key is the replacement char.
             ("r", false) => {
                 self.pending = Pending::Replace { count: self.take_count() };
+                vec![]
+            }
+            // `m`/`'`/`` ` ``: the next key names the mark. Both quote keys are
+            // otherwise only consumed after `i`/`a` (`i'`, `` i` ``), never bare.
+            ("m", false) => {
+                self.pending = Pending::Mark { set: true, line: false };
+                vec![]
+            }
+            ("'", _) => {
+                self.pending = Pending::Mark { set: false, line: true };
+                vec![]
+            }
+            ("`", _) => {
+                self.pending = Pending::Mark { set: false, line: false };
                 vec![]
             }
             ("~", _) => vec![Action::ToggleCase(self.take_count())],
@@ -810,9 +858,10 @@ impl Vim {
     }
 
     /// Resolve a pending state whose next key is a literal character — the
-    /// target of `f`/`F`/`t`/`T` or the replacement of `r`. `None` means no such
-    /// state is pending and the caller handles the key itself. A key that
-    /// produces no char (arrows, Enter, Escape) aborts.
+    /// target of `f`/`F`/`t`/`T`, the replacement of `r`, or the name of a mark
+    /// (`ma`, `` `a ``). `None` means no such state is pending and the caller
+    /// handles the key itself. A key that produces no char (arrows, Enter,
+    /// Escape) aborts.
     fn resolve_literal(&mut self, ks: &Keystroke) -> Option<Vec<Action>> {
         let ch = ks.key_char.as_ref().and_then(|s| s.chars().next());
         match std::mem::replace(&mut self.pending, Pending::None) {
@@ -825,6 +874,11 @@ impl Vim {
                     self.last_find = Some(m);
                     self.find_actions(m, op, count)
                 }
+                None => vec![],
+            }),
+            Pending::Mark { set, line } => Some(match ch {
+                Some(c) if set => vec![Action::SetMark(c)],
+                Some(c) => vec![Action::JumpToMark { name: c, line }],
                 None => vec![],
             }),
             other => {
@@ -1814,6 +1868,62 @@ mod tests {
         // A count multiplies the line scroll.
         v.on_key(&k("3"));
         assert_eq!(v.on_key(&ctrl("y")), vec![Action::ScrollLines { down: false, count: 3 }]);
+    }
+
+    #[test]
+    fn ctrl_o_and_i_walk_the_jumplist() {
+        let mut v = vim();
+        let ctrl = |key: &str| Keystroke {
+            key: key.into(),
+            key_char: Some(key.into()),
+            modifiers: Modifiers { control: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&ctrl("o")), vec![Action::JumpBack]);
+        assert_eq!(v.on_key(&ctrl("i")), vec![Action::JumpForward]);
+        // Ctrl-Tab is left free for a cycle-tabs binding.
+        assert_eq!(v.on_key(&ctrl("tab")), vec![]);
+    }
+
+    #[test]
+    fn only_jump_motions_record() {
+        assert!(Action::Move(Motion::FileEnd, 1).is_jump());
+        assert!(Action::Move(Motion::GotoLine(12), 1).is_jump()); // `3G`
+        assert!(Action::SearchNext { reverse: false, count: 1 }.is_jump());
+        assert!(!Action::Move(Motion::WordForward, 1).is_jump());
+        assert!(!Action::ScrollHalf { down: true }.is_jump());
+        assert!(!Action::JumpBack.is_jump()); // walking is not jumping
+        assert!(!Action::JumpToMark { name: 'a', line: false }.is_jump()); // records itself
+    }
+
+    #[test]
+    fn mark_set_and_jump() {
+        let mut v = vim();
+        assert_eq!(v.on_key(&k("m")), vec![]); // awaiting the name
+        assert_eq!(v.on_key(&k("a")), vec![Action::SetMark('a')]);
+        assert_eq!(v.on_key(&k("`")), vec![]);
+        assert_eq!(v.on_key(&k("a")), vec![Action::JumpToMark { name: 'a', line: false }]);
+        assert_eq!(v.on_key(&k("'")), vec![]);
+        assert_eq!(v.on_key(&k("a")), vec![Action::JumpToMark { name: 'a', line: true }]);
+        // `''` — the position before the latest jump.
+        v.on_key(&k("'"));
+        assert_eq!(v.on_key(&k("'")), vec![Action::JumpToMark { name: '\'', line: true }]);
+        // A digit after `m` is the mark name, not a count.
+        v.on_key(&k("m"));
+        assert_eq!(v.on_key(&k("2")), vec![Action::SetMark('2')]);
+        // Escape abandons the pending name.
+        v.on_key(&k("m"));
+        assert_eq!(v.on_key(&named("escape")), vec![]);
+        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
+        // Quote text objects still work — `'` is only a mark key when bare.
+        v.on_key(&k("d"));
+        v.on_key(&k("i"));
+        assert_eq!(
+            v.on_key(&k("'")),
+            vec![Action::DeleteObject {
+                obj: TextObject::Quote { ch: '\'', around: false },
+                change: false
+            }]
+        );
     }
 
     #[test]

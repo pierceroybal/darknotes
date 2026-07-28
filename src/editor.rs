@@ -8,7 +8,7 @@ mod search;
 mod sidebar;
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -19,7 +19,8 @@ use gpui::{
     Pixels, ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
 };
 use crate::config::{Config, LineNumbers, Search as SearchConfig};
-use crate::document::Document;
+use crate::document::{Document, Motion};
+use crate::jumps::{Jumps, Pos};
 use crate::keymap::{Ctx, Resolver};
 use buffers::{open_or_empty, rel_display, resolve, resolve_link, unique_dest, with_md_ext, Buffer};
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
@@ -177,6 +178,12 @@ pub struct Editor {
     picker: Option<Picker>,
     /// Drives the picker results list scroll (scroll-to-selected).
     picker_scroll: UniformListScrollHandle,
+    /// Cross-note jump history (`Ctrl-O`/`Ctrl-I`). On the editor, not the
+    /// document — like the search register, it spans buffer switches.
+    jumps: Jumps,
+    /// `mA`–`mZ`: global marks, each carrying its file. Lowercase marks are
+    /// per-buffer and live on the `Document`.
+    marks: HashMap<char, Pos>,
     /// `/`-search state (`/`, `?`, `n`, `N`, hlsearch).
     search: SearchState,
     /// Search options from config (ignorecase, hlsearch, …).
@@ -324,6 +331,8 @@ impl Editor {
             repeat_timer: None,
             picker: None,
             picker_scroll: UniformListScrollHandle::new(),
+            jumps: Jumps::default(),
+            marks: HashMap::new(),
             search: SearchState::default(),
             search_cfg: config.search,
             cursor_blink: config.cursor_blink,
@@ -1112,9 +1121,102 @@ impl Editor {
         }));
     }
 
+    /// The caret's spot, or `None` in an unnamed buffer (nothing to reopen by).
+    fn here(&self) -> Option<Pos> {
+        Some(Pos {
+            path: self.doc().path()?.to_path_buf(),
+            line: self.doc().caret_line_col().0,
+            offset: self.doc().caret_offset(),
+        })
+    }
+
+    /// Record the caret's spot as a jump origin. Call *before* the move.
+    fn push_jump(&mut self) {
+        if let Some(pos) = self.here() {
+            self.jumps.push(pos);
+        }
+    }
+
+    /// `Ctrl-O`/`Ctrl-I`. Silent at either end of the list, like vim.
+    fn jump_history(&mut self, back: bool, window: &mut Window) {
+        let here = self.here();
+        let Some(target) = (if back { self.jumps.back(here) } else { self.jumps.forward() })
+        else {
+            return;
+        };
+        self.goto(&target, false, window);
+    }
+
+    /// Put the caret on `target`, opening its file if it isn't the active
+    /// buffer. `record` pushes the position we leave — off for a jumplist walk,
+    /// which must not rewrite the history it is walking.
+    ///
+    /// A stored position is a snapshot and doesn't track edits above it, so the
+    /// offset can be stale: `jump_to` clamps it into the rope, and `feed_vim`'s
+    /// normal-mode snap fixes the column.
+    fn goto(&mut self, target: &Pos, record: bool, window: &mut Window) {
+        if self.doc().path() != Some(target.path.as_path()) {
+            match record {
+                true => self.open_path(target.path.clone(), window),
+                false => self.open_path_quiet(target.path.clone(), window),
+            }
+        } else if record {
+            self.push_jump();
+        }
+        self.doc_mut().jump_to(target.offset);
+    }
+
+    /// `m{a}`. Lowercase is per-buffer (vim: `ma` in two files, two marks);
+    /// uppercase carries its file. Anything else is not a mark name.
+    fn set_mark(&mut self, name: char) {
+        match name {
+            'a'..='z' => {
+                let at = self.doc().caret_offset();
+                self.doc_mut().set_mark(name, at);
+            }
+            'A'..='Z' => {
+                if let Some(pos) = self.here() {
+                    self.marks.insert(name, pos);
+                }
+            }
+            _ => self.message = Some(format!("E191: Argument must be a letter: {name}")),
+        }
+    }
+
+    /// `` `{a} `` / `'{a}`, and `` `` ``/`''` (the position before the latest
+    /// jump — the jumplist's newest entry). `line` lands on the target line's
+    /// first non-blank instead of its exact column.
+    fn jump_to_mark(&mut self, name: char, line: bool, window: &mut Window) {
+        let target = match name {
+            '\'' | '`' => self.jumps.last().cloned(),
+            // A lowercase mark is this buffer's, so it has no path of its own.
+            'a'..='z' => self.doc().mark(name).and_then(|offset| {
+                Some(Pos { path: self.doc().path()?.to_path_buf(), line: 0, offset })
+            }),
+            'A'..='Z' => self.marks.get(&name).cloned(),
+            _ => {
+                self.message = Some(format!("E191: Argument must be a letter: {name}"));
+                return;
+            }
+        };
+        let Some(target) = target else {
+            self.message = Some(format!("E20: Mark not set: {name}"));
+            return;
+        };
+        self.goto(&target, true, window);
+        if line {
+            self.doc_mut().move_motion(Motion::FirstNonBlank, 1);
+        }
+    }
+
     /// The single execution seam every input grammar funnels through.
     fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         let renumbers = action.renumbers();
+        // Record where a jump leaves from, before it moves the caret. Opens by
+        // path record in `open_path` instead — see `Action::is_jump`.
+        if action.is_jump() {
+            self.push_jump();
+        }
         match action {
             // In visual mode a motion drags the selection's head; otherwise it
             // just moves the caret.
@@ -1203,6 +1305,10 @@ impl Editor {
                 let line = self.doc().caret_line_col().0;
                 self.toggle_task(line);
             }
+            Action::JumpBack => self.jump_history(true, window),
+            Action::JumpForward => self.jump_history(false, window),
+            Action::SetMark(name) => self.set_mark(name),
+            Action::JumpToMark { name, line } => self.jump_to_mark(name, line, window),
             // Expanded into the recorded change in `feed_vim`, before dispatch;
             // never reaches here.
             Action::Repeat => {}

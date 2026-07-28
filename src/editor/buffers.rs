@@ -32,7 +32,16 @@ impl Editor {
 
     /// Open a file by path (sidebar click / Enter / switcher / `:e`): switch
     /// to its buffer if one is already open, else show it in the preview slot.
+    /// Records where we left, so `Ctrl-O` returns to it — every by-path open
+    /// funnels through here, so no open site can forget to.
     pub(super) fn open_path(&mut self, path: PathBuf, window: &mut Window) {
+        self.push_jump(); // before the switch: reads the caret we're leaving
+        self.open_path_quiet(path, window);
+    }
+
+    /// `open_path` without recording — for the `Ctrl-O`/`Ctrl-I` restore, which
+    /// must not rewrite the history it is walking.
+    pub(super) fn open_path_quiet(&mut self, path: PathBuf, window: &mut Window) {
         if let Some(i) = self.buffers.iter().position(|b| b.doc.path() == Some(path.as_path())) {
             self.activate(i, window);
             return;
@@ -62,6 +71,11 @@ impl Editor {
     }
 
     /// Switch to buffer `i`, recording where we came from for `Ctrl-6`/`:b #`.
+    ///
+    /// Deliberately *not* a jumplist entry: cycling between open buffers
+    /// (`Ctrl-6`, `:bn`, `gt`) is a move between containers, not a jump to a
+    /// position, and recording it would make `Ctrl-O` replay tab visits.
+    /// By-path opens record in `open_path`.
     pub(super) fn activate(&mut self, i: usize, window: &mut Window) {
         if i != self.active {
             self.alternate = Some(self.active);

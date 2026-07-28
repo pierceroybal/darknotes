@@ -1,4 +1,5 @@
 use ropey::Rope;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,6 +91,20 @@ impl Motion {
     fn is_vertical(self) -> bool {
         matches!(self, Motion::LineUp | Motion::LineDown)
     }
+
+    /// Vim's "jump" motions: the ones that record a jumplist entry, so `Ctrl-O`
+    /// can come back. Relative moves (chars, words, `f`/`t`, line ends) don't.
+    pub fn is_jump(self) -> bool {
+        matches!(
+            self,
+            Motion::FileStart
+                | Motion::FileEnd
+                | Motion::GotoLine(_)
+                | Motion::ParaBackward
+                | Motion::ParaForward
+                | Motion::MatchBracket
+        )
+    }
 }
 
 /// A text object: the region around the caret an operator acts on (`diw`,
@@ -158,6 +173,12 @@ pub struct Document {
     /// each line), so passing through short lines doesn't truncate the column.
     /// Any horizontal move or edit resets it to the actual column.
     goal_col: usize,
+    /// `m{a}`–`m{z}`: char offsets, per buffer as in vim (`ma` in two files is
+    /// two marks). Uppercase marks are global and live on the editor. Offsets
+    /// are raw — an edit above a mark leaves it pointing at a shifted spot, and
+    /// a jump to it clamps. Vim adjusts; matching that means routing every
+    /// edit's `(offset, delta)` through here.
+    marks: HashMap<char, usize>,
 }
 
 /// Source of `Document::revision` values — see that field's doc.
@@ -181,6 +202,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             goal_col: 0,
+            marks: HashMap::new(),
         }
     }
 
@@ -205,6 +227,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             goal_col: 0,
+            marks: HashMap::new(),
         })
     }
 
@@ -307,6 +330,16 @@ impl Document {
     /// Place the caret at an absolute char offset, clamped to the buffer.
     pub fn jump_to(&mut self, at: usize) {
         self.set_caret(at.min(self.rope.len_chars()));
+    }
+
+    /// `m{a}`: name `at` in this buffer (see the `marks` field doc).
+    pub fn set_mark(&mut self, name: char, at: usize) {
+        self.marks.insert(name, at);
+    }
+
+    /// A lowercase mark's offset, if set in this buffer.
+    pub fn mark(&self, name: char) -> Option<usize> {
+        self.marks.get(&name).copied()
     }
 
     fn set_caret(&mut self, at: usize) {
