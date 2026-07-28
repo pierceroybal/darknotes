@@ -1323,15 +1323,28 @@ impl Editor {
 
     /// `gd`/`gf`/`gx`: follow the link under the caret. A wikilink opens its
     /// note, or a blank named buffer if it doesn't exist yet (created on `:w`,
-    /// like `:e`); an external URL opens in the browser. Off a link it's a
-    /// silent no-op.
+    /// like `:e`); a `#Heading` fragment then lands on that heading, and a
+    /// note-less `[[#Heading]]` stays in the current document. An external URL
+    /// opens in the browser. Off a link it's a silent no-op.
     fn follow_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (line, col) = self.doc().caret_line_col();
         let text = line_text(&self.doc().rope, line);
-        if let Some(target) = markdown::wikilink_at(&text, col) {
-            match resolve_link(&self.vault.root, &self.vault.files, &target) {
-                Some(path) => self.open_path(path, window),
-                None => self.edit(&target, false, window),
+        if let Some((note, heading)) = markdown::wikilink_at(&text, col) {
+            if note.is_empty() {
+                // Same document: no buffer switch to record the origin for us.
+                self.push_jump();
+            } else {
+                match resolve_link(&self.vault.root, &self.vault.files, &note) {
+                    Some(path) => self.open_path(path, window),
+                    // Nothing to search in a buffer that doesn't exist yet.
+                    None => return self.edit(&note, false, window),
+                }
+            }
+            if let Some(heading) = heading {
+                match heading_line(&self.doc().rope, &heading) {
+                    Some(l) => self.jump_to_line_col(l, 0),
+                    None => self.message = Some(format!("no heading: {heading}")),
+                }
             }
         } else if let Some(url) = markdown::url_at(&text, col) {
             cx.open_url(&url);
@@ -1972,6 +1985,17 @@ impl Render for Editor {
 /// Text of line `i` without its trailing newline.
 fn line_text(rope: &ropey::Rope, i: usize) -> String {
     rope.line(i).chars().filter(|c| *c != '\n').collect()
+}
+
+/// Line of the first heading titled `name`, case-insensitively and ignoring the
+/// `#` markers — the target of a `[[note#Heading]]` link. Duplicate titles
+/// resolve to the first, matching how a duplicate note stem resolves.
+// ponytail: ASCII-only case folding, like wikilink note resolution. Whole-line
+// scan, fine at note scale; index headings per buffer if it ever isn't.
+fn heading_line(rope: &ropey::Rope, name: &str) -> Option<usize> {
+    (0..rope.len_lines()).find(|&i| {
+        markdown::heading_text(&line_text(rope, i)).is_some_and(|t| t.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Invert a conceal source→display byte map: the source byte displayed at

@@ -163,7 +163,8 @@ impl Action {
     /// `Ctrl-O` target. Only within-buffer jumps: anything that opens a file by
     /// path records in `Editor::open_path` instead, and recording a
     /// `JumpBack`/`JumpForward` would truncate the history being walked.
-    /// `JumpToMark` may or may not cross files, so it records in its handler.
+    /// `JumpToMark` and `FollowLink` may or may not cross files, so they record
+    /// in their handlers.
     pub fn is_jump(&self) -> bool {
         match self {
             Action::Move(m, _) => m.is_jump(),

@@ -331,8 +331,11 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 let inner = &text[i + 2..close];
                 if !inner.is_empty() {
                     // `[[target|alias]]`: conceal `[[target|`, show the alias.
+                    // A note-less `[[#Heading]]` also conceals the `#`, so it
+                    // reads as the heading's title rather than a tag.
                     let vis = match inner.find('|') {
                         Some(p) => i + 2 + p + 1,
+                        None if inner.starts_with('#') => i + 3,
                         None => i + 2,
                     };
                     out.push(Span { range: i..vis, kind: SpanKind::Marker });
@@ -387,10 +390,12 @@ fn bare_url_end(text: &str, start: usize) -> usize {
     end
 }
 
-/// The wikilink target under `char_col` in `line` (newline stripped), if any.
-/// The full `[[...]]` span counts, brackets included. `|alias` and `#fragment`
-/// are dropped — the caller gets just the note name.
-pub fn wikilink_at(line: &str, char_col: usize) -> Option<String> {
+/// The wikilink under `char_col` in `line` (newline stripped), if any, as
+/// `(note, heading)`. The full `[[...]]` span counts, brackets included;
+/// `|alias` is dropped. Either half can be absent: `[[note]]` targets a note's
+/// start, `[[note#Sec]]` a heading in it, `[[#Sec]]` a heading in the document
+/// the link itself lives in (empty note name). A link with neither is `None`.
+pub fn wikilink_at(line: &str, char_col: usize) -> Option<(String, Option<String>)> {
     let byte = line.char_indices().nth(char_col).map_or(line.len(), |(b, _)| b);
     let mut from = 0;
     while let Some(open) = line[from..].find("[[").map(|p| from + p) {
@@ -399,12 +404,29 @@ pub fn wikilink_at(line: &str, char_col: usize) -> Option<String> {
             if byte < open {
                 return None; // caret sits before this link; links don't nest
             }
-            let target = line[open + 2..close].split(['|', '#']).next().unwrap_or("").trim();
-            return (!target.is_empty()).then(|| target.to_string());
+            let body = line[open + 2..close].split('|').next().unwrap_or("");
+            let (note, heading) = match body.split_once('#') {
+                Some((n, h)) => (n.trim(), Some(h.trim()).filter(|h| !h.is_empty())),
+                None => (body.trim(), None),
+            };
+            if note.is_empty() && heading.is_none() {
+                return None;
+            }
+            return Some((note.to_string(), heading.map(str::to_string)));
         }
         from = close + 2;
     }
     None
+}
+
+/// A heading line's title: the text after the `#` markers, trimmed. `None` if
+/// the line isn't a heading. Inline markup stays in — `## **Bold**` titles
+/// itself `**Bold**`.
+pub fn heading_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    // `heading_level` counts leading ASCII `#`, so the slice is on a boundary.
+    let level = heading_level(trimmed)? as usize;
+    Some(trimmed[level..].trim())
 }
 
 /// The external-link destination under `char_col`, if any: a `[text](url)`
@@ -725,6 +747,10 @@ mod tests {
         assert_eq!(kind_at(&segs, 6), Some(SpanKind::Link)); // 'n' of note
         assert_eq!(kind_at(&segs, 23), Some(SpanKind::Link)); // 'B'
         assert_eq!(conceal(line, &segs).text, "see note and B");
+        // A same-document heading link renders as the bare title.
+        let line = "see [[#Payroll]]";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(conceal(line, &segs).text, "see Payroll");
         // Inside a code span `[[x]]` stays literal.
         let line = "`[[x]]`";
         let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
@@ -749,15 +775,33 @@ mod tests {
 
     #[test]
     fn wikilink_at_hit_zones_and_stripping() {
+        let at = |line: &str, col: usize| {
+            wikilink_at(line, col).map(|(n, h)| (n, h.unwrap_or_default()))
+        };
         let line = "see [[a/b|B]] end";
         // Anywhere on the span — brackets, target, alias — yields the target.
         for col in [4, 7, 10, 12] {
-            assert_eq!(wikilink_at(line, col).as_deref(), Some("a/b"));
+            assert_eq!(at(line, col), Some(("a/b".into(), String::new())));
         }
-        assert_eq!(wikilink_at("x [[note#sec]]", 5).as_deref(), Some("note")); // fragment dropped
-        assert!(wikilink_at(line, 0).is_none()); // before the link
-        assert!(wikilink_at(line, 15).is_none()); // after the link
-        assert!(wikilink_at("[[]] x", 1).is_none()); // empty target
+        // `#heading` splits off; an alias after it doesn't reach either half.
+        assert_eq!(at("x [[note#a sec]]", 5), Some(("note".into(), "a sec".into())));
+        assert_eq!(at("[[note#sec|S]]", 2), Some(("note".into(), "sec".into())));
+        assert_eq!(at("[[#4.6 Payroll]]", 2), Some((String::new(), "4.6 Payroll".into())));
+        assert!(at(line, 0).is_none()); // before the link
+        assert!(at(line, 15).is_none()); // after the link
+        assert!(at("[[]] x", 1).is_none()); // empty target
+        assert!(at("[[#]] x", 1).is_none()); // empty on both sides of the `#`
+    }
+
+    #[test]
+    fn heading_text_strips_markers() {
+        let payroll = "4.6 Payroll build functions";
+        assert_eq!(heading_text(&format!("### {payroll}")), Some(payroll));
+        assert_eq!(heading_text("  #  Spaced  "), Some("Spaced"));
+        assert_eq!(heading_text("#"), Some(""));
+        assert_eq!(heading_text("#no space"), None);
+        assert_eq!(heading_text("####### too deep"), None);
+        assert_eq!(heading_text("not a heading"), None);
     }
 
     #[test]

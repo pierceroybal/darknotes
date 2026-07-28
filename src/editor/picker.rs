@@ -340,7 +340,7 @@ impl Editor {
     /// is a snapshot and the file may have changed under it. Mirrors the
     /// click-to-place path: normal mode disallows the column past a line's last
     /// char, insert mode needs it.
-    fn jump_to_line_col(&mut self, line: usize, col: usize) {
+    pub(super) fn jump_to_line_col(&mut self, line: usize, col: usize) {
         let rope = &self.doc().rope;
         let line = line.min(rope.len_lines().saturating_sub(1));
         let start = rope.line_to_char(line);
