@@ -3,6 +3,8 @@
 //!
 //! A child module of `editor` so methods can touch private `Editor` state.
 
+use std::rc::Rc;
+
 use crate::config::Search as SearchConfig;
 use crate::vim::Mode;
 
@@ -23,7 +25,76 @@ pub(super) struct SearchState {
     pub(super) origin: Option<usize>,
 }
 
+/// The last match scan, memoized. `find_matches` walks the whole buffer, and
+/// within a single keystroke up to two call sites want the same answer — the
+/// incsearch jump in `sync_search_prompt`, then `row_ctx` when render builds
+/// rows — so without this the document was scanned twice per typed character.
+pub(super) struct MatchCache {
+    revision: u64,
+    query: String,
+    sensitive: bool,
+    ranges: Rc<Vec<(usize, usize)>>,
+}
+
 impl Editor {
+    /// Matches of `query` in the active buffer, scanning only when it must.
+    ///
+    /// Four outcomes, cheapest first:
+    ///
+    /// 1. **Exact hit** on `(revision, query, sensitivity)` — the common case
+    ///    within one keystroke, where the incsearch jump and then render both ask.
+    /// 2. **Query extended** — typing another character. The old matches are a
+    ///    superset, so `narrow_matches` filters them.
+    /// 3. **One line edited** — typing with a search lit. `shift_matches`
+    ///    rescans that line and shifts the rest by the edit's char delta.
+    /// 4. Anything else rescans the buffer.
+    ///
+    /// Case 3 is what keeps an edit cheap while hlsearch is on: the whole-buffer
+    /// scan is ~5 ms on a 10k-line note, against a ~120 µs row patch, so without
+    /// it the scan dominated every keystroke.
+    pub(super) fn search_matches(&mut self, query: &str) -> Rc<Vec<(usize, usize)>> {
+        let revision = self.doc().revision();
+        let sensitive = search_sensitive(query, &self.search_cfg);
+        if let Some(c) = &self.match_cache {
+            if c.revision == revision && c.sensitive == sensitive && c.query == query {
+                return c.ranges.clone();
+            }
+        }
+        // Taken so the rope can be borrowed alongside it; replaced below.
+        let cached = self.match_cache.take();
+        let rope = self.doc().rope.clone(); // ropey clone shares its backing
+        let ranges = 'compute: {
+            if let Some(c) = &cached {
+                // A sensitivity flip (smartcase seeing an uppercase letter)
+                // invalidates the earlier fold, so both reuse paths need it equal.
+                if c.sensitive == sensitive {
+                    if c.revision == revision
+                        && !c.query.is_empty()
+                        && query.starts_with(&c.query)
+                    {
+                        break 'compute narrow_matches(&rope, &c.ranges, query, sensitive);
+                    }
+                    if c.query == query {
+                        if let Some(edit) = self.doc().single_line_edit(c.revision) {
+                            break 'compute shift_matches(
+                                &rope, &c.ranges, edit, query, sensitive,
+                            );
+                        }
+                    }
+                }
+            }
+            find_matches(&rope, query, sensitive)
+        };
+        let ranges = Rc::new(ranges);
+        self.match_cache = Some(MatchCache {
+            revision,
+            query: query.to_string(),
+            sensitive,
+            ranges: ranges.clone(),
+        });
+        ranges
+    }
+
     /// The query whose matches should be highlighted right now: the pending
     /// prompt text while a `/`/`?` search is being typed (incsearch preview),
     /// else the last submitted query while hlsearch is lit. Empty = none.
@@ -78,8 +149,8 @@ impl Editor {
     /// Jump `count` matches from the caret, honoring wrapscan, with vim's wrap
     /// and not-found messages. The caret stays put when nothing is found.
     fn find_and_jump(&mut self, backward: bool, count: usize) {
-        let q = &self.search.query;
-        let matches = find_matches(&self.doc().rope, q, search_sensitive(q, &self.search_cfg));
+        let q = self.search.query.clone();
+        let matches = self.search_matches(&q);
         let mut at = self.doc().caret_offset();
         let mut wrapped = false;
         for _ in 0..count.max(1) {
@@ -122,15 +193,15 @@ impl Editor {
             }
             if self.search_cfg.incsearch {
                 let origin = self.search.origin.unwrap_or(0);
-                let q = self.vim.command_line();
-                let jump = (!q.is_empty())
-                    .then(|| {
-                        let matches =
-                            find_matches(&self.doc().rope, q, search_sensitive(q, &self.search_cfg));
-                        next_match(&matches, origin, self.vim.prompt() == '?', self.search_cfg.wrapscan)
-                            .map(|(i, _)| matches[i].0)
-                    })
-                    .flatten();
+                let q = self.vim.command_line().to_string();
+                let backward = self.vim.prompt() == '?';
+                let wrapscan = self.search_cfg.wrapscan;
+                let jump = if q.is_empty() {
+                    None
+                } else {
+                    let matches = self.search_matches(&q);
+                    next_match(&matches, origin, backward, wrapscan).map(|(i, _)| matches[i].0)
+                };
                 self.doc_mut().jump_to(jump.unwrap_or(origin)); // no match → sit at origin
             }
         } else if let Some(origin) = self.search.origin.take() {
@@ -156,6 +227,40 @@ pub(super) fn search_sensitive(query: &str, cfg: &SearchConfig) -> bool {
     !cfg.ignorecase || (cfg.smartcase && query.chars().any(char::is_uppercase))
 }
 
+/// Whether `needle` (already case-folded) sits at char offset `at`.
+///
+/// A haystack newline can never equal a needle char — the query comes from a
+/// one-line prompt — so this preserves `find_matches`'s rule that a match stays
+/// within its line, without needing to know where the lines are.
+fn matches_at(rope: &ropey::Rope, at: usize, needle: &[char], sensitive: bool) -> bool {
+    let mut chars = rope.chars_at(at);
+    needle.iter().all(|&n| chars.next().is_some_and(|c| fold(c, sensitive) == n))
+}
+
+/// Matches of a query that *extends* one already scanned, filtered from the
+/// previous result instead of rescanning the buffer.
+///
+/// Every occurrence of `q + more` is an occurrence of `q`, so the previous
+/// matches are a superset and only they need re-checking — which is exactly the
+/// shape of typing a query: one whole-buffer scan on the first character, then a
+/// narrowing pass per keystroke over a shrinking candidate set.
+///
+/// The caller must have verified that `query` starts with the query `prev` came
+/// from *and* that the case-sensitivity is unchanged — smartcase flips it when an
+/// uppercase letter arrives, which invalidates the earlier fold.
+pub(super) fn narrow_matches(
+    rope: &ropey::Rope,
+    prev: &[(usize, usize)],
+    query: &str,
+    sensitive: bool,
+) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = query.chars().map(|c| fold(c, sensitive)).collect();
+    prev.iter()
+        .filter(|&&(start, _)| matches_at(rope, start, &needle, sensitive))
+        .map(|&(start, _)| (start, start + needle.len()))
+        .collect()
+}
+
 /// Every match of `query` as absolute char ranges `[start, end)`, scanned per
 /// line (a literal one-line query can't span newlines). Overlapping matches
 /// step by one char, like vim.
@@ -168,15 +273,71 @@ pub(super) fn find_matches(rope: &ropey::Rope, query: &str, sensitive: bool) -> 
     }
     let mut out = Vec::new();
     for i in 0..rope.len_lines() {
-        let start = rope.line_to_char(i);
-        // The trailing '\n' rides along harmlessly — the needle never has one.
-        let hay: Vec<char> = rope.line(i).chars().map(|c| fold(c, sensitive)).collect();
-        for j in 0..hay.len().saturating_sub(needle.len() - 1) {
-            if hay[j..j + needle.len()] == needle[..] {
-                out.push((start + j, start + j + needle.len()));
-            }
+        push_line_matches(rope, i, &needle, sensitive, &mut out);
+    }
+    out
+}
+
+/// Append line `i`'s matches of the pre-folded `needle`, as absolute char
+/// ranges. The single definition of "matches within a line", so the full scan
+/// and the incremental update in `shift_matches` cannot drift apart.
+fn push_line_matches(
+    rope: &ropey::Rope,
+    i: usize,
+    needle: &[char],
+    sensitive: bool,
+    out: &mut Vec<(usize, usize)>,
+) {
+    if needle.is_empty() {
+        return;
+    }
+    let start = rope.line_to_char(i);
+    // The trailing '\n' rides along harmlessly — the needle never has one.
+    let hay: Vec<char> = rope.line(i).chars().map(|c| fold(c, sensitive)).collect();
+    for j in 0..hay.len().saturating_sub(needle.len() - 1) {
+        if hay[j..j + needle.len()] == needle[..] {
+            out.push((start + j, start + j + needle.len()));
         }
     }
+}
+
+/// Matches after a one-line edit, updated from the previous result rather than
+/// rescanned.
+///
+/// A match never spans a newline, so the previous matches partition cleanly at
+/// the edited line's boundaries: those before it are untouched, those on it are
+/// stale and get rescanned, and those after it are the same matches at offsets
+/// shifted by the edit's `delta`. The edited line's *start* offset is identical
+/// in both revisions, since every line above it is unchanged.
+///
+/// `prev` must be the matches of this same query at `edit.before`; the caller
+/// establishes that with `Document::single_line_edit`.
+pub(super) fn shift_matches(
+    rope: &ropey::Rope,
+    prev: &[(usize, usize)],
+    edit: crate::document::LineEdit,
+    query: &str,
+    sensitive: bool,
+) -> Vec<(usize, usize)> {
+    let needle: Vec<char> = query.chars().map(|c| fold(c, sensitive)).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let start = rope.line_to_char(edit.line);
+    let end = start + rope.line(edit.line).len_chars();
+    // The same line's extent *before* the edit — the coordinates `prev` is in.
+    let was_end = (end as isize - edit.delta).max(start as isize) as usize;
+    let shift = |o: usize| (o as isize + edit.delta).max(0) as usize;
+
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(prev.len() + 1);
+    // `prev` ascends, so the three groups are contiguous slices of it.
+    out.extend(prev.iter().copied().take_while(|&(s, _)| s < start));
+    push_line_matches(rope, edit.line, &needle, sensitive, &mut out);
+    out.extend(
+        prev.iter()
+            .skip_while(|&&(s, _)| s < was_end)
+            .map(|&(s, e)| (shift(s), shift(e))),
+    );
     out
 }
 
@@ -205,9 +366,98 @@ fn next_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_matches, next_match, search_sensitive};
+    use super::{find_matches, narrow_matches, next_match, search_sensitive};
     use crate::config::Search as SearchConfig;
     use ropey::Rope;
+
+    #[test]
+    fn shifting_matches_after_an_edit_equals_a_fresh_scan() {
+        use super::shift_matches;
+        use crate::document::LineEdit;
+
+        let query = "widget";
+        // Bases with and without a trailing newline — the last line's extent
+        // differs between them, and that feeds the shift arithmetic.
+        for base in ["widget one\nplain\nwidget two widget\n\nlast widget\n", "a widget\nb"] {
+            let original: Vec<String> = base.split('\n').map(str::to_string).collect();
+            for (line, new) in original.iter().enumerate().flat_map(|(i, old)| {
+                [
+                    // Same length, match kept / lost / gained.
+                    (i, old.to_uppercase()),
+                    // Grow and shrink, including to nothing.
+                    (i, format!("{old} widget tail")),
+                    (i, format!("{old}{old}")),
+                    (i, old.chars().take(2).collect::<String>()),
+                    (i, String::new()),
+                    // Multi-byte: the char delta differs from the byte delta,
+                    // and every offset here is char-based.
+                    (i, format!("café {old}")),
+                    (i, "café".to_string()),
+                ]
+            }) {
+                let mut edited = original.clone();
+                let delta = new.chars().count() as isize
+                    - edited[line].chars().count() as isize;
+                edited[line] = new.clone();
+
+                let before = Rope::from_str(base);
+                let after = Rope::from_str(&edited.join("\n"));
+                let edit = LineEdit { before: 1, after: 2, line, delta };
+
+                for sensitive in [false, true] {
+                    let prev = find_matches(&before, query, sensitive);
+                    assert_eq!(
+                        shift_matches(&after, &prev, edit, query, sensitive),
+                        find_matches(&after, query, sensitive),
+                        "line {line} → {new:?} (delta {delta}), sensitive={sensitive}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowing_a_query_equals_a_fresh_scan() {
+        // Mixed case, overlapping matches, a match split across a newline, and
+        // multi-byte text ahead of a hit so char offsets have to be right.
+        let rope = Rope::from_str(
+            "widget and Widget\nwid WIDGET wide\n\nno match\nwidgetwidget\nwi\nwid\nget\ncafé widget\n",
+        );
+        for sensitive in [false, true] {
+            // Narrow one character at a time, comparing against a full scan at
+            // every prefix — the subset property has to hold at each step, not
+            // just at the end.
+            let full = "widget";
+            let mut prev = find_matches(&rope, &full[..1], sensitive);
+            for n in 2..=full.len() {
+                let q = &full[..n];
+                let narrowed = narrow_matches(&rope, &prev, q, sensitive);
+                assert_eq!(
+                    narrowed,
+                    find_matches(&rope, q, sensitive),
+                    "query {q:?}, sensitive={sensitive}"
+                );
+                prev = narrowed;
+            }
+        }
+
+        // Overlapping matches narrow correctly, including the tail candidate
+        // that runs off the end of the buffer.
+        let rope = Rope::from_str("aaaa");
+        let one = find_matches(&rope, "a", true);
+        assert_eq!(one, vec![(0, 1), (1, 2), (2, 3), (3, 4)]);
+        assert_eq!(narrow_matches(&rope, &one, "aa", true), find_matches(&rope, "aa", true));
+        let two = narrow_matches(&rope, &one, "aa", true);
+        assert_eq!(narrow_matches(&rope, &two, "aaa", true), find_matches(&rope, "aaa", true));
+
+        // A candidate whose extension would cross a newline is rejected, so
+        // narrowing keeps `find_matches`'s stays-within-a-line rule.
+        let rope = Rope::from_str("wid\nget\n");
+        let prev = find_matches(&rope, "wid", true);
+        assert_eq!(prev, vec![(0, 3)]);
+        assert!(narrow_matches(&rope, &prev, "widget", true).is_empty());
+        assert!(find_matches(&rope, "widget", true).is_empty());
+    }
 
     #[test]
     fn find_matches_folds_case_and_counts_chars() {

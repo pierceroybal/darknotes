@@ -34,7 +34,7 @@ use rows::{
     caret_only_change, content_change_is_local, row_offsets, LineForms, RowsCache, RowsKey,
     ShapeWrapCache,
 };
-use search::{find_matches, search_sensitive, SearchState};
+use search::{search_sensitive, MatchCache, SearchState};
 use sidebar::{expand_ancestors, FilePrompt, PromptAction};
 // `line_text` lives in the scanner: every caller wants a newline-stripped line
 // in order to feed it a markdown function.
@@ -197,6 +197,9 @@ pub struct Editor {
     search: SearchState,
     /// Search options from config (ignorecase, hlsearch, …).
     search_cfg: SearchConfig,
+    /// Memoized match scan; see `MatchCache`. Shared by the incsearch jump and
+    /// the render path, which otherwise scanned the buffer twice per keystroke.
+    match_cache: Option<MatchCache>,
     /// Blink the caret while the editor pane is focused, from config.
     cursor_blink: bool,
     /// Length (ms) of each blink phase, from config. 0 disables blinking.
@@ -350,6 +353,7 @@ impl Editor {
             marks: HashMap::new(),
             search: SearchState::default(),
             search_cfg: config.search,
+            match_cache: None,
             cursor_blink: config.cursor_blink,
             blink_interval: config.cursor_blink_interval,
             blink_show: true,
@@ -515,6 +519,18 @@ impl Editor {
             Some("wrap") => self.wrap = true,
             Some("nowrap") => self.wrap = false,
             Some("wrap!") | Some("invwrap") => self.wrap = !self.wrap,
+            // hlsearch is otherwise only reachable through config + restart,
+            // which makes its render path awkward to exercise. `:noh` still
+            // clears the current highlight without changing the option.
+            Some("hlsearch") | Some("hls") => self.search_cfg.hlsearch = true,
+            Some("nohlsearch") | Some("nohls") => self.search_cfg.hlsearch = false,
+            Some("hlsearch!") | Some("invhlsearch") => {
+                self.search_cfg.hlsearch = !self.search_cfg.hlsearch
+            }
+            Some("hlsearch?") | Some("hls?") => {
+                self.message =
+                    Some(if self.search_cfg.hlsearch { "  hlsearch" } else { "nohlsearch" }.into())
+            }
             // Bare `:set` / `:set wrap?` report the current value, vim-style.
             None | Some("wrap?") => {
                 self.message = Some(if self.wrap { "  wrap" } else { "nowrap" }.into())
@@ -560,7 +576,7 @@ impl Editor {
             }
         }
         let cached_rev = self.spans_cache.as_ref().map(|(r, _)| *r);
-        let edited = cached_rev.and_then(|r| self.doc().single_line_edit(r));
+        let edited = cached_rev.and_then(|r| self.doc().single_line_edit(r)).map(|e| e.line);
         let is_md = self.doc().is_markdown();
         let rope = self.doc().rope.clone(); // ropey clone shares its backing
 

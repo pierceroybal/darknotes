@@ -44,9 +44,8 @@ use crate::theme::Theme;
 use crate::vim::Mode;
 
 use super::{
-    caret_bytes, fence_block, find_matches, heading_metrics, row_decor, run,
-    search_sensitive, segments_to_runs, Editor, Gutter, Highlight, LineCaret, LineElement,
-    RowDecor, CODE_MARGIN, CODE_PAD,
+    caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, Editor,
+    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
 };
 
 /// Everything the editor's row list is built from, beyond session constants
@@ -131,7 +130,7 @@ pub(super) struct RowCtx {
     /// Match ranges in ascending order, as `find_matches` returns them. Both
     /// bounds ascend (every match is the query's length), which is what lets a
     /// line binary-search its own slice of them.
-    pub(super) search_ranges: Vec<(usize, usize)>,
+    pub(super) search_ranges: Rc<Vec<(usize, usize)>>,
     pub(super) num_width: usize,
 }
 
@@ -274,10 +273,11 @@ impl Editor {
             (rope.char_to_line(lo.min(len)), rope.char_to_line(hi.min(len)))
         });
         let q = self.search_query();
+        // Shared with the incsearch jump through the memo — see `search_matches`.
         let search_ranges = if q.is_empty() {
-            Vec::new()
+            Rc::new(Vec::new())
         } else {
-            find_matches(&rope, &q, search_sensitive(&q, &self.search_cfg))
+            self.search_matches(&q)
         };
 
         // Shaping font, matching what `LineElement` resolves from the window's
@@ -309,7 +309,8 @@ impl Editor {
         // against *this* cache's revision, so a cache that fell more than one
         // edit behind is discarded rather than partially trusted.
         let revision = self.doc().revision();
-        let forms_dirty = self.doc().single_line_edit(self.line_forms.revision());
+        let forms_dirty =
+            self.doc().single_line_edit(self.line_forms.revision()).map(|e| e.line);
         self.line_forms.begin(revision, wrap_width, rope.len_lines(), forms_dirty);
         RowCtx {
             rope,
@@ -715,16 +716,26 @@ pub(super) fn caret_only_change(old: &RowsKey, new: &RowsKey) -> bool {
 /// knowledge — `Editor::spans_for_render` returning the edited line — because a
 /// row key can't express it: `revision` says the content differs, not how much.
 ///
-/// Selection and search are excluded rather than handled: a visual sweep or a
-/// live query re-highlights arbitrary lines, which is not a bounded patch.
+/// The two highlight sources are treated differently, and the asymmetry is the
+/// point:
+///
+/// - **Search: an unchanged query is enough.** Matches are content-addressed —
+///   a line's match columns are a function of that line's text and the query,
+///   both unchanged — so every cached row stays correct and only the patched
+///   lines need recomputing. Requiring an *empty* query instead meant
+///   `hlsearch = true` forced a full rebuild on every `j`, `k` and `n`.
+/// - **Selection: it must be absent, not merely equal.** `sel` is an absolute
+///   char span. Were the content to shift under an unchanged span, each line's
+///   *local* highlight columns would move while its cached row kept the old
+///   ones. Visual-mode edits leave visual (so the mode differs and this never
+///   fires today), but "unreachable" is a poor thing to rely on.
 pub(super) fn content_change_is_local(old: &RowsKey, new: &RowsKey) -> bool {
     old.wrap_width == new.wrap_width
         && old.mode == new.mode
         && old.view == new.view
         && old.sel.is_none()
         && new.sel.is_none()
-        && old.q.is_empty()
-        && new.q.is_empty()
+        && old.q == new.q
 }
 
 /// Greedy word wrap for plain ASCII text in a monospace font: row-start byte
@@ -810,6 +821,42 @@ mod tests {
     use crate::markdown::{self, SpanKind};
     use gpui::{px, Pixels};
     use ropey::Rope;
+
+    #[test]
+    fn a_lit_search_still_allows_the_patch_path() {
+        use super::{caret_only_change, content_change_is_local, RowsKey};
+        use crate::vim::Mode;
+        let key = |revision: u64, caret: usize, q: &str, sel| RowsKey {
+            revision,
+            caret,
+            mode: Mode::Normal,
+            view: false,
+            sel,
+            q: q.to_string(),
+            wrap_width: Some(px(400.)),
+        };
+
+        // No search: a caret move patches, as before.
+        assert!(caret_only_change(&key(1, 0, "", None), &key(1, 9, "", None)));
+        // hlsearch lit on an unchanged query: still patchable. Requiring an
+        // *empty* query here forced a full rebuild on every j/k/n.
+        assert!(caret_only_change(&key(1, 0, "widget", None), &key(1, 9, "widget", None)));
+        // A changed query re-highlights arbitrary lines: no patch.
+        assert!(!caret_only_change(&key(1, 0, "widge", None), &key(1, 9, "widget", None)));
+        // A one-line edit with the query unchanged is patchable (revision moves,
+        // which `caret_only_change` rejects but `content_change_is_local` allows).
+        assert!(content_change_is_local(&key(1, 0, "widget", None), &key(2, 1, "widget", None)));
+        assert!(!caret_only_change(&key(1, 0, "widget", None), &key(2, 1, "widget", None)));
+        // A selection must be absent, not merely equal — `sel` is an absolute
+        // span, so content shifting under it would move every line's local
+        // columns while cached rows kept the old ones.
+        let sel = Some((3, 7));
+        assert!(!content_change_is_local(&key(1, 0, "", sel), &key(2, 1, "", sel)));
+        // Anything else that changes row content still forces a full rebuild.
+        let mut wide = key(1, 9, "", None);
+        wide.wrap_width = Some(px(500.));
+        assert!(!caret_only_change(&key(1, 0, "", None), &wide));
+    }
 
     #[test]
     fn ranges_touching_windows_the_matches_for_one_line() {
