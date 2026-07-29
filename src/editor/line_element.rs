@@ -37,6 +37,51 @@ pub(super) enum CaretPaint {
     Dim,
 }
 
+/// One row's line-number gutter, stored as the *inputs* to its label rather
+/// than a formatted string.
+///
+/// Relative numbering re-labels every row whenever the cursor line moves, so a
+/// baked-in label would make every cached row stale on every caret move — which
+/// is why `Plan::Patch` used to be skipped entirely in that mode, costing a
+/// whole-document rebuild per `j`. Deriving the label in `prepaint` from a
+/// shared cursor-line cell (the same trick `scroll_x` and `caret_paint` use)
+/// keeps cached rows valid, and formats only the rows actually on screen.
+#[derive(Clone)]
+pub(super) struct Gutter {
+    /// 0-based logical line this row belongs to.
+    pub(super) line: usize,
+    /// A wrapped line's continuation row: blanks of the same width, so its text
+    /// stays aligned under the first row's.
+    pub(super) continuation: bool,
+    /// Digits reserved for the number. The label is always `width + 3` chars,
+    /// which is what keeps its shaped width independent of the caret.
+    pub(super) width: usize,
+    /// Hybrid relative numbering: the distance to the cursor line, except on the
+    /// cursor line itself, which shows its absolute number.
+    pub(super) relative: bool,
+    /// Cursor line, read at paint time — see `Editor::cur_line`.
+    pub(super) cur_line: Rc<Cell<usize>>,
+}
+
+impl Gutter {
+    /// This row's label and its color, resolved against the live cursor line.
+    /// Callers that only want the width still need the text, since it decides it.
+    pub(super) fn resolve(&self, theme: &Theme) -> (SharedString, Hsla) {
+        let width = self.width;
+        if self.continuation {
+            return (format!(" {:>width$}  ", "").into(), theme.muted);
+        }
+        let cur = self.cur_line.get();
+        let n = if self.relative && self.line != cur {
+            self.line.abs_diff(cur)
+        } else {
+            self.line + 1
+        };
+        let color = if self.line == cur { theme.foreground } else { theme.muted };
+        (format!(" {n:>width$}  ").into(), color)
+    }
+}
+
 /// The selected column span within a line (visual mode). `to_eol` means the
 /// selection covers this line's newline, so the highlight fills to the edge.
 #[derive(Clone, Copy)]
@@ -76,9 +121,10 @@ pub(super) struct LineElement {
     /// How the caret paints (blink phase + focus), shared like `scroll_x` —
     /// see `Editor::caret_paint`.
     pub(super) caret_paint: Rc<Cell<CaretPaint>>,
-    /// Pre-formatted line-number string and its color. `None` when the gutter is
-    /// off. Painted at a fixed left position; the text is shifted right past it.
-    pub(super) gutter: Option<(SharedString, Hsla)>,
+    /// Line-number gutter, as the inputs to its label rather than the label —
+    /// see `Gutter`. `None` when the gutter is off. Painted at a fixed left
+    /// position; the text is shifted right past it.
+    pub(super) gutter: Option<Gutter>,
     /// Nudge `scroll_x` to keep the caret horizontally on screen — nowrap
     /// only. A wrapped row never overflows, and its caret reaching the right
     /// edge must not shift the pane. Only the caret row acts on it.
@@ -182,11 +228,10 @@ impl Element for LineElement {
         let runs = segments_to_runs(&self.text, &self.segments, &font, fg, &theme);
         // Shape the line-number gutter (if any). It sits at a fixed left position
         // and never scrolls, so the text below is shifted right by its width.
-        let gutter = self.gutter.as_ref().map(|(text, color)| {
-            let runs = [run(&font, text.len(), *color)];
-            window
-                .text_system()
-                .shape_line(text.clone(), base_size, &runs, None)
+        let gutter = self.gutter.as_ref().map(|g| {
+            let (text, color) = g.resolve(&theme);
+            let runs = [run(&font, text.len(), color)];
+            window.text_system().shape_line(text, base_size, &runs, None)
         });
         let gutter_w = gutter.as_ref().map_or(Pixels::ZERO, |g| g.width);
         let shaped = window
@@ -649,11 +694,66 @@ pub(super) fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, fence_block, heading_metrics, row_decor, segment_style, RowDecor,
+        caret_bytes, fence_block, heading_metrics, row_decor, segment_style, Gutter, RowDecor,
     };
     use crate::markdown::{self, SpanKind};
     use gpui::Hsla;
     use ropey::Rope;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[test]
+    fn gutter_labels_track_the_cursor_line_at_a_fixed_width() {
+        let theme = crate::theme::Theme::by_name("dark").unwrap();
+        let cur = Rc::new(Cell::new(0usize));
+        let g = |line: usize, relative: bool, continuation: bool| Gutter {
+            line,
+            continuation,
+            width: 3,
+            relative,
+            cur_line: cur.clone(),
+        };
+        let label = |gut: &Gutter| gut.resolve(&theme).0.to_string();
+
+        // Absolute: 1-based, right-aligned in `width`, ignores the cursor.
+        assert_eq!(label(&g(0, false, false)), "   1  ");
+        assert_eq!(label(&g(41, false, false)), "  42  ");
+
+        // Relative is hybrid: distance to the cursor, except on the cursor
+        // line, which shows its own absolute number.
+        cur.set(10);
+        assert_eq!(label(&g(10, true, false)), "  11  "); // cursor line
+        assert_eq!(label(&g(7, true, false)), "   3  ");
+        assert_eq!(label(&g(13, true, false)), "   3  ");
+
+        // The cursor line is the only thing that moved; every label follows it
+        // with no rebuild. This is what makes `Plan::Patch` legal in relative
+        // mode — the row is unchanged, only the shared cell is.
+        cur.set(7);
+        assert_eq!(label(&g(10, true, false)), "   3  ");
+        assert_eq!(label(&g(7, true, false)), "   8  ");
+
+        // Continuation rows are same-width blanks, so wrapped text stays aligned.
+        assert_eq!(label(&g(10, true, true)), "      ");
+
+        // The load-bearing invariant: the label is always `width + 3` chars
+        // whatever the caret does. `gutter_w` is measured from it and feeds the
+        // text offset and click-to-caret math, so a variable-width label would
+        // make those depend on the cursor's line number.
+        for cursor in [0usize, 5, 999] {
+            cur.set(cursor);
+            for line in [0usize, 1, 42, 998] {
+                for relative in [true, false] {
+                    assert_eq!(label(&g(line, relative, false)).len(), 6, "{line}/{cursor}");
+                }
+            }
+        }
+
+        // The cursor line reads as foreground, everything else muted.
+        cur.set(4);
+        assert_eq!(g(4, true, false).resolve(&theme).1, theme.foreground);
+        assert_eq!(g(5, true, false).resolve(&theme).1, theme.muted);
+    }
 
     #[test]
     fn strong_color_differs_from_plain_text() {

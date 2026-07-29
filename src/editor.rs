@@ -26,7 +26,7 @@ use buffers::{open_or_empty, rel_display, resolve, resolve_link, unique_dest, wi
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
     caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, CaretPaint,
-    Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
+    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
 };
 use picker::Picker;
 use row_list::row_list;
@@ -204,6 +204,11 @@ pub struct Editor {
     /// the line elements like `scroll_x`, so a blink tick or pane switch only
     /// repaints — the cached rows never rebuild for it.
     caret_paint: Rc<Cell<CaretPaint>>,
+    /// The caret's logical line, shared with the line elements like
+    /// `caret_paint`. Relative line numbers are relative to *this*, resolved
+    /// when a row paints, so moving the caret re-labels the gutter without
+    /// invalidating a single cached row.
+    cur_line: Rc<Cell<usize>>,
 }
 
 impl Editor {
@@ -342,6 +347,7 @@ impl Editor {
             blink_show: true,
             blink_timer: None,
             caret_paint: Rc::new(Cell::new(CaretPaint::Solid)),
+            cur_line: Rc::new(Cell::new(0)),
         };
         this.arm_blink(cx);
         if config.watch_files {
@@ -587,9 +593,10 @@ impl Editor {
         let font = gpui::font(self.font_family.clone());
         let font_size = px(self.font_size);
         let theme = *cx.global::<Theme>();
-        let gutter_w = el.gutter.as_ref().map_or(Pixels::ZERO, |(text, _)| {
+        let gutter_w = el.gutter.as_ref().map_or(Pixels::ZERO, |g| {
+            let (text, _) = g.resolve(&theme);
             let runs = [run(&font, text.len(), theme.foreground)];
-            window.text_system().shape_line(text.clone(), font_size, &runs, None).width
+            window.text_system().shape_line(text, font_size, &runs, None).width
         });
         let pad = match el.decor {
             Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
@@ -1496,6 +1503,9 @@ impl Render for Editor {
         } else {
             CaretPaint::Hidden
         });
+        // Relative line numbers read this when a row paints, so a caret move
+        // re-labels the gutter without rebuilding any row (see `Gutter`).
+        self.cur_line.set(self.doc().caret_line_col().0);
 
         // Soft-wrap width: the live viewport minus the fixed sidebar and the
         // line-number gutter. Live — not last frame's layout — so a resize
@@ -1544,14 +1554,7 @@ impl Render for Editor {
         }
         let plan = match &self.rows_cache {
             Some(c) if c.key == key => Plan::Hit,
-            // Relative line numbers re-label every row on a caret line
-            // change, so they can't take the two-line patch.
-            Some(c)
-                if caret_only_change(&c.key, &key)
-                    && self.line_numbers != LineNumbers::Relative =>
-            {
-                Plan::Patch
-            }
+            Some(c) if caret_only_change(&c.key, &key) => Plan::Patch,
             _ => Plan::Full,
         };
         let (lines, cur_row) = match plan {
@@ -1562,8 +1565,11 @@ impl Render for Editor {
             Plan::Patch => {
                 // Same content, no highlights: only the old and new cursor
                 // lines — plus the fence lines their enclosing code blocks
-                // reveal — can render differently (conceal swap, caret,
-                // gutter emphasis). Rebuild those lines and splice in place.
+                // reveal — can render differently (conceal swap, caret).
+                // Rebuild those lines and splice in place. Line numbers are
+                // not in that set: the gutter resolves its label at paint time
+                // against the shared cursor line, so relative numbering
+                // re-labels every row here without touching one.
                 let t0 = crate::perf::t0();
                 let mut c = self.rows_cache.take().unwrap();
                 let ctx = self.row_ctx(wrap_width, &theme, window);

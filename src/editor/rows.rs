@@ -37,8 +37,8 @@ use crate::vim::Mode;
 
 use super::{
     caret_bytes, fence_block, find_matches, heading_metrics, row_decor, run,
-    search_sensitive, segments_to_runs, Editor, Highlight, LineCaret, LineElement, RowDecor,
-    CODE_MARGIN, CODE_PAD,
+    search_sensitive, segments_to_runs, Editor, Gutter, Highlight, LineCaret, LineElement,
+    RowDecor, CODE_MARGIN, CODE_PAD,
 };
 
 /// Everything the editor's row list is built from, beyond session constants
@@ -426,22 +426,15 @@ impl Editor {
             if caret_row == Some(k) {
                 caret_at = Some(out.len() - base);
             }
-            // Line number on the first row only; continuation rows carry
-            // same-width blanks so their text aligns. Relative mode is
-            // hybrid: the cursor line shows its absolute number, others
-            // the distance to it.
-            let num_width = ctx.num_width;
-            let gutter = (self.line_numbers != LineNumbers::Off).then(|| {
-                if k > 0 {
-                    return (format!(" {:>num_width$}  ", "").into(), ctx.theme.muted);
-                }
-                let n = match self.line_numbers {
-                    LineNumbers::Relative if i != ctx.cur_line => i.abs_diff(ctx.cur_line),
-                    _ => i + 1,
-                };
-                let color =
-                    if i == ctx.cur_line { ctx.theme.foreground } else { ctx.theme.muted };
-                (format!(" {n:>num_width$}  ").into(), color)
+            // The gutter carries its inputs, not a formatted label — the label
+            // resolves in `prepaint` against the shared cursor line, so a caret
+            // move never invalidates a cached row (see `Gutter`).
+            let gutter = (self.line_numbers != LineNumbers::Off).then(|| Gutter {
+                line: i,
+                continuation: k > 0,
+                width: ctx.num_width,
+                relative: self.line_numbers == LineNumbers::Relative,
+                cur_line: self.cur_line.clone(),
             });
             out.push(LineElement {
                 text: text[b0..b1].to_string().into(),
