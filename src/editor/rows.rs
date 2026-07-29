@@ -11,8 +11,16 @@
 //!   nothing. Anything new that changes row *content* belongs in that key.
 //! - A caret-only key change patches at most six lines — the old and new
 //!   cursor lines plus the fences their enclosing code blocks reveal — through
-//!   `append_line_rows`, spliced into `RowsCache.line_rows`. Visual-mode
-//!   sweeps and insert typing still take the full rebuild.
+//!   `append_line_rows`, spliced into `RowsCache.line_rows`. A *one-line edit*
+//!   patches the same way: `Editor::spans_for_render` reparses the single line
+//!   and says so, which is what keeps insert-mode typing off the full rebuild.
+//!   Anything wider — a multi-line edit, an undo, a fence boundary moving —
+//!   still rebuilds everything.
+//! - A full rebuild reuses per-line work through `LineForms`: text, segments,
+//!   heading metrics, decoration, and wrap boundaries are cached per line, so a
+//!   rebuild driven by a selection sweep or a search keystroke re-derives only
+//!   the lines that actually carry a highlight. Nothing caret- or
+//!   selection-dependent may enter that cache.
 //! - Plain-ASCII monospace lines get their wrap boundaries from
 //!   `wrap_columns`, a pure column walk with zero platform shaping. Only what
 //!   changes glyph advances — non-ASCII, tabs, bold — falls back to real
@@ -94,7 +102,7 @@ pub(super) fn row_offsets(rows: &[LineElement], line_h: Pixels) -> Rc<Vec<Pixels
 /// rerunning a whole `build_rows` pass.
 pub(super) struct RowCtx {
     pub(super) rope: ropey::Rope, // ropey clone is cheap (shared, CoW)
-    pub(super) spans: Rc<Vec<Vec<markdown::Span>>>,
+    pub(super) spans: Rc<markdown::Parsed>,
     pub(super) theme: Theme,
     pub(super) font: Font,
     pub(super) font_size: Pixels,
@@ -116,6 +124,13 @@ pub(super) struct RowCtx {
     /// cursor line so the whole block reads as one unit while edited inside.
     pub(super) reveal_fences: [Option<usize>; 2],
     pub(super) sel_span: Option<(usize, usize)>,
+    /// Logical line range `sel_span` covers, inclusive — so a line can rule
+    /// itself out of the selection without touching the rope. Derived once per
+    /// build; a two-line selection otherwise cost a rope walk per document line.
+    pub(super) sel_lines: Option<(usize, usize)>,
+    /// Match ranges in ascending order, as `find_matches` returns them. Both
+    /// bounds ascend (every match is the query's length), which is what lets a
+    /// line binary-search its own slice of them.
     pub(super) search_ranges: Vec<(usize, usize)>,
     pub(super) num_width: usize,
 }
@@ -132,6 +147,89 @@ pub(super) struct ShapeWrapCache {
     width: Pixels,
     cur: HashMap<(String, Vec<Segment>), Vec<usize>>,
     prev: HashMap<(String, Vec<Segment>), Vec<usize>>,
+}
+
+/// Everything about a row build that depends only on the line's text and spans:
+/// its concealed display form, heading metrics, block decoration, and wrap
+/// boundaries. Deliberately excludes anything caret-, selection-, or
+/// search-dependent, which is what makes it reusable across those changes.
+pub(super) struct LineForm {
+    text: String,
+    segments: Vec<Segment>,
+    metrics: (f32, f32),
+    decor: Option<RowDecor>,
+    row_starts: Vec<usize>,
+}
+
+/// `LineForm` per logical line, so a rebuild driven by something other than
+/// content — entering visual mode, dragging a selection, typing a search query,
+/// an undo, a multi-line edit — skips re-flattening and re-concealing the whole
+/// document. Those all still take `Plan::Full`, and before this they paid the
+/// per-line pipeline for every line each time.
+///
+/// Valid for one `(revision, wrap width)` pair. A width change invalidates
+/// everything, since boundaries depend on it — so this does *not* help a resize.
+/// A one-line edit invalidates one entry, on the same proof `spans_for_render`
+/// uses (`Document::single_line_edit` against *this* cache's revision, so a
+/// cache that fell more than one edit behind is discarded rather than trusted).
+#[derive(Default)]
+pub(super) struct LineForms {
+    revision: u64,
+    wrap_width: Option<Pixels>,
+    forms: Vec<Option<LineForm>>,
+}
+
+impl LineForms {
+    /// The generation this cache holds, for the caller's staleness proof.
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Ready the cache for a build, keeping whatever stays valid: everything but
+    /// `dirty` when the caller proved the change was confined to that line,
+    /// nothing when the revision moved otherwise or the width changed.
+    pub(super) fn begin(
+        &mut self,
+        revision: u64,
+        width: Option<Pixels>,
+        lines: usize,
+        dirty: Option<usize>,
+    ) {
+        let keep = self.wrap_width == width
+            && self.forms.len() == lines
+            && (dirty.is_some() || self.revision == revision);
+        if keep {
+            if let Some(line) = dirty {
+                // The neighbours go too: a code band's `top`/`bottom` corners
+                // come from whether the *adjacent* lines are in-band, so an edit
+                // that changes this line's role restyles the rows either side.
+                // Three entries instead of one, and no subtle argument to get
+                // wrong later.
+                for l in line.saturating_sub(1)..=line + 1 {
+                    if let Some(slot) = self.forms.get_mut(l) {
+                        *slot = None;
+                    }
+                }
+            }
+        } else {
+            self.forms.clear();
+            self.forms.resize_with(lines, || None);
+        }
+        self.revision = revision;
+        self.wrap_width = width;
+    }
+
+    /// Move line `i`'s form out for use. Taken rather than borrowed so the
+    /// caller can hold it while touching other caches; `put` returns it.
+    fn take(&mut self, i: usize) -> Option<LineForm> {
+        self.forms.get_mut(i)?.take()
+    }
+
+    fn put(&mut self, i: usize, form: LineForm) {
+        if let Some(slot) = self.forms.get_mut(i) {
+            *slot = Some(form);
+        }
+    }
 }
 
 impl ShapeWrapCache {
@@ -168,6 +266,13 @@ impl Editor {
         // The selected char-range to highlight, `None` outside visual mode.
         let sel_span: Option<(usize, usize)> =
             mode.is_visual().then(|| self.doc().selection_span(mode == Mode::VisualLine));
+        // Its line span, so lines outside it skip the per-line rope walk. `end`
+        // is exclusive, so its line may sit one past the selection; that only
+        // means one extra line runs the check, which then finds nothing.
+        let sel_lines = sel_span.map(|(lo, hi)| {
+            let len = rope.len_chars();
+            (rope.char_to_line(lo.min(len)), rope.char_to_line(hi.min(len)))
+        });
         let q = self.search_query();
         let search_ranges = if q.is_empty() {
             Vec::new()
@@ -200,6 +305,12 @@ impl Editor {
 
         let num_width = rope.len_lines().to_string().len().max(3);
         let reveal_fences = fence_block(&spans, cur_line);
+        // Ready the per-line form cache for this build. The dirty line is proved
+        // against *this* cache's revision, so a cache that fell more than one
+        // edit behind is discarded rather than partially trusted.
+        let revision = self.doc().revision();
+        let forms_dirty = self.doc().single_line_edit(self.line_forms.revision());
+        self.line_forms.begin(revision, wrap_width, rope.len_lines(), forms_dirty);
         RowCtx {
             rope,
             spans,
@@ -216,6 +327,7 @@ impl Editor {
             cur_col,
             reveal_fences,
             sel_span,
+            sel_lines,
             search_ranges,
             num_width,
         }
@@ -265,29 +377,68 @@ impl Editor {
         window: &mut Window,
         out: &mut Vec<LineElement>,
     ) -> Option<usize> {
-        let base = out.len();
-        let mut caret_at = None;
+        // Order matters here: everything the cache check needs is computed
+        // first, and it is all O(1)-ish. `line_text` and `flatten` sit *below*
+        // the check, because they are the two most expensive steps and a cache
+        // hit must not pay for them.
+        let revealed = !ctx.view && (i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i)));
+        // Highlights land in source columns; a concealed line remaps them
+        // through the conceal map so they track the display text.
+        //
+        // Both are gated on the lines they can actually touch. Testing every
+        // line meant a two-line visual selection walked the rope once per line
+        // of the document, and an hlsearch query cost O(lines × matches).
+        let selection = ctx
+            .sel_lines
+            .filter(|&(first, last)| i >= first && i <= last)
+            .and_then(|_| ctx.sel_span)
+            .and_then(|(lo, hi)| line_highlight(&ctx.rope, i, lo, hi));
+        let search: Vec<Highlight> = if ctx.search_ranges.is_empty() {
+            Vec::new()
+        } else {
+            let start = ctx.rope.line_to_char(i);
+            let end = start + ctx.rope.line(i).len_chars();
+            ranges_touching(&ctx.search_ranges, start, end)
+                .iter()
+                .filter_map(|&(lo, hi)| line_highlight(&ctx.rope, i, lo, hi))
+                .collect()
+        };
+        // A line whose form is reusable: it renders concealed, and nothing about
+        // it depends on the caret, the selection, or a search hit. That holds for
+        // all but a handful of lines in any build, which is what makes a visual
+        // sweep or a search keystroke cheap despite taking `Plan::Full`.
+        let cacheable = self.render_markdown
+            && !revealed
+            && i != ctx.cur_line
+            && selection.is_none()
+            && search.is_empty();
+        if let Some(form) = cacheable.then(|| self.line_forms.take(i)).flatten() {
+            let LineForm { text, segments, metrics: (scale, pad), decor, row_starts } = form;
+            let pad_top = (ctx.line_h * pad).round();
+            self.emit_rows(
+                ctx, i, &text, &segments, &row_starts, None, &[], None, scale, pad_top, decor,
+                out,
+            );
+            self.line_forms.put(
+                i,
+                LineForm { text, segments, metrics: (scale, pad), decor, row_starts },
+            );
+            return None; // never the cursor line, so no caret row to report
+        }
+
+        // Cache miss (or an uncacheable line): the full per-line pipeline.
         // Conceal markers on every line but the cursor line, which keeps
         // full source so caret math stays on real document bytes.
         let text = line_text(&ctx.rope, i);
         let line_spans = ctx.spans.get(i).map_or(&[][..], Vec::as_slice);
         let segs = markdown::flatten(text.len(), line_spans);
-        // Highlights land in source columns; a concealed line remaps them
-        // through the conceal map so they track the display text.
-        let selection = ctx.sel_span.and_then(|(lo, hi)| line_highlight(&ctx.rope, i, lo, hi));
-        let search: Vec<Highlight> = ctx
-            .search_ranges
-            .iter()
-            .filter_map(|&(lo, hi)| line_highlight(&ctx.rope, i, lo, hi))
-            .collect();
+        let mut cur_col = ctx.cur_col;
         // Heading lines shape larger in a taller row, the revealed cursor
         // line included — its source segments carry `Heading` too, so both
         // branches agree and row heights never change on a caret move (no
         // layout shift as j/k crosses an H1). Scale/pad are pure functions
         // of the segments the wrap cache keys on, so cached boundaries stay
         // consistent. Markdown rendering off is all body size.
-        let revealed = !ctx.view && (i == ctx.cur_line || ctx.reveal_fences.contains(&Some(i)));
-        let mut cur_col = ctx.cur_col;
         let (text, segments, selection, search, (scale, pad), decor) = if self.render_markdown
             && !revealed
         {
@@ -392,17 +543,65 @@ impl Editor {
                 }
             }
         };
+        let caret_at = self.emit_rows(
+            ctx,
+            i,
+            &text,
+            &segments,
+            &row_starts,
+            selection,
+            &search,
+            (i == ctx.cur_line).then_some(cur_col),
+            scale,
+            pad_top,
+            decor,
+            out,
+        );
+        // Only the caret/selection-independent lines are worth keeping, and
+        // only they are safe to: a cached form carries no highlight or caret.
+        if cacheable {
+            self.line_forms
+                .put(i, LineForm { text, segments, metrics: (scale, pad), decor, row_starts });
+        }
+        caret_at
+    }
+
+    /// Slice one line's display form into visual rows and push them onto `out`,
+    /// returning the caret's index among them when `cur_col` places it here.
+    ///
+    /// Split out so the `LineForms` fast path and the full pipeline emit rows
+    /// identically — the row geometry is the part that must not drift between
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_rows(
+        &self,
+        ctx: &RowCtx,
+        i: usize,
+        text: &str,
+        segments: &[Segment],
+        row_starts: &[usize],
+        selection: Option<Highlight>,
+        search: &[Highlight],
+        // `Some` only on the cursor line, in this line's display coordinates.
+        cur_col: Option<usize>,
+        scale: f32,
+        pad_top: Pixels,
+        decor: Option<RowDecor>,
+        out: &mut Vec<LineElement>,
+    ) -> Option<usize> {
+        let base = out.len();
+        let mut caret_at = None;
         // Char col where each row starts — highlight and caret columns
         // are char-based, byte offsets index the text slices. ASCII:
         // bytes are cols. Otherwise one pass over the char boundaries
         // (per-row `chars().count()` was quadratic on long lines).
         let (row_cols, line_chars): (Vec<usize>, usize) = if text.is_ascii() {
-            (row_starts.clone(), text.len())
+            (row_starts.to_vec(), text.len())
         } else {
             let mut cols = Vec::with_capacity(row_starts.len());
             let mut chars = 0;
             let mut ci = text.char_indices().peekable();
-            for &b in &row_starts {
+            for &b in row_starts {
                 while ci.next_if(|&(cb, _)| cb < b).is_some() {
                     chars += 1;
                 }
@@ -413,8 +612,8 @@ impl Editor {
         let last = row_starts.len() - 1;
         // The caret's row: the last row starting at or before its byte (a
         // byte on a boundary belongs to the row the boundary opens).
-        let caret_row = (i == ctx.cur_line).then(|| {
-            let byte = caret_bytes(&text, cur_col).0;
+        let caret_row = cur_col.map(|col| {
+            let byte = caret_bytes(text, col).0;
             row_starts.partition_point(|&b| b <= byte) - 1
         });
 
@@ -438,9 +637,9 @@ impl Editor {
             });
             out.push(LineElement {
                 text: text[b0..b1].to_string().into(),
-                segments: slice_segments(&segments, b0, b1),
+                segments: slice_segments(segments, b0, b1),
                 caret: (caret_row == Some(k)).then(|| LineCaret {
-                    col: cur_col - c0,
+                    col: cur_col.unwrap_or(0) - c0,
                     block: ctx.mode != Mode::Insert,
                 }),
                 selection: selection.and_then(|h| clip_row_highlight(h, c0, c1, k == last)),
@@ -469,6 +668,18 @@ impl Editor {
     }
 }
 
+/// The slice of `ranges` that can overlap the char range `[start, end)`.
+///
+/// `ranges` ascends in both bounds (see `RowCtx::search_ranges`), so everything
+/// overlapping is one contiguous window and the rest is never looked at —
+/// scanning them all cost O(lines × matches) per build, which an hlsearch query
+/// on a large note turns into millions of rope reads.
+fn ranges_touching(ranges: &[(usize, usize)], start: usize, end: usize) -> &[(usize, usize)] {
+    let from = ranges.partition_point(|&(_, e)| e <= start);
+    let len = ranges[from..].iter().take_while(|&&(s, _)| s < end).count();
+    &ranges[from..from + len]
+}
+
 /// Which columns of line `i` fall inside the selection char-range `[lo, hi)`.
 /// `to_eol` is set when the range reaches into this line's newline, so the
 /// highlight should fill past the last char (selected blank space / joined line).
@@ -493,11 +704,21 @@ fn line_highlight(rope: &ropey::Rope, i: usize, lo: usize, hi: usize) -> Option<
 
 /// The only difference between two row keys is where the caret sits: same
 /// content, same mode, no selection, no highlighted search. Then only the old
-/// and new cursor lines can render differently (conceal swap, caret quad,
-/// gutter emphasis), so the cached rows can be patched instead of rebuilt.
+/// and new cursor lines can render differently (conceal swap, caret quad), so
+/// the cached rows can be patched instead of rebuilt.
 pub(super) fn caret_only_change(old: &RowsKey, new: &RowsKey) -> bool {
-    old.revision == new.revision
-        && old.wrap_width == new.wrap_width
+    old.revision == new.revision && content_change_is_local(old, new)
+}
+
+/// Everything but the content matches, so a content change that is *known* to be
+/// confined to a few lines can be patched too. The caller supplies that
+/// knowledge — `Editor::spans_for_render` returning the edited line — because a
+/// row key can't express it: `revision` says the content differs, not how much.
+///
+/// Selection and search are excluded rather than handled: a visual sweep or a
+/// live query re-highlights arbitrary lines, which is not a bounded patch.
+pub(super) fn content_change_is_local(old: &RowsKey, new: &RowsKey) -> bool {
+    old.wrap_width == new.wrap_width
         && old.mode == new.mode
         && old.view == new.view
         && old.sel.is_none()
@@ -582,9 +803,111 @@ fn remap_highlight(h: Highlight, source: &str, c: &markdown::Concealed) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_row_highlight, remap_highlight, slice_segments, wrap_columns, Highlight};
+    use super::{
+        clip_row_highlight, remap_highlight, slice_segments, wrap_columns, Highlight, LineForm,
+        LineForms,
+    };
     use crate::markdown::{self, SpanKind};
+    use gpui::{px, Pixels};
     use ropey::Rope;
+
+    #[test]
+    fn ranges_touching_windows_the_matches_for_one_line() {
+        use super::ranges_touching;
+        // Four matches of a 3-char query, at chars 0, 10, 20, 30.
+        let r = [(0, 3), (10, 13), (20, 23), (30, 33)];
+
+        // A line covering [10, 20) sees only the match inside it.
+        assert_eq!(ranges_touching(&r, 10, 20), &[(10, 13)]);
+        // A line spanning several sees all of them, contiguously.
+        assert_eq!(ranges_touching(&r, 0, 25), &[(0, 3), (10, 13), (20, 23)]);
+        // Boundaries are half-open at both ends: a match ending exactly at the
+        // line's start, or starting exactly at its end, doesn't touch it.
+        assert_eq!(ranges_touching(&r, 3, 10), &[]);
+        assert_eq!(ranges_touching(&r, 25, 30), &[]);
+        // A partial overlap still counts — the highlight gets clipped later.
+        assert_eq!(ranges_touching(&r, 11, 15), &[(10, 13)]);
+        // Off the end, and the empty case.
+        assert_eq!(ranges_touching(&r, 100, 200), &[]);
+        assert_eq!(ranges_touching(&[], 0, 10), &[]);
+
+        // Exhaustive cross-check against the naive scan it replaced: for every
+        // line window, the window must contain exactly the overlapping matches.
+        for start in 0..40 {
+            for end in start..40 {
+                let naive: Vec<_> =
+                    r.iter().copied().filter(|&(lo, hi)| lo < end && hi > start).collect();
+                assert_eq!(ranges_touching(&r, start, end), &naive[..], "[{start}, {end})");
+            }
+        }
+    }
+
+    #[test]
+    fn line_forms_keeps_only_what_stays_valid() {
+        let form = || LineForm {
+            text: String::new(),
+            segments: Vec::new(),
+            metrics: (1.0, 0.0),
+            decor: None,
+            row_starts: vec![0],
+        };
+        let w: Option<Pixels> = Some(px(400.));
+        let fill = |c: &mut LineForms, n: usize| {
+            for i in 0..n {
+                c.put(i, form());
+            }
+        };
+        let held = |c: &mut LineForms, n: usize| {
+            (0..n)
+                .filter(|&i| {
+                    let hit = c.take(i);
+                    let present = hit.is_some();
+                    if let Some(f) = hit {
+                        c.put(i, f);
+                    }
+                    present
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // A caret-only rebuild (same revision, same width) keeps everything —
+        // this is what makes a `j` cheap.
+        let mut c = LineForms::default();
+        c.begin(7, w, 5, None);
+        fill(&mut c, 5);
+        c.begin(7, w, 5, None);
+        assert_eq!(held(&mut c, 5), vec![0, 1, 2, 3, 4]);
+
+        // A confined edit drops that line and its two neighbours, keeps the rest.
+        c.begin(8, w, 5, Some(2));
+        assert_eq!(held(&mut c, 5), vec![0, 4]);
+
+        // An edit at line 0 clamps instead of underflowing.
+        fill(&mut c, 5);
+        c.begin(9, w, 5, Some(0));
+        assert_eq!(held(&mut c, 5), vec![2, 3, 4]);
+
+        // An unconfined content change drops everything.
+        fill(&mut c, 5);
+        c.begin(10, w, 5, None);
+        assert!(held(&mut c, 5).is_empty());
+
+        // So does a wrap-width change — boundaries depend on it, which is why
+        // this cache does nothing for a resize.
+        fill(&mut c, 5);
+        c.begin(10, Some(px(500.)), 5, None);
+        assert!(held(&mut c, 5).is_empty());
+
+        // And so does a line-count change, even when a line is named dirty:
+        // the indices no longer mean the same lines.
+        fill(&mut c, 5);
+        c.begin(11, Some(px(500.)), 6, Some(2));
+        assert!(held(&mut c, 6).is_empty());
+
+        // Out-of-range access is refused, not a panic.
+        assert!(c.take(99).is_none());
+        c.put(99, form());
+    }
 
     #[test]
     fn wrap_columns_breaks_words_and_walls() {

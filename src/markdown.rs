@@ -66,15 +66,74 @@ pub struct Segment {
     pub struck: bool,
 }
 
+/// A document's per-line spans, plus the scanner state entering each line.
+///
+/// Derefs to `[Vec<Span>]`, so callers index it by line like the plain `Vec` it
+/// replaced. The recorded states are what make `reparse_line` possible: they let
+/// a one-line edit prove it didn't disturb any other line's classification.
+/// `Clone` exists for `Rc::make_mut` in the incremental path — it only fires
+/// when the cached parse is *not* uniquely held, which is off the hot path.
+#[derive(Clone)]
+pub struct Parsed {
+    lines: Vec<Vec<Span>>,
+    /// State entering line `i`, with `states[lines.len()]` the state after the
+    /// last line — so `len == lines.len() + 1`.
+    states: Vec<ScanState>,
+}
+
+impl std::ops::Deref for Parsed {
+    type Target = [Vec<Span>];
+    fn deref(&self) -> &Self::Target {
+        &self.lines
+    }
+}
+
+impl Parsed {
+    /// Empty spans for every line: a non-markdown buffer renders as plain text.
+    pub fn blank(lines: usize) -> Self {
+        Parsed { lines: vec![Vec::new(); lines], states: vec![ScanState::default(); lines + 1] }
+    }
+}
+
 /// Classify every line of the document into styled spans. Document-level because
 /// fenced code and frontmatter span lines, but output is per-line so the
 /// renderer grabs line `i`'s spans directly. Lines mirror the renderer's model
 /// (`rope.len_lines()`, newline stripped).
-pub fn parse(rope: &Rope) -> Vec<Vec<Span>> {
-    let mut scan = Scan { in_fence: false, in_frontmatter: false };
-    (0..rope.len_lines())
-        .map(|i| scan.line(&line_text(rope, i), i))
-        .collect()
+pub fn parse(rope: &Rope) -> Parsed {
+    let n = rope.len_lines();
+    let mut lines = Vec::with_capacity(n);
+    let mut states = Vec::with_capacity(n + 1);
+    let mut scan = ScanState::default();
+    for i in 0..n {
+        states.push(scan);
+        lines.push(scan.line(&line_text(rope, i), i));
+    }
+    states.push(scan);
+    Parsed { lines, states }
+}
+
+/// Re-scan only `line`, reusing every other line's spans — the incremental path
+/// behind insert-mode typing, where one keystroke changes one line.
+///
+/// `prev` must be the parse of this rope's state immediately before the edit,
+/// and the edit must have left the line count alone (the caller proves both;
+/// `Document::single_line_edit` is how the editor does it).
+///
+/// Returns `false`, having changed nothing, when the edit flipped the scanner
+/// state leaving that line — typing a ``` fence or opening frontmatter
+/// reclassifies every line below, so the caller must fall back to a full parse
+/// and a full row rebuild.
+pub fn reparse_line(rope: &Rope, prev: &mut Parsed, line: usize) -> bool {
+    if line >= prev.lines.len() || prev.lines.len() != rope.len_lines() {
+        return false;
+    }
+    let mut state = prev.states[line];
+    let spans = state.line(&line_text(rope, line), line);
+    if state != prev.states[line + 1] {
+        return false; // fence/frontmatter boundary moved; everything below shifts
+    }
+    prev.lines[line] = spans;
+    true
 }
 
 /// Text of line `i` with its trailing newline dropped — the form every scanner
@@ -91,12 +150,16 @@ pub fn line_text(rope: &Rope, i: usize) -> String {
     slice.slice(..end).to_string()
 }
 
-struct Scan {
+/// What the scanner carries from one line to the next. Fenced code and
+/// frontmatter both span lines, so a line's classification depends on this —
+/// which is also why an edit that changes it invalidates every line below.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ScanState {
     in_fence: bool,
     in_frontmatter: bool,
 }
 
-impl Scan {
+impl ScanState {
     fn line(&mut self, text: &str, idx: usize) -> Vec<Span> {
         let mut spans = Vec::new();
         let len = text.len();
@@ -617,6 +680,71 @@ mod tests {
 
     fn kind_at(segs: &[Segment], byte: usize) -> Option<SpanKind> {
         seg_at(segs, byte).kind
+    }
+
+    #[test]
+    fn reparse_line_reuses_the_parse_and_bails_when_state_moves() {
+        // A plain text edit: local, and every other line's spans are reused.
+        let before = Rope::from_str("# a\ntext\n```\ncode\n```\ntail\n");
+        let mut p = parse(&before);
+        let after = Rope::from_str("# a\ntext **b**\n```\ncode\n```\ntail\n");
+        assert!(reparse_line(&after, &mut p, 1));
+        assert!(p[1].iter().any(|s| s.kind == SpanKind::Strong));
+        assert_eq!(p[3][0].kind, SpanKind::CodeText); // untouched, still in-fence
+
+        // Typing a fence where there wasn't one flips every line below from
+        // plain text to code, so the local path must refuse and change nothing.
+        let before = Rope::from_str("a\nb\nc\n");
+        let mut p = parse(&before);
+        let snapshot = p[1].clone();
+        let after = Rope::from_str("a\n```\nc\n");
+        assert!(!reparse_line(&after, &mut p, 1));
+        assert_eq!(p[1], snapshot);
+
+        // Removing a fence is the same hazard in reverse.
+        let before = Rope::from_str("a\n```\nc\n```\n");
+        let mut p = parse(&before);
+        let after = Rope::from_str("a\nx\nc\n```\n");
+        assert!(!reparse_line(&after, &mut p, 1));
+
+        // Opening frontmatter on line 0 reclassifies the lines after it.
+        let before = Rope::from_str("a\nb\n");
+        let mut p = parse(&before);
+        let after = Rope::from_str("---\nb\n");
+        assert!(!reparse_line(&after, &mut p, 0));
+
+        // A line-count change invalidates the index mapping outright.
+        let before = Rope::from_str("a\nb\nc\n");
+        let mut p = parse(&before);
+        let after = Rope::from_str("a\nb\n");
+        assert!(!reparse_line(&after, &mut p, 1));
+
+        // An out-of-range line is refused rather than panicking.
+        let rope = Rope::from_str("a\n");
+        let mut p = parse(&rope);
+        assert!(!reparse_line(&rope, &mut p, 99));
+    }
+
+    #[test]
+    fn incremental_parse_matches_a_full_one() {
+        // The whole point: the fast path must be indistinguishable from the
+        // slow one. Edit each line of a document with mixed structure and
+        // compare against a from-scratch parse.
+        let lines = ["# head", "- [ ] task", "plain **bold** text", "> quote", "`code`", "tail"];
+        for i in 0..lines.len() {
+            let before = Rope::from_str(&format!("{}\n", lines.join("\n")));
+            let mut edited: Vec<&str> = lines.to_vec();
+            let replacement = "changed *text* here";
+            edited[i] = replacement;
+            let after = Rope::from_str(&format!("{}\n", edited.join("\n")));
+
+            let mut incremental = parse(&before);
+            assert!(reparse_line(&after, &mut incremental, i), "line {i}");
+            let full = parse(&after);
+            for l in 0..full.len() {
+                assert_eq!(incremental[l], full[l], "line {i} edited, line {l} differs");
+            }
+        }
     }
 
     #[test]

@@ -30,7 +30,10 @@ use line_element::{
 };
 use picker::Picker;
 use row_list::row_list;
-use rows::{caret_only_change, row_offsets, RowsCache, RowsKey, ShapeWrapCache};
+use rows::{
+    caret_only_change, content_change_is_local, row_offsets, LineForms, RowsCache, RowsKey,
+    ShapeWrapCache,
+};
 use search::{find_matches, search_sensitive, SearchState};
 use sidebar::{expand_ancestors, FilePrompt, PromptAction};
 // `line_text` lives in the scanner: every caller wants a newline-stripped line
@@ -136,9 +139,13 @@ pub struct Editor {
     rows_cache: Option<RowsCache>,
     /// Cross-build cache of shaped wrap boundaries; see `ShapeWrapCache`.
     wrap_cache: ShapeWrapCache,
+    /// Per-line concealed render forms; see `LineForms`. Makes a `Plan::Full`
+    /// driven by anything but content (a visual sweep, a search keystroke, an
+    /// undo) skip the per-line conceal pipeline.
+    line_forms: LineForms,
     /// Markdown parse of the active buffer, memoized on its revision (the
     /// parse is document-wide and caret-independent).
-    spans_cache: Option<(u64, Rc<Vec<Vec<markdown::Span>>>)>,
+    spans_cache: Option<(u64, Rc<markdown::Parsed>)>,
     /// Horizontal scroll offset in pixels (lines have no soft-wrap, so they
     /// overflow right). The caret line's element nudges this in prepaint to keep
     /// the caret on screen; every line reads it in paint. Shared because the line
@@ -318,6 +325,7 @@ impl Editor {
             wrap: config.wrap,
             rows_cache: None,
             wrap_cache: ShapeWrapCache::default(),
+            line_forms: LineForms::default(),
             spans_cache: None,
             scroll_x: Rc::new(Cell::new(Pixels::ZERO)),
             font_family: config.font_family.clone().into(),
@@ -530,23 +538,55 @@ impl Editor {
         }
     }
 
-    /// Per-line markdown spans of the active buffer, memoized on its content
-    /// revision (the parse is document-wide and caret-independent). Non-markdown
-    /// buffers get empty spans per line — plain text, no conceal/styling.
-    fn spans(&mut self) -> Rc<Vec<Vec<markdown::Span>>> {
+    /// The active buffer's markdown spans, memoized on its content revision,
+    /// plus the one line a reparse was confined to when it was.
+    ///
+    /// A whole-document parse is the fallback, not the norm: an insert-mode
+    /// keystroke changes one line, so `markdown::reparse_line` re-scans that line
+    /// and keeps the rest — mutating the cached parse in place, since it is
+    /// uniquely held between renders and `Rc::make_mut` then copies nothing. The
+    /// returned line is what lets render patch rows for an *edit* rather than
+    /// rebuilding the document (see the `Plan` match).
+    ///
+    /// `Some(line)` is a promise the caller acts on, so it is only ever returned
+    /// when `Document::single_line_edit` confirms the cached parse is this
+    /// buffer's state immediately before the edit, and the scanner state leaving
+    /// that line is unchanged.
+    fn spans_for_render(&mut self) -> (Rc<markdown::Parsed>, Option<usize>) {
         let rev = self.doc().revision();
-        match &self.spans_cache {
-            Some((r, s)) if *r == rev => s.clone(),
-            _ => {
-                let s = if self.doc().is_markdown() {
-                    Rc::new(markdown::parse(&self.doc().rope))
-                } else {
-                    Rc::new(vec![Vec::new(); self.doc().rope.len_lines()])
-                };
-                self.spans_cache = Some((rev, s.clone()));
-                s
+        if let Some((r, s)) = &self.spans_cache {
+            if *r == rev {
+                return (s.clone(), None); // content unchanged: nothing reparsed
             }
         }
+        let cached_rev = self.spans_cache.as_ref().map(|(r, _)| *r);
+        let edited = cached_rev.and_then(|r| self.doc().single_line_edit(r));
+        let is_md = self.doc().is_markdown();
+        let rope = self.doc().rope.clone(); // ropey clone shares its backing
+
+        if is_md {
+            if let (Some(line), Some((r, parsed))) = (edited, self.spans_cache.as_mut()) {
+                if markdown::reparse_line(&rope, Rc::make_mut(parsed), line) {
+                    *r = rev;
+                    return (parsed.clone(), Some(line));
+                }
+                // The edit moved a fence/frontmatter boundary, restyling every
+                // line below it — reparse and rebuild in full.
+            }
+        }
+        let parsed = Rc::new(if is_md {
+            markdown::parse(&rope)
+        } else {
+            markdown::Parsed::blank(rope.len_lines())
+        });
+        self.spans_cache = Some((rev, parsed.clone()));
+        (parsed, None)
+    }
+
+    /// The spans alone, for the paths outside render (click hit-testing,
+    /// `gj`/`gk`) that don't care what changed.
+    fn spans(&mut self) -> Rc<markdown::Parsed> {
+        self.spans_for_render().0
     }
 
     /// Left click in the text area: place the caret at the clicked spot.
@@ -1552,9 +1592,26 @@ impl Render for Editor {
             Patch,
             Full,
         }
+        // Reparse first: whether a content change was confined to one line is
+        // what separates a patchable edit from a whole-document rebuild, and
+        // only the parse can establish it (a typed ``` moves a fence boundary
+        // and restyles everything below).
+        let (_, edited_line) = self.spans_for_render();
+        let line_count = self.doc().rope.len_lines();
         let plan = match &self.rows_cache {
             Some(c) if c.key == key => Plan::Hit,
             Some(c) if caret_only_change(&c.key, &key) => Plan::Patch,
+            // A one-line edit — an insert-mode keystroke — whose reparse stayed
+            // local. The edited line is the only content that differs, so it
+            // patches like a caret move. `line_rows` is indexed per logical
+            // line below, so its length has to still match.
+            Some(c)
+                if edited_line.is_some()
+                    && c.line_rows.len() == line_count
+                    && content_change_is_local(&c.key, &key) =>
+            {
+                Plan::Patch
+            }
             _ => Plan::Full,
         };
         let (lines, cur_row) = match plan {
@@ -1581,6 +1638,9 @@ impl Render for Editor {
                 // Higher line first, so the lower splice's length change
                 // can't shift the row range the higher one was measured at.
                 let mut redo = vec![new_line, old_line];
+                // The edited line is usually the caret's, but not always — a
+                // click on a checkbox toggles a line the caret never visits.
+                redo.extend(edited_line);
                 redo.extend(ctx.reveal_fences.into_iter().flatten());
                 redo.extend(fence_block(&ctx.spans, old_line).into_iter().flatten());
                 redo.sort_unstable_by(|a, b| b.cmp(a));

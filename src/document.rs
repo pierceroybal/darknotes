@@ -173,6 +173,15 @@ pub struct Document {
     /// each line), so passing through short lines doesn't truncate the column.
     /// Any horizontal move or edit resets it to the actual column.
     goal_col: usize,
+    /// The last content change, when it touched exactly one line and left the
+    /// line count alone: `(revision before, revision after, line)`.
+    ///
+    /// Both revisions are recorded so a consumer can prove a cached derivation
+    /// (the render layer's markdown parse) is *this* buffer's state immediately
+    /// before the edit — a buffer switch or any intervening change breaks the
+    /// pairing and falls back to recomputing. `None` means "assume everything
+    /// changed": multi-line edits, anything crossing a newline, undo/redo.
+    last_edit: Option<(u64, u64, usize)>,
     /// `m{a}`–`m{z}`: char offsets, per buffer as in vim (`ma` in two files is
     /// two marks). Uppercase marks are global and live on the editor. Offsets
     /// are raw — an edit above a mark leaves it pointing at a shifted spot, and
@@ -206,6 +215,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             goal_col: 0,
+            last_edit: None,
             marks: HashMap::new(),
         }
     }
@@ -231,6 +241,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             goal_col: 0,
+            last_edit: None,
             marks: HashMap::new(),
         })
     }
@@ -295,9 +306,38 @@ impl Document {
 
     /// Mark a content change: dirty for save tracking, a fresh revision for
     /// render caches. Every rope mutation routes through here (or `restore`).
+    ///
+    /// Clears `last_edit`, so anything not explicitly reporting a single-line
+    /// change is treated as a whole-document one. That's the safe direction: a
+    /// missed opportunity costs a full rebuild, a wrong claim renders staleness.
     fn touch(&mut self) {
         self.dirty = true;
         self.revision = next_revision();
+        self.last_edit = None;
+    }
+
+    /// `touch` for a change confined to `line` that left the line count alone —
+    /// see the `last_edit` field doc. Callers must be certain of both: the
+    /// render layer reuses every *other* line's markdown parse on this promise.
+    fn touch_line(&mut self, line: usize) {
+        let before = self.revision;
+        self.dirty = true;
+        self.revision = next_revision();
+        self.last_edit = Some((before, self.revision, line));
+    }
+
+    /// The line the last change touched, if it touched only one *and* the
+    /// caller's cached derivation (`cached_revision`) is this buffer's state
+    /// immediately before that change. Both halves matter — see `last_edit`.
+    pub fn single_line_edit(&self, cached_revision: u64) -> Option<usize> {
+        match self.last_edit {
+            Some((before, after, line))
+                if before == cached_revision && after == self.revision =>
+            {
+                Some(line)
+            }
+            _ => None,
+        }
     }
 
     pub fn path(&self) -> Option<&Path> {
@@ -310,6 +350,8 @@ impl Document {
     pub fn set_path(&mut self, path: PathBuf) {
         self.path = Some(path);
         self.revision = next_revision();
+        // Markdown styling keys off the extension, so every line may restyle.
+        self.last_edit = None;
     }
 
     /// Whether markdown-aware editing conveniences (list continuation, list-line
@@ -353,8 +395,14 @@ impl Document {
 
     pub fn insert(&mut self, text: &str) {
         let at = self.caret();
+        // Text carrying a newline splits a line, so the line count changes and
+        // only a whole-document reparse is safe.
+        let line = (!text.contains('\n')).then(|| self.rope.char_to_line(at));
         self.rope.insert(at, text);
-        self.touch();
+        match line {
+            Some(line) => self.touch_line(line),
+            None => self.touch(),
+        }
         self.set_caret(at + text.chars().count());
     }
 
@@ -503,7 +551,7 @@ impl Document {
         let inner = self.rope.line_to_char(line) + text[..at].chars().count() + 1;
         self.rope.remove(inner..inner + 1);
         self.rope.insert(inner, if checked { " " } else { "x" });
-        self.touch();
+        self.touch_line(line);
         true
     }
 
@@ -513,8 +561,14 @@ impl Document {
         if at == 0 {
             return;
         }
+        // Backspacing a newline joins two lines — a line-count change, so no
+        // single-line claim (see `touch_line`).
+        let line = (self.rope.char(at - 1) != '\n').then(|| self.rope.char_to_line(at - 1));
         self.rope.remove(at - 1..at);
-        self.touch();
+        match line {
+            Some(line) => self.touch_line(line),
+            None => self.touch(),
+        }
         self.set_caret(at - 1);
     }
 
@@ -522,8 +576,12 @@ impl Document {
     pub fn delete_forward(&mut self) {
         let at = self.caret();
         if at < self.rope.len_chars() {
+            let line = (self.rope.char(at) != '\n').then(|| self.rope.char_to_line(at));
             self.rope.remove(at..at + 1);
-            self.touch();
+            match line {
+                Some(line) => self.touch_line(line),
+                None => self.touch(),
+            }
         }
     }
 
@@ -986,7 +1044,7 @@ impl Document {
         if from < to {
             self.set_register(self.rope.slice(from..to).to_string(), false);
             self.rope.remove(from..to);
-            self.touch();
+            self.touch_line(line);
         }
         // The caret stays at the deletion point — which may now be past the
         // line's last char. `s` needs it there (insert continues at that spot);
@@ -1007,7 +1065,7 @@ impl Document {
         }
         self.rope.remove(from..from + count);
         self.rope.insert(from, &std::iter::repeat(ch).take(count).collect::<String>());
-        self.touch();
+        self.touch_line(line);
         self.set_caret(from + count - 1);
     }
 
@@ -1036,7 +1094,7 @@ impl Document {
             .collect();
         self.rope.remove(from..to);
         self.rope.insert(from, &flipped);
-        self.touch();
+        self.touch_line(line);
         // Past the last flipped char; the normal-mode clamp pulls it back at EOL.
         self.set_caret(to);
     }
@@ -1177,6 +1235,8 @@ impl Document {
         // state is clean), but the content still changed — new revision.
         self.dirty = s.dirty;
         self.revision = next_revision();
+        // An undo can move any number of lines; no single-line claim.
+        self.last_edit = None;
         self.set_caret(s.caret.min(self.rope.len_chars()));
     }
 
@@ -2283,6 +2343,73 @@ mod tests {
         // past it onto the one-char line.
         let d = Document::new("a\n\nb");
         assert_eq!(d.motion_target(Motion::ParaForward, 0, 1), d.rope.line_to_char(1));
+    }
+
+    #[test]
+    fn single_line_edit_reports_only_confined_changes() {
+        let mut d = Document::new("alpha\nbeta\ngamma");
+        let rev = |d: &Document| d.revision();
+
+        // Typing on one line: reported, against the revision that preceded it.
+        let before = rev(&d);
+        d.move_motion(Motion::LineDown, 1);
+        d.insert("x");
+        assert_eq!(d.single_line_edit(before), Some(1));
+        // Only the immediately-preceding revision qualifies — this is what stops
+        // a stale cache (or another buffer's) from being spliced into.
+        assert_eq!(d.single_line_edit(before - 1), None);
+        assert_eq!(d.single_line_edit(rev(&d)), None);
+
+        // Anything that changes the line count must not be reported.
+        let before = rev(&d);
+        d.insert("\n");
+        assert_eq!(d.single_line_edit(before), None);
+
+        // Backspacing a newline joins two lines: also a line-count change.
+        let mut d = Document::new("a\nb");
+        d.move_motion(Motion::LineDown, 1);
+        let before = rev(&d);
+        d.delete_backward();
+        assert_eq!(d.single_line_edit(before), None);
+
+        // Backspacing an ordinary char stays on its line.
+        let mut d = Document::new("ab\ncd");
+        d.move_motion(Motion::LineDown, 1);
+        d.move_motion(Motion::CharRight, 2);
+        let before = rev(&d);
+        d.delete_backward();
+        assert_eq!(d.single_line_edit(before), Some(1));
+
+        // Undo can move any number of lines, so it makes no claim.
+        let mut d = Document::new("a\nb");
+        d.checkpoint();
+        d.insert("x");
+        let before = rev(&d);
+        d.undo();
+        assert_eq!(d.single_line_edit(before), None);
+
+        // Line-wise deletes and pastes likewise.
+        let mut d = Document::new("a\nb\nc");
+        let before = rev(&d);
+        d.delete_lines(1);
+        assert_eq!(d.single_line_edit(before), None);
+
+        // In-place single-char rewrites report their line.
+        let mut d = Document::new("abc\ndef");
+        d.move_motion(Motion::LineDown, 1);
+        let before = rev(&d);
+        d.replace_char('Z', 1);
+        assert_eq!(d.single_line_edit(before), Some(1));
+        let before = rev(&d);
+        d.toggle_case(1);
+        assert_eq!(d.single_line_edit(before), Some(1));
+
+        // A checkbox toggle reports the line it flipped, not the caret's.
+        let mut d = Document::new("- [ ] a\n- [ ] b");
+        let before = rev(&d);
+        assert!(d.toggle_task(1));
+        assert_eq!(d.single_line_edit(before), Some(1));
+        assert_eq!(d.caret_line_col().0, 0); // caret never moved
     }
 
     #[test]
