@@ -181,6 +181,10 @@ pub struct Document {
     marks: HashMap<char, usize>,
 }
 
+/// Undo states kept per buffer, matching vim's `undolevels` default. Past this
+/// the oldest is dropped — see `checkpoint`.
+const UNDO_LEVELS: usize = 1000;
+
 /// Source of `Document::revision` values — see that field's doc.
 static REVISION: AtomicU64 = AtomicU64::new(0);
 
@@ -427,9 +431,7 @@ impl Document {
     /// caret keeps its place in its line's content when digit widths change.
     /// Returns the block's last line; no-op (returning `line`) off a list item.
     pub fn renumber_block(&mut self, line: usize, width: usize) -> usize {
-        let text = |d: &Self, l: usize| -> String {
-            d.rope.line(l).chars().filter(|&c| c != '\n').collect()
-        };
+        let text = |d: &Self, l: usize| markdown::line_text(&d.rope, l);
         let in_block =
             |t: &str| markdown::is_list_item(t) || (t.starts_with(' ') && !t.trim().is_empty());
         if !markdown::is_list_item(&text(self, line)) {
@@ -896,7 +898,7 @@ impl Document {
     /// trailing blank lines — or the leading ones when none trail; from a
     /// blank block it adds the following paragraph instead.
     fn paragraph_span(&self, around: bool) -> Option<(usize, usize)> {
-        let blank = |l: usize| self.line_len_chars(l) == 0;
+        let blank = |l: usize| self.line_is_blank(l);
         let last_line = self.rope.len_lines().saturating_sub(1);
         let (line, _) = self.line_col_of(self.caret());
         let on_blank = blank(line);
@@ -1180,9 +1182,18 @@ impl Document {
 
     /// Record the pre-change state. The editor calls this once per undoable unit
     /// (a normal-mode edit, or entering insert — the whole insert session coalesces).
+    ///
+    /// The stack is capped at `UNDO_LEVELS`, dropping the oldest state past it.
+    /// Snapshots share rope structure, so each costs only its diverged nodes —
+    /// but without a cap a long session retains every intermediate state for the
+    /// process lifetime, and idle RSS climbs with edit count rather than
+    /// document size.
     pub fn checkpoint(&mut self) {
         let snap = self.snapshot();
         self.undo.push(snap);
+        if self.undo.len() > UNDO_LEVELS {
+            self.undo.drain(..self.undo.len() - UNDO_LEVELS);
+        }
         self.redo.clear();
     }
 
@@ -1396,10 +1407,10 @@ impl Document {
                 let (mut line, _) = self.line_col_of(from);
                 let last = self.rope.len_lines().saturating_sub(1);
                 for _ in 0..count {
-                    while line < last && self.line_len_chars(line) == 0 {
+                    while line < last && self.line_is_blank(line) {
                         line += 1;
                     }
-                    while line < last && self.line_len_chars(line) != 0 {
+                    while line < last && !self.line_is_blank(line) {
                         line += 1;
                     }
                 }
@@ -1408,10 +1419,10 @@ impl Document {
             Motion::ParaBackward => {
                 let (mut line, _) = self.line_col_of(from);
                 for _ in 0..count {
-                    while line > 0 && self.line_len_chars(line) == 0 {
+                    while line > 0 && self.line_is_blank(line) {
                         line -= 1;
                     }
-                    while line > 0 && self.line_len_chars(line) != 0 {
+                    while line > 0 && !self.line_is_blank(line) {
                         line -= 1;
                     }
                 }
@@ -1468,13 +1479,33 @@ impl Document {
     }
 
     /// Chars in a line excluding its trailing newline.
+    ///
+    /// Indexes the last char rather than iterating to it: `Chars::last()` walks
+    /// the whole line, which is ~1ns/char and shows up on long ones (a 5k-char
+    /// line costs 49× an indexed read). This is called on every keystroke that
+    /// lands in normal mode, via `clamp_caret_to_line`.
+    ///
+    /// Only `\n` is stripped, so a CRLF line keeps its `\r` in the count.
     fn line_len_chars(&self, line: usize) -> usize {
         let slice = self.rope.line(line);
         let n = slice.len_chars();
-        if slice.chars().last() == Some('\n') {
+        if n > 0 && slice.char(n - 1) == '\n' {
             n - 1
         } else {
             n
+        }
+    }
+
+    /// Whether `line` holds no content — its newline alone, or nothing (the
+    /// buffer's last line). The paragraph motions and `ip`/`ap` test this per
+    /// line across a range, so it answers in O(log n) instead of measuring the
+    /// line's length.
+    fn line_is_blank(&self, line: usize) -> bool {
+        let slice = self.rope.line(line);
+        match slice.len_chars() {
+            0 => true,
+            1 => slice.char(0) == '\n',
+            _ => false,
         }
     }
 
@@ -2232,6 +2263,41 @@ mod tests {
         assert!(!d.toggle_task(1)); // no box on a plain line
         assert!(d.toggle_task(2)); // indented ordered item, capital X unchecks
         assert_eq!(d.rope.line(2).to_string(), "  1. [ ] b");
+    }
+
+    #[test]
+    fn blank_line_test_excludes_a_one_char_last_line() {
+        // The buffer's last line carries no newline, so a one-char line there
+        // is one char long *as stored* — the blankness test must look at the
+        // char, not just the length, or `{`/`}`/`ip` treat it as a paragraph
+        // break. "a\n\nb": only line 1 is blank.
+        let d = Document::new("a\n\nb");
+        assert!(!d.line_is_blank(0));
+        assert!(d.line_is_blank(1));
+        assert!(!d.line_is_blank(2));
+        // A trailing newline makes a genuinely empty final line.
+        let d = Document::new("a\n");
+        assert!(d.line_is_blank(1));
+
+        // The motion it backs: `}` from line 0 stops at the blank line, not
+        // past it onto the one-char line.
+        let d = Document::new("a\n\nb");
+        assert_eq!(d.motion_target(Motion::ParaForward, 0, 1), d.rope.line_to_char(1));
+    }
+
+    #[test]
+    fn undo_stack_is_capped() {
+        let mut d = Document::new("x");
+        for i in 0..UNDO_LEVELS + 50 {
+            d.checkpoint();
+            d.insert(&i.to_string());
+        }
+        assert_eq!(d.undo.len(), UNDO_LEVELS);
+        // The cap drops the oldest states, so undo still walks back the most
+        // recent ones rather than failing outright.
+        let before = d.rope.to_string();
+        d.undo();
+        assert_ne!(d.rope.to_string(), before);
     }
 
     #[test]

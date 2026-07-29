@@ -8,6 +8,16 @@ edition = "2024"
 # debug/release builds carry zero measurement code; `cargo perf` turns it on.
 perf = []
 
+# The editor's hot loop spans document.rs, markdown.rs, and editor/rows.rs, so
+# cross-unit inlining is worth the slower link. `cargo perf` is a release build
+# and inherits this, which is what makes its numbers representative.
+#
+# `panic = "abort"` is deliberately absent: gpui unwinds in places, and the
+# marginal size win isn't worth changing crash behavior.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 gpui = "0.2"
 jiff = "0.2.32"

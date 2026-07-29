@@ -33,7 +33,9 @@ use row_list::row_list;
 use rows::{caret_only_change, row_offsets, RowsCache, RowsKey, ShapeWrapCache};
 use search::{find_matches, search_sensitive, SearchState};
 use sidebar::{expand_ancestors, FilePrompt, PromptAction};
-use crate::markdown::{self, SpanKind};
+// `line_text` lives in the scanner: every caller wants a newline-stripped line
+// in order to feed it a markdown function.
+use crate::markdown::{self, line_text, SpanKind};
 use crate::session;
 use crate::theme::Theme;
 use crate::vault::{Row, Vault};
@@ -1562,6 +1564,7 @@ impl Render for Editor {
                 // lines — plus the fence lines their enclosing code blocks
                 // reveal — can render differently (conceal swap, caret,
                 // gutter emphasis). Rebuild those lines and splice in place.
+                let t0 = crate::perf::t0();
                 let mut c = self.rows_cache.take().unwrap();
                 let ctx = self.row_ctx(wrap_width, &theme, window);
                 let old_line =
@@ -1591,6 +1594,7 @@ impl Render for Editor {
                     + caret_in_line;
                 let rows = Rc::new(rows);
                 let offsets = row_offsets(&rows, self.line_h());
+                crate::perf::rows_done(t0, "patch", redo.len(), rows.len());
                 self.rows_cache = Some(RowsCache {
                     key,
                     rows: rows.clone(),
@@ -1601,10 +1605,13 @@ impl Render for Editor {
                 (rows, cur_row)
             }
             Plan::Full => {
+                let t0 = crate::perf::t0();
                 let ctx = self.row_ctx(wrap_width, &theme, window);
+                let line_count = ctx.rope.len_lines();
                 let (rows, cur_row, line_rows) = self.build_rows(&ctx, window);
                 let rows = Rc::new(rows);
                 let offsets = row_offsets(&rows, self.line_h());
+                crate::perf::rows_done(t0, "FULL", line_count, rows.len());
                 self.rows_cache =
                     Some(RowsCache { key, rows: rows.clone(), cur_row, line_rows, offsets });
                 (rows, cur_row)
@@ -1980,11 +1987,6 @@ impl Render for Editor {
             )
             .children(self.render_picker(&theme))
     }
-}
-
-/// Text of line `i` without its trailing newline.
-fn line_text(rope: &ropey::Rope, i: usize) -> String {
-    rope.line(i).chars().filter(|c| *c != '\n').collect()
 }
 
 /// Line of the first heading titled `name`, case-insensitively and ignoring the

@@ -73,11 +73,22 @@ pub struct Segment {
 pub fn parse(rope: &Rope) -> Vec<Vec<Span>> {
     let mut scan = Scan { in_fence: false, in_frontmatter: false };
     (0..rope.len_lines())
-        .map(|i| {
-            let text: String = rope.line(i).chars().filter(|&c| c != '\n').collect();
-            scan.line(&text, i)
-        })
+        .map(|i| scan.line(&line_text(rope, i), i))
         .collect()
+}
+
+/// Text of line `i` with its trailing newline dropped — the form every scanner
+/// function here takes, and what the editor and document layers feed them.
+///
+/// Slices the newline off and bulk-copies rather than filtering char by char:
+/// the newline is only ever last (`Rope::line` splits on them), and this runs
+/// once per line over the whole document on every reparse. A CRLF line keeps
+/// its `\r`.
+pub fn line_text(rope: &Rope, i: usize) -> String {
+    let slice = rope.line(i);
+    let n = slice.len_chars();
+    let end = if n > 0 && slice.char(n - 1) == '\n' { n - 1 } else { n };
+    slice.slice(..end).to_string()
 }
 
 struct Scan {

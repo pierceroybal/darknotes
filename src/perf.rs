@@ -17,6 +17,7 @@ pub use real::*;
 
 #[cfg(feature = "perf")]
 mod real {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Once, OnceLock};
     use std::time::Instant;
 
@@ -80,6 +81,25 @@ mod real {
         }
     }
 
+    static ROW_BUILDS: AtomicU32 = AtomicU32::new(0);
+
+    /// Pair with `t0` around a row build, reporting which plan ran. This is the
+    /// one measurement `key → frame` cannot substitute for: that line resolves
+    /// on the next drawn frame, so it bundles app work with frame scheduling and
+    /// (on a software rasterizer) is dominated by the latter. This times the
+    /// build itself, and the running count exposes how many full builds one
+    /// user action costs — a startup or resize can trigger several, since a
+    /// changed wrap width fails `RowsKey` equality.
+    pub fn rows_done(t0: Option<Instant>, plan: &str, lines: usize, rows: usize) {
+        if let Some(t) = t0 {
+            let n = ROW_BUILDS.fetch_add(1, Ordering::Relaxed) + 1;
+            eprintln!(
+                "perf: rows #{n} {plan} {lines} lines → {rows} rows in {:.1?}",
+                t.elapsed()
+            );
+        }
+    }
+
     /// `", rss 48MB"`, or empty where /proc is unavailable (non-Linux).
     fn rss() -> String {
         std::fs::read_to_string("/proc/self/status")
@@ -123,4 +143,6 @@ mod noop {
     pub fn task_scan_done(_: Option<Instant>, _: usize, _: usize) {}
     #[inline(always)]
     pub fn grep_snapshot_done(_: Option<Instant>, _: usize, _: usize) {}
+    #[inline(always)]
+    pub fn rows_done(_: Option<Instant>, _: &str, _: usize, _: usize) {}
 }

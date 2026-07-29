@@ -30,13 +30,13 @@ use std::rc::Rc;
 
 use gpui::{px, Font, Pixels, Window};
 
-use crate::markdown::{self, Segment, SpanKind};
+use crate::markdown::{self, line_text, Segment, SpanKind};
 use crate::config::LineNumbers;
 use crate::theme::Theme;
 use crate::vim::Mode;
 
 use super::{
-    caret_bytes, fence_block, find_matches, heading_metrics, line_text, row_decor, run,
+    caret_bytes, fence_block, find_matches, heading_metrics, row_decor, run,
     search_sensitive, segments_to_runs, Editor, Highlight, LineCaret, LineElement, RowDecor,
     CODE_MARGIN, CODE_PAD,
 };
@@ -483,7 +483,9 @@ fn line_highlight(rope: &ropey::Rope, i: usize, lo: usize, hi: usize) -> Option<
     let line_start = rope.line_to_char(i);
     let line = rope.line(i);
     let total = line.len_chars(); // includes a trailing '\n' if present
-    let content = if line.chars().last() == Some('\n') { total - 1 } else { total };
+    // Indexed, not iterated: this runs once per selection span and once per
+    // search match per line, and `Chars::last()` walks the whole line.
+    let content = if total > 0 && line.char(total - 1) == '\n' { total - 1 } else { total };
     let a = lo.max(line_start);
     let b = hi.min(line_start + total); // clamp to past-the-newline
     if a >= b {
