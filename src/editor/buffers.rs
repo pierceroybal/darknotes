@@ -275,10 +275,19 @@ impl Editor {
     }
 
     /// Write every dirty buffer, stopping at the first failure so the error
-    /// reaches the user instead of a partial save reporting success.
-    pub(super) fn save_all_dirty(&mut self) -> std::io::Result<()> {
-        for b in self.buffers.iter_mut().filter(|b| b.doc.is_dirty()) {
-            b.doc.save()?;
+    /// reaches the user instead of a partial save reporting success. The `Err`
+    /// names the buffer, which is the only way to tell which one stopped it.
+    ///
+    /// Never forces: a note that changed on disk must not be overwritten just
+    /// because the user is quitting. They resolve it with `:w!` or `:e!`.
+    pub(super) fn save_all_dirty(&mut self) -> Result<(), String> {
+        for i in 0..self.buffers.len() {
+            if !self.buffers[i].doc.is_dirty() {
+                continue;
+            }
+            if let Err(e) = self.buffers[i].doc.save(false) {
+                return Err(format!("{}: {e}", self.buffer_display(&self.buffers[i])));
+            }
         }
         Ok(())
     }

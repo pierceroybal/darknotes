@@ -156,8 +156,15 @@ pub struct Document {
     missing: bool,
     /// Hash of the file content as this buffer last read or wrote it
     /// (`open`/`save`). The watcher compares disk against this to tell a
-    /// genuine external change from an echo of our own write.
+    /// genuine external change from an echo of our own write, and `save`
+    /// refuses to overwrite a file that no longer matches it. Only a real read
+    /// or write may move it — recording an unadopted disk state here would
+    /// erase the very divergence both checks exist to find.
     disk_hash: u64,
+    /// Hash of an external change already reported for this buffer, so repeat
+    /// watcher events for one write don't re-warn. Distinct from `disk_hash`
+    /// because this content was seen and *not* adopted.
+    warned_hash: Option<u64>,
     /// Content generation, drawn from a process-wide counter so no two
     /// documents (or states of one document) ever share a value. Bumped on
     /// every content change — including undo/redo, which can restore
@@ -226,6 +233,7 @@ impl Document {
             dirty: false,
             missing: false,
             disk_hash: Self::hash_text(text),
+            warned_hash: None,
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -252,6 +260,7 @@ impl Document {
             dirty: false,
             missing: false,
             disk_hash: Self::hash_text(&text),
+            warned_hash: None,
             revision: next_revision(),
             register: Register::default(),
             undo: Vec::new(),
@@ -263,7 +272,54 @@ impl Document {
     }
 
     /// Write the buffer to its backing file. No-op for an unnamed buffer.
-    pub fn save(&mut self) -> io::Result<()> {
+    /// Refuses when the file no longer holds what this buffer last read or
+    /// wrote — someone else's edit is not ours to discard — unless `force`
+    /// (`:w!`). `:e!` takes the other side of that choice.
+    pub fn save(&mut self, force: bool) -> io::Result<()> {
+        if !force {
+            self.check_unchanged()?;
+        }
+        self.write_now()
+    }
+
+    /// Adopt `path` as the backing file and write to it (vim `:w <name>`).
+    /// Refuses when `path` already holds a file, unless `force` (`:w! <name>`):
+    /// its contents were never loaded here, so nothing has been compared and
+    /// overwriting would be blind.
+    pub fn save_as(&mut self, path: impl Into<PathBuf>, force: bool) -> io::Result<()> {
+        let path = path.into();
+        // Naming the file it already has is a plain `:w`, divergence check and
+        // all — `disk_hash` describes exactly this file.
+        if self.path.as_deref() == Some(path.as_path()) {
+            return self.save(force);
+        }
+        if !force && path.exists() {
+            return Err(refused(format!("E13: {} exists (add ! to override)", path.display())));
+        }
+        // Past here `disk_hash` describes the *old* file, so it says nothing
+        // about this target and `write_now` runs unguarded.
+        self.path = Some(path);
+        self.write_now()
+    }
+
+    /// `Err` when the backing file has diverged from what this buffer last read
+    /// or wrote.
+    fn check_unchanged(&self) -> io::Result<()> {
+        let Some(path) = &self.path else { return Ok(()) };
+        // A file that is gone is not a conflict — `save` recreates it, as vim
+        // does. Neither is one that won't read back as text: there is then
+        // nothing to compare and nothing to describe to the user, and the
+        // write reports its own failure if the path is genuinely unwritable.
+        let Ok(disk) = std::fs::read_to_string(path) else { return Ok(()) };
+        if Self::hash_text(&disk) == self.disk_hash {
+            return Ok(());
+        }
+        Err(refused("E13: file changed on disk (add ! to override)".into()))
+    }
+
+    /// The write itself, with no guards: create the parent, replace the file,
+    /// and adopt the written text as this buffer's disk state.
+    fn write_now(&mut self) -> io::Result<()> {
         if let Some(path) = &self.path {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
@@ -273,14 +329,9 @@ impl Document {
             self.dirty = false;
             self.missing = false;
             self.disk_hash = Self::hash_text(&text);
+            self.warned_hash = None; // whatever diverged, this write settled it
         }
         Ok(())
-    }
-
-    /// Adopt `path` as the backing file and write to it (vim `:w <name>`).
-    pub fn save_as(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
-        self.path = Some(path.into());
-        self.save()
     }
 
     pub fn is_dirty(&self) -> bool {
@@ -302,10 +353,15 @@ impl Document {
         self.disk_hash
     }
 
+    /// Whether `hash` is an external change already reported for this buffer.
+    pub fn already_warned(&self, hash: u64) -> bool {
+        self.warned_hash == Some(hash)
+    }
+
     /// Record a disk state observed but not adopted (the W12 dirty-buffer
     /// case), so duplicate events for the same change don't re-warn.
-    pub fn set_disk_hash(&mut self, hash: u64) {
-        self.disk_hash = hash;
+    pub fn set_warned_hash(&mut self, hash: u64) {
+        self.warned_hash = Some(hash);
     }
 
     pub fn hash_text(text: &str) -> u64 {
@@ -1654,6 +1710,13 @@ impl Document {
     }
 }
 
+/// A save the editor declined to perform, as opposed to one the filesystem
+/// rejected. `AlreadyExists` is the marker: the message is already a complete
+/// vim-style error, so `Editor::save` shows it without a `save failed:` prefix.
+fn refused(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, message)
+}
+
 /// Write `contents` to `path` without ever leaving it partial: fill a temp file
 /// beside it, flush that to disk, then rename over the target. An interruption —
 /// a full disk, the OOM killer, power loss — costs the *new* contents and leaves
@@ -2704,13 +2767,79 @@ mod tests {
         assert!(!d.is_dirty());
         d.insert("hello");
         assert!(d.is_dirty());
-        d.save().unwrap();
+        d.save(false).unwrap();
         assert!(!d.is_dirty());
 
         let reopened = Document::open(&path).unwrap();
         assert_eq!(reopened.rope.to_string(), "hello");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_refuses_to_overwrite_an_external_change_until_forced() {
+        let dir = std::env::temp_dir().join("darknotes_save_conflict_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+
+        std::fs::write(&path, "theirs\n").unwrap();
+        let mut d = Document::open(&path).unwrap();
+        d.insert("mine");
+        // No divergence yet: disk still holds what `open` read.
+        d.save(false).unwrap();
+
+        // Someone else writes the file behind us.
+        std::fs::write(&path, "theirs again\n").unwrap();
+        let err = d.save(false).expect_err("a diverged file must not be overwritten");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs again\n");
+
+        // `:w!` is the way through, and it re-syncs `disk_hash` so the next
+        // plain save is not still blocked by the old divergence.
+        d.save(true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), d.rope.to_string());
+        d.insert("more");
+        d.save(false).unwrap();
+
+        // A file deleted out from under the buffer is recreated, not refused.
+        std::fs::remove_file(&path).unwrap();
+        d.insert("!");
+        d.save(false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), d.rope.to_string());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_refuses_an_existing_target_until_forced() {
+        let dir = std::env::temp_dir().join("darknotes_save_as_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mine, theirs) = (dir.join("mine.md"), dir.join("theirs.md"));
+        std::fs::write(&theirs, "not mine\n").unwrap();
+
+        let mut d = Document::open(&mine).unwrap();
+        d.insert("mine");
+        d.save(false).unwrap();
+
+        // `:w theirs.md` must not blow away a file this buffer never loaded.
+        let err = d.save_as(theirs.clone(), false).expect_err("existing target");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "not mine\n");
+        // The refusal must not have retargeted the buffer either.
+        assert_eq!(d.path(), Some(mine.as_path()));
+
+        d.save_as(theirs.clone(), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine");
+        assert_eq!(d.path(), Some(theirs.as_path()));
+
+        // Naming the file it already has is a plain save, not an "exists" error.
+        d.insert("!");
+        d.save_as(theirs.clone(), false).unwrap();
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "mine!");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2755,7 +2884,7 @@ mod tests {
 
         let mut d = Document::open(&path).unwrap();
         d.insert("hello");
-        d.save().unwrap();
+        d.save(false).unwrap();
         // Watcher event echoing our own save: disk matches disk_hash.
         let disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(Document::hash_text(&disk), d.disk_hash());

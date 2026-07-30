@@ -493,11 +493,16 @@ impl Editor {
                 }
                 if self.buffers[i].doc.is_dirty() {
                     self.buffers[i].doc.set_missing(false); // back, even if we won't reload it
-                    self.buffers[i].doc.set_disk_hash(hash); // dedupe repeat events
-                    let name = self.buffer_display(&self.buffers[i]);
-                    self.message =
-                        Some(format!("W12: {name} changed on disk (unsaved changes kept)"));
-                    repaint = true;
+                    // Dedupe against `warned_hash`, never `disk_hash`: this
+                    // content was seen, not adopted, and `save` reads
+                    // `disk_hash` to decide whether overwriting is safe.
+                    if !self.buffers[i].doc.already_warned(hash) {
+                        self.buffers[i].doc.set_warned_hash(hash);
+                        let name = self.buffer_display(&self.buffers[i]);
+                        self.message =
+                            Some(format!("W12: {name} changed on disk (unsaved changes kept)"));
+                        repaint = true;
+                    }
                 } else {
                     let caret = self.buffers[i].doc.caret_offset();
                     self.buffers[i].doc = open_or_empty(path);
@@ -1509,12 +1514,12 @@ impl Editor {
         session::record(&self.vault.root, session::VaultSession { active, files });
     }
 
-    fn save(&mut self, arg: Option<&str>) {
+    fn save(&mut self, arg: Option<&str>, force: bool) {
         let result = match arg {
             Some(name) => {
                 let path = resolve(&self.vault.root, name);
                 let display = path.display().to_string();
-                let r = self.doc_mut().save_as(path).map(|()| display);
+                let r = self.doc_mut().save_as(path, force).map(|()| display);
                 if r.is_ok() {
                     // A new file may now exist under the vault root — re-scan
                     // so the sidebar shows it.
@@ -1531,7 +1536,7 @@ impl Editor {
                         .doc()
                         .path()
                         .is_some_and(|p| self.vault.files.iter().any(|f| f == p));
-                    let r = self.doc_mut().save().map(|()| display);
+                    let r = self.doc_mut().save(force).map(|()| display);
                     if r.is_ok() && !known {
                         self.rescan_vault();
                     }
@@ -1551,6 +1556,9 @@ impl Editor {
         }
         self.message = Some(match result {
             Ok(name) => format!("\"{name}\" written"),
+            // A declined save already reads as a vim error; the filesystem's
+            // own failures are the ones that need saying what they were.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => e.to_string(),
             Err(e) => format!("save failed: {e}"),
         });
     }

@@ -412,8 +412,9 @@ impl Editor {
                 match key {
                     "s" => match self.save_all_dirty() {
                         Ok(()) => self.quit(true, cx),
-                        // Still unsaved, so don't quit — the message says why.
-                        Err(e) => self.message = Some(format!("write failed: {e}")),
+                        // Still unsaved, so don't quit — the message says which
+                        // note refused and why.
+                        Err(e) => self.message = Some(e),
                     },
                     "d" => self.quit(true, cx),
                     _ => {}

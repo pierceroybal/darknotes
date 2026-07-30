@@ -35,7 +35,7 @@ pub(super) const COMMANDS: &[Command] = &[
         name: "save",
         ex: &["w", "write"],
         takes_arg: true,
-        run: |ed, a, _win, _cx| ed.save(a.arg.as_deref()),
+        run: |ed, a, _win, _cx| ed.save(a.arg.as_deref(), a.bang),
     },
     Command {
         name: "edit",
@@ -129,8 +129,8 @@ pub(super) const COMMANDS: &[Command] = &[
         takes_arg: false,
         // Save first; quit only if the save stuck (it can fail) — and `quit`
         // still refuses if some *other* buffer holds unsaved changes.
-        run: |ed, _a, _win, cx| {
-            ed.save(None);
+        run: |ed, a, _win, cx| {
+            ed.save(None, a.bang);
             if !ed.doc().is_dirty() {
                 ed.quit(false, cx);
             }
