@@ -701,19 +701,52 @@ impl Document {
         }
     }
 
+    /// Char span for a linewise delete of lines `first..=last`: the range that
+    /// goes to the register, and the offset the removal actually starts at.
+    ///
+    /// Through the buffer's last line the two differ. There is no newline after
+    /// a final line, so removing the range alone leaves the *preceding* one
+    /// behind as a phantom empty last line — and on an already-empty last line
+    /// it would remove nothing at all. Taking that newline instead is what
+    /// leaves the buffer genuinely one line shorter.
+    ///
+    /// Keyed on line indices, not on whether the range reaches `len_chars`: a
+    /// buffer ending in a newline has a final empty line, so a range stopping
+    /// at `len_chars` need not be the last line's, and treating it as such
+    /// would swallow the trailing newline.
+    fn linewise_del_span(&self, first: usize, last: usize) -> (std::ops::Range<usize>, usize) {
+        let start = self.rope.line_to_char(first);
+        if last + 1 >= self.rope.len_lines() {
+            (start..self.rope.len_chars(), start.saturating_sub(1))
+        } else {
+            (start..self.rope.line_to_char(last + 1), start)
+        }
+    }
+
     /// Visual `d`/`x`, or `c` when `change`: delete the selection into the
     /// register, then drop the caret on a real char of the resulting line. A
     /// linewise change spares the span's last newline, leaving one empty line
     /// for the insert that follows (vim `Vc`, same rule as `cip`), and leaves
     /// the caret there rather than snapping it onto a char.
     pub fn delete_selection(&mut self, linewise: bool, change: bool) {
-        let (start, mut end) = self.selection_span(linewise);
+        let (start, mut end, del_start) = if linewise {
+            let r = self.selections[0].range();
+            let (span, del_start) = self
+                .linewise_del_span(self.rope.char_to_line(r.start), self.rope.char_to_line(r.end));
+            // A change keeps the newline before the range and gives up the
+            // range's own last one instead, so the insert lands on an empty
+            // line rather than joining the neighbours.
+            (span.start, span.end, if change { span.start } else { del_start })
+        } else {
+            let (start, end) = self.selection_span(false);
+            (start, end, start)
+        };
         if start < end {
             self.set_register(self.rope.slice(start..end).to_string(), linewise);
             if change && linewise && self.rope.char(end - 1) == '\n' {
                 end -= 1;
             }
-            self.rope.remove(start..end);
+            self.rope.remove(del_start..end);
             self.touch();
         }
         let at = start.min(self.rope.len_chars());
@@ -795,20 +828,11 @@ impl Document {
     /// `dd`: delete `count` whole lines starting at the caret's line.
     pub fn delete_lines(&mut self, count: usize) {
         let (line, _) = self.line_col_of(self.caret());
-        let start = self.rope.line_to_char(line);
-        let end_line = line + count.max(1);
-        // Deleting through the buffer's last line must also take the newline
-        // *before* the range: there is none after it, so leaving the previous
-        // one behind keeps a phantom empty last line (and on an already-empty
-        // last line the delete would remove nothing at all).
-        let (end, del_start) = if end_line >= self.rope.len_lines() {
-            (self.rope.len_chars(), start.saturating_sub(1))
-        } else {
-            (self.rope.line_to_char(end_line), start)
-        };
-        if del_start < end {
-            self.set_register(self.rope.slice(start..end).to_string(), true);
-            self.rope.remove(del_start..end);
+        let (span, del_start) = self.linewise_del_span(line, line + count.max(1) - 1);
+        let start = span.start;
+        if del_start < span.end {
+            self.set_register(self.rope.slice(span.clone()).to_string(), true);
+            self.rope.remove(del_start..span.end);
             self.touch();
         }
         let at = start.min(self.rope.len_chars());
@@ -831,16 +855,11 @@ impl Document {
         } else {
             (line, (line + count).min(last))
         };
-        let start = self.rope.line_to_char(first);
-        // Same last-line rule as `delete_lines`: take the preceding newline.
-        let (end, del_start) = if last_del >= last {
-            (self.rope.len_chars(), start.saturating_sub(1))
-        } else {
-            (self.rope.line_to_char(last_del + 1), start)
-        };
-        if del_start < end {
-            self.set_register(self.rope.slice(start..end).to_string(), true);
-            self.rope.remove(del_start..end);
+        let (span, del_start) = self.linewise_del_span(first, last_del);
+        let start = span.start;
+        if del_start < span.end {
+            self.set_register(self.rope.slice(span.clone()).to_string(), true);
+            self.rope.remove(del_start..span.end);
             self.touch();
         }
         let at = start.min(self.rope.len_chars());
@@ -2412,6 +2431,44 @@ mod tests {
         d.delete_selection(true, false);
         assert_eq!(d.rope.to_string(), "ccc\n");
         assert_eq!(d.caret_line_col(), (0, 0));
+    }
+
+    #[test]
+    fn visual_linewise_delete_through_eof_leaves_no_empty_line() {
+        // `Vd` on the last line takes the newline before it, like `dd` — the
+        // buffer ends up one line shorter, not one line plus an empty one.
+        let mut d = Document::new("abc\ndef");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_selection(true, false);
+        assert_eq!(d.rope.to_string(), "abc");
+        assert_eq!(d.rope.len_lines(), 1);
+        assert_eq!(d.caret_line_col(), (0, 2)); // last real char, as vim
+        // The line itself, not the newline taken from before it. Normalized to
+        // end in one by `set_register`, so `p` pastes it as a whole line.
+        assert_eq!(d.register.text, "def\n");
+
+        // Deleting the only line empties the buffer rather than underflowing.
+        let mut one = Document::new("solo");
+        one.delete_selection(true, false);
+        assert_eq!(one.rope.to_string(), "");
+
+        // A trailing newline means a final empty line, so line 0 is not the
+        // last line: its delete must leave that newline alone.
+        let mut trailing = Document::new("ab\ncd\n");
+        trailing.move_motion(Motion::LineDown, 1);
+        trailing.delete_selection(true, false);
+        assert_eq!(trailing.rope.to_string(), "ab\n");
+    }
+
+    #[test]
+    fn visual_linewise_change_through_eof_keeps_a_line_to_type_on() {
+        // `Vc` gives up the range's own newline instead of the preceding one,
+        // so the insert lands on an empty line (vim `Vc`, same rule as `cip`).
+        let mut d = Document::new("abc\ndef");
+        d.move_motion(Motion::LineDown, 1);
+        d.delete_selection(true, true);
+        assert_eq!(d.rope.to_string(), "abc\n");
+        assert_eq!(d.caret_line_col(), (1, 0));
     }
 
     #[test]

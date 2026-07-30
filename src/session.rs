@@ -46,10 +46,17 @@ fn session_path() -> Option<PathBuf> {
 }
 
 fn load() -> Session {
-    session_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| toml::from_str(&t).ok())
-        .unwrap_or_default()
+    let Some(p) = session_path() else { return Session::default() };
+    let Ok(text) = std::fs::read_to_string(&p) else { return Session::default() };
+    match toml::from_str(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            // Starting fresh is the documented behavior; say so, because the
+            // alternative reading of every tab vanishing is a lost vault.
+            eprintln!("darknotes: ignoring unreadable {}: {e}", p.display());
+            Session::default()
+        }
+    }
 }
 
 pub fn restore(vault: &Path) -> Option<VaultSession> {
@@ -64,7 +71,9 @@ pub fn record(vault: &Path, entry: VaultSession) {
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Err(e) = std::fs::write(&p, text) {
+    // Atomic: this one file holds every vault's restore state, and a write
+    // interrupted partway through would strand all of them, not just this one.
+    if let Err(e) = crate::document::atomic_write(&p, &text) {
         eprintln!("darknotes: could not write {}: {e}", p.display());
     }
 }
