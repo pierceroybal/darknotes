@@ -10,7 +10,7 @@ use gpui::{Context, Window};
 
 use crate::document::Document;
 
-use super::Editor;
+use super::{Editor, FilePrompt, PromptAction};
 
 /// One open buffer: a `Document` plus tab metadata.
 pub(super) struct Buffer {
@@ -273,6 +273,53 @@ impl Editor {
         self.save_session();
         cx.quit();
     }
+
+    /// Write every dirty buffer, stopping at the first failure so the error
+    /// reaches the user instead of a partial save reporting success.
+    pub(super) fn save_all_dirty(&mut self) -> std::io::Result<()> {
+        for b in self.buffers.iter_mut().filter(|b| b.doc.is_dirty()) {
+            b.doc.save()?;
+        }
+        Ok(())
+    }
+
+    /// Window-close guard (the titlebar X): `true` lets the close through.
+    /// Unsaved buffers raise the quit confirmation and veto it — the same
+    /// policy as `:q`, except the save/discard choice is offered here instead
+    /// of left as an E162 for the user to resolve by hand.
+    pub(crate) fn confirm_close(&mut self, cx: &mut Context<Self>) -> bool {
+        // Clicking X again while the dialog is up must not stack a second one.
+        if matches!(self.prompt.as_ref().map(|p| &p.action), Some(PromptAction::ConfirmQuit)) {
+            return false;
+        }
+        let dirty: Vec<String> = self
+            .buffers
+            .iter()
+            .filter(|b| b.doc.is_dirty())
+            .map(|b| self.buffer_display(b))
+            .collect();
+        let Some(label) = unsaved_label(&dirty) else {
+            self.save_session();
+            return true;
+        };
+        self.prompt =
+            Some(FilePrompt { label, input: String::new(), action: PromptAction::ConfirmQuit });
+        cx.notify(); // the dialog is a render-state change, not a key event
+        false
+    }
+}
+
+/// The quit dialog's question for buffers named `names`, or `None` when there
+/// is nothing unsaved and the window may just close. One note is named — it is
+/// the common case, and this is the last word before a possible discard, so it
+/// has to say what is at stake. Past one, a count reads better than a list and
+/// keeps the dialog a fixed size.
+fn unsaved_label(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some(format!("1 unsaved note: {one}")),
+        many => Some(format!("{} unsaved notes", many.len())),
+    }
 }
 
 /// Bare names get a `.md` extension; anything with an extension is left alone.
@@ -439,7 +486,7 @@ fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
 mod tests {
     use super::{
         append_line, create_daily, match_buffer, rel_display, resolve, resolve_link, unique_dest,
-        vault_relative,
+        unsaved_label, vault_relative,
     };
     use std::path::{Path, PathBuf};
 
@@ -559,6 +606,18 @@ mod tests {
         assert_eq!(resolve_link(root, &files, "ideas"), Some(files[0].clone()));
         assert_eq!(resolve_link(root, &files, "TODAY"), Some(files[1].clone()));
         assert_eq!(resolve_link(root, &files, "nope"), None);
+    }
+
+    #[test]
+    fn unsaved_label_names_one_note_and_counts_the_rest() {
+        // `None` is what lets the window close without asking.
+        assert_eq!(unsaved_label(&[]), None);
+        assert_eq!(
+            unsaved_label(&["daily/2026-07-30".to_string()]).unwrap(),
+            "1 unsaved note: daily/2026-07-30"
+        );
+        let three = ["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(unsaved_label(&three).unwrap(), "3 unsaved notes");
     }
 
     #[test]

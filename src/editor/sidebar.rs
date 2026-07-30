@@ -7,27 +7,29 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use gpui::{KeyDownEvent, ScrollStrategy, Window};
+use gpui::{Context, KeyDownEvent, ScrollStrategy, Window};
 
 use crate::vault::Row;
 
 use super::{unique_dest, with_md_ext, Editor, Pane};
 
-/// A sidebar file-op prompt — modal like the picker. Create and rename edit
+/// A modal prompt — key routing like the picker's. Create and rename edit
 /// inline in the tree: the input renders as the row being created/renamed
-/// (vim's open-line, for files) with `label` as a status-line hint. The
-/// delete confirmation lives in the status line alone. Printable keys extend
-/// `input`, Backspace trims, Enter applies via `action`, Esc — or clicking
-/// another row — cancels.
+/// (vim's open-line, for files) with `label` as a status-line hint, printable
+/// keys extend `input`, Backspace trims, Enter applies via `action`, and Esc —
+/// or clicking another row — cancels. The confirmations take no input and
+/// resolve on one key instead: delete asks from the status line, quit from a
+/// centered dialog.
 pub(super) struct FilePrompt {
-    /// Status-line text: a hint (`"New in notes/"`) while editing inline,
-    /// the whole question for the delete confirmation.
+    /// A hint (`"New in notes/"`) while editing inline, the whole question for
+    /// a confirmation.
     pub(super) label: String,
     pub(super) input: String,
     pub(super) action: PromptAction,
 }
 
-/// What Enter does with a finished file prompt.
+/// What resolving a prompt does. The editing kinds act on Enter; the
+/// confirmations act on their own single key, in `prompt_key`.
 pub(super) enum PromptAction {
     /// Create `input` inside `dir`: a folder on a trailing `/`, else a file
     /// (bare names default to `.md`). `at`/`depth` place the phantom input
@@ -38,6 +40,10 @@ pub(super) enum PromptAction {
     Rename { target: PathBuf },
     /// Permanently delete `target` (already inside `.trash`) on `y`.
     ConfirmDelete { target: PathBuf },
+    /// Unsaved buffers at window-close: `s` writes them all and quits, `d`
+    /// quits anyway, anything else stays. Renders as a centered dialog rather
+    /// than a status-line hint, so its label is the whole question.
+    ConfirmQuit,
 }
 
 impl Editor {
@@ -378,22 +384,43 @@ impl Editor {
 
     /// Keystrokes while a file-op prompt is open. Mirrors `picker_key`:
     /// printable chars extend the input, Backspace trims, Enter applies, Esc
-    /// cancels. The delete confirmation is single-key: `y` commits, anything
-    /// else cancels.
-    pub(super) fn prompt_key(&mut self, ev: &KeyDownEvent, window: &mut Window) {
+    /// cancels. The confirmations are single-key and consume every other key,
+    /// so a stray keystroke cancels rather than falling through to the input
+    /// editing below.
+    pub(super) fn prompt_key(
+        &mut self,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
         let key = ev.keystroke.key.as_str();
-        if matches!(
-            self.prompt.as_ref().map(|p| &p.action),
-            Some(PromptAction::ConfirmDelete { .. })
-        ) {
-            if let Some(FilePrompt { action: PromptAction::ConfirmDelete { target }, .. }) =
-                self.prompt.take()
-            {
-                if key == "y" {
-                    self.delete_forever(&target);
+        match self.prompt.as_ref().map(|p| &p.action) {
+            Some(PromptAction::ConfirmDelete { .. }) => {
+                if let Some(FilePrompt { action: PromptAction::ConfirmDelete { target }, .. }) =
+                    self.prompt.take()
+                {
+                    if key == "y" {
+                        self.delete_forever(&target);
+                    }
                 }
+                return;
             }
-            return;
+            Some(PromptAction::ConfirmQuit) => {
+                // Dismiss first: both quitting branches leave the dialog with
+                // nothing left to answer, and cancelling is the default.
+                self.prompt = None;
+                match key {
+                    "s" => match self.save_all_dirty() {
+                        Ok(()) => self.quit(true, cx),
+                        // Still unsaved, so don't quit — the message says why.
+                        Err(e) => self.message = Some(format!("write failed: {e}")),
+                    },
+                    "d" => self.quit(true, cx),
+                    _ => {}
+                }
+                return;
+            }
+            _ => {}
         }
         let m = ev.keystroke.modifiers;
         match key {
@@ -428,7 +455,8 @@ impl Editor {
         match prompt.action {
             PromptAction::Create { dir, .. } => self.create_entry(&dir, input, window),
             PromptAction::Rename { target } => self.rename_entry(&target, input),
-            PromptAction::ConfirmDelete { .. } => {} // handled in prompt_key
+            // Both confirmations resolve on a single key, never on Enter.
+            PromptAction::ConfirmDelete { .. } | PromptAction::ConfirmQuit => {}
         }
     }
 

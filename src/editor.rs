@@ -870,6 +870,58 @@ impl Editor {
     /// `●` when dirty, italic while a preview, muted + struck through when the
     /// backing file has been deleted out from under it. Click switches;
     /// middle-click closes (`:bd` semantics, no force).
+    /// The unsaved-changes dialog raised by the titlebar X (`confirm_close`).
+    /// Deliberately not a file list: the label names the note when there is one
+    /// and counts them otherwise, which keeps the box a fixed size and puts the
+    /// three answers — the point of the dialog — where the eye lands.
+    fn render_confirm_quit(&self, theme: &Theme) -> Option<impl IntoElement> {
+        let p = self.prompt.as_ref()?;
+        if !matches!(p.action, PromptAction::ConfirmQuit) {
+            return None;
+        }
+        let key = |k: &str, what: &str| {
+            div()
+                .flex()
+                .gap_2()
+                .child(div().text_color(theme.accent).child(k.to_string()))
+                .child(div().text_color(theme.foreground).child(what.to_string()))
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(160.))
+                .bg(hsla(0., 0., 0., 0.4)) // scrim, as the picker's
+                .child(
+                    div()
+                        .w(px(440.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .font_family(self.ui_font_family.clone())
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .rounded_lg()
+                        .shadow_lg()
+                        .child(div().text_color(theme.foreground).child(p.label.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(key("s", "save all and quit"))
+                                .child(key("d", "discard and quit"))
+                                .child(key("Esc", "keep editing")),
+                        ),
+                ),
+        )
+    }
+
     fn render_tabline(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let theme = *theme;
         let entity = cx.entity();
@@ -1037,7 +1089,7 @@ impl Editor {
 
         // File-op prompts (create/rename/delete-confirm) are modal the same way.
         if self.prompt.is_some() {
-            self.prompt_key(ev, window);
+            self.prompt_key(ev, window, cx);
             cx.notify();
             return;
         }
@@ -1777,8 +1829,12 @@ impl Render for Editor {
         // Mode reads as a colored pill; command mode keeps the raw `:` prompt
         // and a file-op prompt shows its hint instead. The filename (and dirty
         // flag) live in the tabline.
-        let (pill, bar) = if let Some(p) = &self.prompt {
+        let (pill, bar) = if let Some(p) =
+            self.prompt.as_ref().filter(|p| !matches!(p.action, PromptAction::ConfirmQuit))
+        {
             // Create/rename input renders inline in the tree; this is a hint.
+            // The quit confirmation is excluded — its dialog asks in full, and
+            // repeating the question down here would just read as an echo.
             (None, p.label.clone())
         } else if mode == Mode::Command {
             (None, format!("{}{}", self.vim.prompt(), self.vim.command_line()))
@@ -2078,6 +2134,7 @@ impl Render for Editor {
                     ),
             )
             .children(self.render_picker(&theme))
+            .children(self.render_confirm_quit(&theme))
     }
 }
 

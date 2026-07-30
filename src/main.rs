@@ -165,6 +165,12 @@ fn main() {
                 // Focus on launch, or on_key_down never fires and nothing types.
                 let handle = editor.read(cx).focus_handle(cx);
                 window.focus(&handle);
+                // The titlebar X is otherwise an unguarded exit: it bypasses
+                // `:q`'s unsaved-changes check and the session snapshot both.
+                window.on_window_should_close(cx, {
+                    let editor = editor.clone();
+                    move |_, cx| editor.update(cx, |e, cx| e.confirm_close(cx))
+                });
                 editor
             },
         )
