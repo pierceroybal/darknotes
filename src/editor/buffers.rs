@@ -4,7 +4,7 @@
 //!
 //! A child module of `editor` so methods can touch private `Editor` state.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use gpui::{Context, Window};
 
@@ -382,6 +382,21 @@ pub(super) fn resolve_link(root: &Path, files: &[PathBuf], target: &str) -> Opti
         .cloned()
 }
 
+/// Whether a wikilink target may be resolved into a path. Note text is
+/// untrusted — a synced or shared vault carries whatever its author wrote — and
+/// a real target is a bare stem or a vault-relative path, so anything that
+/// could leave the vault is refused. `..`, `.`, an absolute path, and a Windows
+/// prefix are all non-`Normal` components.
+///
+/// A lexical check, not `canonicalize` + `starts_with`: the target usually does
+/// not exist yet (that is how `[[New Note]]` then `:w` creates a note), which
+/// makes `canonicalize` fail, and `starts_with` is itself lexical — for a root
+/// of `/vault`, `/vault/../../etc/passwd.md` starts with `/vault`.
+pub(super) fn vault_relative(target: &str) -> bool {
+    let p = Path::new(target);
+    p.components().all(|c| matches!(c, Component::Normal(_))) && p.components().next().is_some()
+}
+
 /// Resolve a `:b` argument against buffer display names (vault-relative, `.md`
 /// dropped): a 1-based tab number, an exact name/basename match, else a unique
 /// case-insensitive substring match. `#` (alternate) is handled by the caller.
@@ -424,6 +439,7 @@ fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
 mod tests {
     use super::{
         append_line, create_daily, match_buffer, rel_display, resolve, resolve_link, unique_dest,
+        vault_relative,
     };
     use std::path::{Path, PathBuf};
 
@@ -543,5 +559,27 @@ mod tests {
         assert_eq!(resolve_link(root, &files, "ideas"), Some(files[0].clone()));
         assert_eq!(resolve_link(root, &files, "TODAY"), Some(files[1].clone()));
         assert_eq!(resolve_link(root, &files, "nope"), None);
+    }
+
+    #[test]
+    fn vault_relative_refuses_targets_that_can_leave_the_vault() {
+        // What a real wikilink looks like.
+        assert!(vault_relative("ideas"));
+        assert!(vault_relative("projects/ideas"));
+        assert!(vault_relative("New Note"));
+        assert!(vault_relative("a.b/c.md"));
+        // Traversal, absolute, and the `.`/empty degenerate cases. `resolve`
+        // would root the first two under the vault and honor the third as
+        // typed, so all of them have to be refused before they reach it.
+        assert!(!vault_relative("../../.bashrc"));
+        assert!(!vault_relative("notes/../../../.ssh/id_ed25519.pub"));
+        assert!(!vault_relative("/home/you/.ssh/id_ed25519.pub"));
+        assert!(!vault_relative("./x"));
+        assert!(!vault_relative(""));
+        // `starts_with` is lexical, so the check `vault_relative` replaces
+        // would have passed this one.
+        let escaped = resolve(Path::new("/vault"), "../../etc/passwd.md");
+        assert!(escaped.starts_with("/vault"));
+        assert!(!vault_relative("../../etc/passwd.md"));
     }
 }

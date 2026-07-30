@@ -22,7 +22,10 @@ use crate::config::{Config, LineNumbers, Search as SearchConfig};
 use crate::document::{Document, Motion};
 use crate::jumps::{Jumps, Pos};
 use crate::keymap::{Ctx, Resolver};
-use buffers::{open_or_empty, rel_display, resolve, resolve_link, unique_dest, with_md_ext, Buffer};
+use buffers::{
+    open_or_empty, rel_display, resolve, resolve_link, unique_dest, vault_relative, with_md_ext,
+    Buffer,
+};
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
     caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, CaretPaint,
@@ -1402,7 +1405,14 @@ impl Editor {
                 match resolve_link(&self.vault.root, &self.vault.files, &note) {
                     Some(path) => self.open_path(path, window),
                     // Nothing to search in a buffer that doesn't exist yet.
-                    None => return self.edit(&note, false, window),
+                    // `edit` roots a relative name under the vault, so the
+                    // target is gated on staying inside it — unlike a typed
+                    // `:e`, this name comes from the note.
+                    None if vault_relative(&note) => return self.edit(&note, false, window),
+                    None => {
+                        self.message = Some(format!("link outside vault: {note}"));
+                        return;
+                    }
                 }
             }
             if let Some(heading) = heading {
