@@ -1,6 +1,6 @@
 use ropey::Rope;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -269,7 +269,7 @@ impl Document {
                 std::fs::create_dir_all(dir)?;
             }
             let text = self.rope.to_string();
-            std::fs::write(path, &text)?;
+            atomic_write(path, &text)?;
             self.dirty = false;
             self.missing = false;
             self.disk_hash = Self::hash_text(&text);
@@ -1654,6 +1654,52 @@ impl Document {
     }
 }
 
+/// Write `contents` to `path` without ever leaving it partial: fill a temp file
+/// beside it, flush that to disk, then rename over the target. An interruption —
+/// a full disk, the OOM killer, power loss — costs the *new* contents and leaves
+/// the previous version intact. Writing in place would instead truncate first,
+/// so the same interruption leaves a zero-length or half-written note whose only
+/// complete copy was in a process that no longer exists.
+///
+/// The temp lives in the target's own directory, since `rename` is only atomic
+/// within a filesystem. Its name is dot-prefixed so `Vault::scan` skips it and a
+/// crashed save can't surface as a note, and pid-tagged so two instances saving
+/// the same note don't share one scratch file.
+// ponytail: no directory fsync, so a crash right after `rename` can still lose
+// the save — but what survives is the intact previous version, which is the
+// property worth paying for. Add one if losing a *confirmed* save ever matters.
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+    // A symlinked note is written through to its target. Renaming onto the link
+    // path would replace the link itself with a regular file, silently cutting
+    // whatever the user pointed at it.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no parent", target.display()))
+    })?;
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+
+    let replace = || -> io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        // `rename` is atomic but orders metadata only: without this the blocks
+        // can still be unwritten when the crash lands, which is the corruption
+        // this whole function exists to avoid.
+        f.sync_all()?;
+        // Closed before the rename: Windows refuses to rename an open file.
+        drop(f);
+        // Keep the target's mode. A note the user chmod'd to 0600 must not
+        // widen to a fresh temp file's 0644.
+        if let Ok(meta) = std::fs::metadata(&target) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, &target)
+    };
+    replace().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp); // no scratch files left in the vault
+    })
+}
+
 #[derive(PartialEq)]
 enum CharClass {
     Word,
@@ -2665,6 +2711,41 @@ mod tests {
         assert_eq!(reopened.rope.to_string(), "hello");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_scratch_file() {
+        let dir = std::env::temp_dir().join("darknotes_atomic_write_test");
+        let _ = std::fs::remove_dir_all(&dir); // a previous failed run
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+
+        // A fresh file, then a replacement — the two paths through the helper,
+        // since only the second has an existing target to take a mode from.
+        atomic_write(&path, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
+        atomic_write(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+
+        // The rename must consume the temp file: a leftover would show up in
+        // the vault, and a dot-prefix only hides it from the sidebar.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left, vec!["note.md".to_string()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A note the user restricted stays restricted across a save.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            atomic_write(&path, "third").unwrap();
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "save widened the note's permissions");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
