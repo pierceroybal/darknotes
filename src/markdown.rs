@@ -150,6 +150,21 @@ pub fn line_text(rope: &Rope, i: usize) -> String {
     slice.slice(..end).to_string()
 }
 
+/// A `**`/`~~` run opened on an earlier line with no closer yet, so the next
+/// line's scan resumes it instead of treating the stray marker as untouched
+/// text and an unrelated later `**`/`~~` as a fresh opener.
+// ponytail: one slot, not a stack — if a `**` and a `~~` are both left open,
+// nested, by the same line, only the later-detected one carries forward; the
+// other reverts to pre-fix behavior (formatting lost, not corrupted). Upgrade
+// to a small `Vec<OpenRun>` if that combination is ever actually reported.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum OpenRun {
+    #[default]
+    None,
+    Strong,
+    Strike,
+}
+
 /// What the scanner carries from one line to the next. Fenced code and
 /// frontmatter both span lines, so a line's classification depends on this —
 /// which is also why an edit that changes it invalidates every line below.
@@ -157,6 +172,7 @@ pub fn line_text(rope: &Rope, i: usize) -> String {
 struct ScanState {
     in_fence: bool,
     in_frontmatter: bool,
+    open_run: OpenRun,
 }
 
 impl ScanState {
@@ -172,11 +188,13 @@ impl ScanState {
             if text.trim() == "---" {
                 self.in_frontmatter = false;
             }
+            self.open_run = OpenRun::None; // block boundary: an open run doesn't survive it
             return spans;
         }
         if idx == 0 && text.trim() == "---" {
             self.in_frontmatter = true;
             spans.push(Span { range: 0..len, kind: SpanKind::Frontmatter });
+            self.open_run = OpenRun::None;
             return spans;
         }
 
@@ -189,11 +207,13 @@ impl ScanState {
             if is_fence {
                 self.in_fence = false;
             }
+            self.open_run = OpenRun::None;
             return spans;
         }
         if is_fence {
             self.in_fence = true;
             spans.push(Span { range: 0..len, kind: SpanKind::CodeFence });
+            self.open_run = OpenRun::None;
             return spans;
         }
 
@@ -202,7 +222,13 @@ impl ScanState {
         // concealed render replaces the text with a hairline.
         if matches!(text.trim(), "---" | "***" | "___") {
             spans.push(Span { range: 0..len, kind: SpanKind::Rule });
+            self.open_run = OpenRun::None;
             return spans;
+        }
+
+        // A blank line ends the paragraph, so an open run can't reach past it.
+        if trimmed.is_empty() {
+            self.open_run = OpenRun::None;
         }
 
         // Line roles: a whole-line span (the structure model) plus a Marker over
@@ -238,7 +264,7 @@ impl ScanState {
                 }
             }
         }
-        scan_inline(text, &mut spans);
+        scan_inline(text, &mut spans, &mut self.open_run);
         spans
     }
 }
@@ -346,13 +372,15 @@ pub fn list_continuation(line: &str) -> ListContinuation {
 /// scanning gives precedence to whatever opens first — a backtick consumes past
 /// any `[[` or URL inside it, so code spans stay literal. `~~` is the one arm
 /// that resumes inside its own run rather than past it, so strike composes with
-/// the emphasis nested in it. ASCII delimiters only, so scanning raw bytes is
-/// safe across multi-byte chars (continuation bytes are ≥ 0x80, never a
-/// delimiter byte).
+/// the emphasis nested in it. `**`/`~~` left unclosed on a line carry via
+/// `open_run` into the next one; the other delimiters don't need that since
+/// links, wikilinks, and code spans are never intentionally written across a
+/// line break. ASCII delimiters only, so scanning raw bytes is safe across
+/// multi-byte chars (continuation bytes are ≥ 0x80, never a delimiter byte).
 ///
 // ponytail: single `*`/`_` emphasis and escapes are new SpanKind cases here —
-// model and renderer already handle them.
-fn scan_inline(text: &str, out: &mut Vec<Span>) {
+// model and renderer already handle them, and would slot into `OpenRun` too.
+fn scan_inline(text: &str, out: &mut Vec<Span>, open_run: &mut OpenRun) {
     let b = text.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -360,6 +388,46 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
     // a closer rather than opening a second run at it — the `~~` arm keeps
     // scanning *inside* its run, unlike the arms that jump past their content.
     let mut strike_close = None;
+    // A `**`/`~~` opened on a previous line: find its closer before scanning
+    // this line normally. Strong's content isn't rescanned (matching its
+    // no-nesting rule below); Strike's is, via the same `strike_close`
+    // mechanism the intra-line case below uses.
+    match *open_run {
+        OpenRun::None => {}
+        OpenRun::Strong => match find_double(b, 0, b'*') {
+            Some(end) => {
+                if end > 0 {
+                    out.push(Span { range: 0..end, kind: SpanKind::Strong });
+                }
+                out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
+                *open_run = OpenRun::None;
+                i = end + 2;
+            }
+            None => {
+                if n > 0 {
+                    out.push(Span { range: 0..n, kind: SpanKind::Strong });
+                }
+                return;
+            }
+        },
+        OpenRun::Strike => match find_double(b, 0, b'~') {
+            Some(end) => {
+                if end > 0 {
+                    out.push(Span { range: 0..end, kind: SpanKind::Strike });
+                }
+                out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
+                *open_run = OpenRun::None;
+                strike_close = Some(end);
+            }
+            None => {
+                if n > 0 {
+                    out.push(Span { range: 0..n, kind: SpanKind::Strike });
+                }
+                // Stays open; still fall into the loop below at i == 0 so any
+                // nested span in this line's stretch of the run keeps composing.
+            }
+        },
+    }
     while i < n {
         if b[i] == b'`' {
             if let Some(end) = (i + 1..n).find(|&j| b[j] == b'`') {
@@ -372,14 +440,25 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 continue;
             }
         } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'*' {
-            if let Some(end) = find_double(b, i + 2, b'*') {
-                out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
-                if end > i + 2 {
-                    out.push(Span { range: i + 2..end, kind: SpanKind::Strong });
+            match find_double(b, i + 2, b'*') {
+                Some(end) => {
+                    out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
+                    if end > i + 2 {
+                        out.push(Span { range: i + 2..end, kind: SpanKind::Strong });
+                    }
+                    out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
+                    i = end + 2;
+                    continue;
                 }
-                out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
-                i = end + 2;
-                continue;
+                None => {
+                    // No closer on this line: the run carries into the next.
+                    out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
+                    if i + 2 < n {
+                        out.push(Span { range: i + 2..n, kind: SpanKind::Strong });
+                    }
+                    *open_run = OpenRun::Strong;
+                    return;
+                }
             }
         } else if b[i] == b'~' && i + 1 < n && b[i + 1] == b'~' {
             if strike_close == Some(i) {
@@ -387,18 +466,32 @@ fn scan_inline(text: &str, out: &mut Vec<Span>) {
                 i += 2;
                 continue;
             }
-            if let Some(end) = find_double(b, i + 2, b'~') {
-                out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
-                if end > i + 2 {
-                    out.push(Span { range: i + 2..end, kind: SpanKind::Strike });
+            match find_double(b, i + 2, b'~') {
+                Some(end) => {
+                    out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
+                    if end > i + 2 {
+                        out.push(Span { range: i + 2..end, kind: SpanKind::Strike });
+                    }
+                    out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
+                    // Resume just past the opener, not past the run: `~~**x**~~`
+                    // needs its inner delimiters scanned, and Strike claims no
+                    // bytes so it can't collide with what they claim.
+                    strike_close = Some(end);
+                    i += 2;
+                    continue;
                 }
-                out.push(Span { range: end..end + 2, kind: SpanKind::Marker });
-                // Resume just past the opener, not past the run: `~~**x**~~`
-                // needs its inner delimiters scanned, and Strike claims no
-                // bytes so it can't collide with what they claim.
-                strike_close = Some(end);
-                i += 2;
-                continue;
+                None => {
+                    // No closer on this line: the run carries into the next,
+                    // same as `**` — but the rest of the line still scans
+                    // (below), since Strike composes with what's nested in it.
+                    out.push(Span { range: i..i + 2, kind: SpanKind::Marker });
+                    if i + 2 < n {
+                        out.push(Span { range: i + 2..n, kind: SpanKind::Strike });
+                    }
+                    *open_run = OpenRun::Strike;
+                    i += 2;
+                    continue;
+                }
             }
         } else if b[i] == b'[' && i + 1 < n && b[i + 1] == b'[' {
             if let Some(close) = find_double(b, i + 2, b']') {
@@ -997,12 +1090,106 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_and_empty_strike_stay_literal() {
+    fn unclosed_strike_opens_a_run_instead_of_staying_literal() {
+        // No closer anywhere in the document: like an unclosed `**`, the run
+        // strikes forward from the opener rather than staying literal.
         for line in ["~~oops", "a ~~ b"] {
             let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
-            assert!(!segs.iter().any(|s| s.struck), "{line}");
-            assert_eq!(conceal(line, &segs).text, line, "{line}");
+            assert!(segs.iter().any(|s| s.struck), "{line}");
         }
+    }
+
+    #[test]
+    fn strike_run_carries_across_lines_without_leaking_into_the_gap() {
+        // Same shape as the `**` case below, but for `~~`, proving the
+        // generalized `OpenRun` carry (not a `**`-only special case).
+        let rope = Rope::from_str("~~ab\ncd~~ ef ~~gh\nij~~\n");
+        let spans = parse(&rope);
+
+        assert_eq!(
+            spans[0],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Marker },
+                Span { range: 2..4, kind: SpanKind::Strike },
+            ]
+        );
+        assert_eq!(
+            spans[1],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Strike }, // "cd"
+                Span { range: 2..4, kind: SpanKind::Marker },
+                Span { range: 8..10, kind: SpanKind::Marker },
+                Span { range: 10..12, kind: SpanKind::Strike }, // "gh"
+            ]
+        );
+        assert_eq!(
+            spans[2],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Strike }, // "ij"
+                Span { range: 2..4, kind: SpanKind::Marker },
+            ]
+        );
+    }
+
+    #[test]
+    fn strike_run_open_on_this_line_still_scans_nested_spans() {
+        // "~~a **b": the strike opens and never closes, but the nested "**b"
+        // bold opener inside it must still get its own Marker — composition
+        // doesn't stop just because the run is heading into the next line.
+        let line = "~~a **b";
+        let spans = &parse(&Rope::from_str(line))[0];
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Strike));
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Marker && s.range == (4..6)));
+    }
+
+    #[test]
+    fn unclosed_strike_run_stops_at_a_block_boundary() {
+        let rope = Rope::from_str("~~open\n\nplain\n");
+        let spans = parse(&rope);
+        assert!(spans[0].iter().any(|s| s.kind == SpanKind::Strike));
+        assert!(spans[2].iter().all(|s| s.kind != SpanKind::Strike));
+    }
+
+    #[test]
+    fn strong_run_carries_across_lines_without_leaking_into_the_gap() {
+        // Span 1 opens on line 0, closes on line 1 ("cd"); span 2 opens later
+        // on line 1 and closes on line 2 ("gh"..."ij"). The plain " ef "
+        // between them must stay unstyled — the orphaned closer of span 1 is
+        // not a fresh opener paired with span 2's opener.
+        let rope = Rope::from_str("**ab\ncd** ef **gh\nij**\n");
+        let spans = parse(&rope);
+
+        assert_eq!(
+            spans[0],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Marker },
+                Span { range: 2..4, kind: SpanKind::Strong },
+            ]
+        );
+        assert_eq!(
+            spans[1],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Strong }, // "cd"
+                Span { range: 2..4, kind: SpanKind::Marker },
+                Span { range: 8..10, kind: SpanKind::Marker },
+                Span { range: 10..12, kind: SpanKind::Strong }, // "gh"
+            ]
+        );
+        assert_eq!(
+            spans[2],
+            vec![
+                Span { range: 0..2, kind: SpanKind::Strong }, // "ij"
+                Span { range: 2..4, kind: SpanKind::Marker },
+            ]
+        );
+    }
+
+    #[test]
+    fn unclosed_strong_run_stops_at_a_block_boundary() {
+        let rope = Rope::from_str("**open\n\nplain\n");
+        let spans = parse(&rope);
+        assert!(spans[0].iter().any(|s| s.kind == SpanKind::Strong)); // dangling run still marks its own line
+        assert!(spans[2].iter().all(|s| s.kind != SpanKind::Strong)); // blank line resets it
     }
 
     #[test]
