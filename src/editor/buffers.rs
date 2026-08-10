@@ -10,7 +10,7 @@ use gpui::{Context, Window};
 
 use crate::document::Document;
 
-use super::{Editor, FilePrompt, PromptAction};
+use super::{Editor, FilePrompt, PendingView, PromptAction};
 
 /// One open buffer: a `Document` plus tab metadata.
 pub(super) struct Buffer {
@@ -19,6 +19,11 @@ pub(super) struct Buffer {
     /// instead of adding a tab; the first edit commits it (clears the flag).
     /// At most one preview buffer exists at a time.
     pub(super) preview: bool,
+    /// Document line that was at the top of the viewport when this buffer was
+    /// last active, so switching back restores the view instead of recentering.
+    /// Only meaningful while inactive — the active buffer's view lives in the
+    /// shared scroll handle, which `Editor::top_line` reads.
+    pub(super) top: usize,
 }
 
 impl Editor {
@@ -54,6 +59,15 @@ impl Editor {
     /// command. Leaves `alternate` untouched — `activate` (a user-facing
     /// switch) records that.
     pub(super) fn switch_to(&mut self, i: usize, window: &mut Window) {
+        // Park the outgoing buffer's view on it before `active` moves, so
+        // coming back lands where we left. Only on a real switch: an in-place
+        // doc replacement (`show_preview`, `:e!`) arrives with `i == active`
+        // having already set the view it wants. Bounds-checked —
+        // `close_buffer` gets here with `active` still on the slot it removed.
+        if i != self.active && self.active < self.buffers.len() {
+            let top = self.top_line();
+            self.buffers[self.active].top = top;
+        }
         self.active = i;
         self.vim.reset(); // clears transient state, keeps config (tab width)
         self.keymap.clear(); // a pending binding sequence dies with the buffer
@@ -62,9 +76,10 @@ impl Editor {
         // into the new buffer. The query itself survives — vim search is global.
         self.search.origin = None;
         // The scroll handle is shared across buffers and still holds the old
-        // offset; recenter on this buffer's own caret. Deferred to the render
-        // pass — the caret's visual row needs this buffer's wrap map.
-        self.center_on_render = true;
+        // offset; put this buffer's own view back. Deferred to the render pass —
+        // the line's visual row needs this buffer's wrap map.
+        self.pending_scroll =
+            Some(PendingView { top: self.buffers[i].top, caret: self.doc().caret_offset() });
         self.reveal_current();
         window.focus(&self.focus);
         self.save_session();
@@ -86,7 +101,7 @@ impl Editor {
     /// Show `doc` in the preview slot: replace the existing preview buffer, or
     /// append a new preview tab.
     pub(super) fn show_preview(&mut self, doc: Document, window: &mut Window) {
-        let buf = Buffer { doc, preview: true };
+        let buf = Buffer { doc, preview: true, top: 0 };
         match self.buffers.iter().position(|b| b.preview) {
             Some(i) => {
                 self.buffers[i] = buf;
@@ -130,6 +145,10 @@ impl Editor {
             // Reload in place: same tab (preview flag kept), fresh Document —
             // the undo history goes with it, since it indexes the old text.
             self.buffers[self.active].doc = open_or_empty(&path);
+            // The fresh Document's caret is back at the top, so the view goes
+            // with it; a parked `top` from this tab's last switch-away would
+            // strand the caret off screen.
+            self.buffers[self.active].top = 0;
             self.switch_to(self.active, window);
             return;
         }
@@ -246,7 +265,7 @@ impl Editor {
             other => other,
         };
         if self.buffers.is_empty() {
-            self.buffers.push(Buffer { doc: Document::new(""), preview: true });
+            self.buffers.push(Buffer { doc: Document::new(""), preview: true, top: 0 });
         }
         if self.active == i {
             // Closed the active tab: land on the next one (clamped). switch_to,

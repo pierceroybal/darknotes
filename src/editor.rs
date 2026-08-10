@@ -68,6 +68,20 @@ enum Pane {
     Sidebar,
 }
 
+/// A view the render pass owes: where it lands is a *visual* row, and only
+/// render knows the wrap map that turns a line into one.
+#[derive(Clone, Copy)]
+struct PendingView {
+    /// Document line to put at the top of the viewport.
+    top: usize,
+    /// The caret when this was queued. A caret that has moved since means
+    /// something jumped into the buffer after the switch (a cross-file mark or
+    /// jumplist hop, a grep hit), so the saved view is stale and the caret
+    /// wins. A caret that merely sits off screen — the view was wheel-scrolled
+    /// away from it — is not stale, and that view is restored intact.
+    caret: usize,
+}
+
 /// The app's main view. Owns the open `Buffer`s, the `Vim` grammar, and the
 /// `Vault` (folder of notes), and renders a file-tree sidebar beside the text.
 /// One entity holds everything so clicks and file-switch keys need no
@@ -129,10 +143,11 @@ pub struct Editor {
     /// lines); a change requests a scroll-to-cursor. Also what `zz`/`zt`/`zb`
     /// reposition — fresh, since z-scrolls don't move the caret.
     last_row: usize,
-    /// Center the caret's row on the next render. Set by buffer switches: the
-    /// shared scroll handle still holds the old buffer's offset, and the new
-    /// buffer's visual-row index isn't known until render builds its wrap map.
-    center_on_render: bool,
+    /// View the next render must install, or `None` to leave the scroll alone.
+    /// Set by buffer switches and session restore: the shared scroll handle
+    /// still holds the outgoing buffer's offset. Resolved by `restore_row`,
+    /// which falls back to centering the caret when the view went stale.
+    pending_scroll: Option<PendingView>,
     /// Soft-wrap long lines at the pane edge (`:set wrap`/`nowrap`, config
     /// `wrap`). Off = long lines overflow right behind `scroll_x`.
     wrap: bool,
@@ -266,12 +281,18 @@ impl Editor {
                     // or stale file, the first preview wins and the rest pin.
                     let preview = e.preview && !seen_preview;
                     seen_preview |= preview;
-                    buffers.push(Buffer { doc, preview });
+                    buffers.push(Buffer { doc, preview, top: e.top });
                 }
                 active = s.active.min(buffers.len().saturating_sub(1));
             }
         }
         let restored = !buffers.is_empty();
+        // Reinstate the active tab's saved view. Indexed lazily: nothing is
+        // open yet on a fresh launch.
+        let pending_scroll = restored.then(|| PendingView {
+            top: buffers[active].top,
+            caret: buffers[active].doc.caret_offset(),
+        });
         if !restored {
             let doc = match initial {
                 Some(path) => open_or_empty(&path),
@@ -282,7 +303,7 @@ impl Editor {
             };
             // The startup buffer is a preview like any other open: the first
             // navigation replaces it, the first edit commits it.
-            buffers.push(Buffer { doc, preview: true });
+            buffers.push(Buffer { doc, preview: true, top: 0 });
         }
         let vim = Vim::new(config.tab_width);
         let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
@@ -324,10 +345,7 @@ impl Editor {
             prompt: None,
             scroll: UniformListScrollHandle::new(),
             last_row: 0,
-            // A restored mid-file caret must start centered; the render pass
-            // owns the scroll because the caret's visual row needs this
-            // buffer's wrap map (same as a buffer switch).
-            center_on_render: restored,
+            pending_scroll,
             wrap: config.wrap,
             rows_cache: None,
             wrap_cache: ShapeWrapCache::default(),
@@ -807,6 +825,36 @@ impl Editor {
             .borrow()
             .last_item_size
             .map_or(self.line_h(), |s| s.item.height)
+    }
+
+    /// The visual row a queued view wants at the top of the viewport, or
+    /// `None` to center the caret instead.
+    fn restore_row(&self, view: PendingView) -> Option<usize> {
+        if self.doc().caret_offset() != view.caret {
+            return None;
+        }
+        let c = self.rows_cache.as_ref()?;
+        // A stale session file can name a line this file no longer has.
+        let line = view.top.min(c.line_rows.len().saturating_sub(1));
+        Some(c.line_rows[..line].iter().map(|&n| n as usize).sum())
+    }
+
+    /// Document line at the top of the viewport — the inverse of
+    /// `restore_row`, and what a tab parks when it loses focus. Zero before the
+    /// first render, which has no rows to measure against.
+    fn top_line(&self) -> usize {
+        let Some(c) = &self.rows_cache else { return 0 };
+        // offset.y is ≤ 0 once scrolled. Past the last row (the overscroll
+        // room) the walk below stops on the last line, which is what's on
+        // screen there.
+        let y = -self.scroll.0.borrow().base_handle.offset().y;
+        let row = c.offsets.partition_point(|&o| o <= y).saturating_sub(1);
+        let (mut line, mut first) = (0usize, 0usize);
+        while line + 1 < c.line_rows.len() && first + c.line_rows[line] as usize <= row {
+            first += c.line_rows[line] as usize;
+            line += 1;
+        }
+        line
     }
 
     /// *Base* rows that fit fully in the viewport (1 before first layout) —
@@ -1509,6 +1557,15 @@ impl Editor {
                 path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
                 preview: b.preview,
                 caret: b.doc.caret_offset(),
+                // The active tab's view is live in the shared scroll handle;
+                // every other tab parked its own on the way out. A queued view
+                // outranks the handle: mid-switch it still holds the outgoing
+                // buffer's offset, which describes neither tab.
+                top: if i == self.active {
+                    self.pending_scroll.map_or_else(|| self.top_line(), |v| v.top)
+                } else {
+                    b.top
+                },
             });
         }
         session::record(&self.vault.root, session::VaultSession { active, files });
@@ -1656,6 +1713,19 @@ impl Render for Editor {
         } else {
             None
         };
+        // A changed wrap width invalidates every visual row: `last_row` no
+        // longer compares against this frame's rows, and the scroll offset now
+        // lands on a different line. Re-queue the view on screen so it survives
+        // the rebuild instead of the caret auto-scroll below firing on a caret
+        // that never moved. Fires on any window resize — including the async
+        // maximize one frame after launch, which is what a restored session
+        // renders into.
+        if self.pending_scroll.is_none()
+            && self.rows_cache.as_ref().is_some_and(|c| c.key.wrap_width != wrap_width)
+        {
+            self.pending_scroll =
+                Some(PendingView { top: self.top_line(), caret: self.doc().caret_offset() });
+        }
         // Reuse the previous rows when nothing they depend on changed — a
         // wheel scroll re-renders every frame and must not rebuild (much less
         // re-shape) the whole document each time. A caret-only change (j/k,
@@ -1772,18 +1842,22 @@ impl Render for Editor {
 
         // Keep the caret on screen, but only when its row actually moved — so
         // the mouse wheel can scroll freely without snapping back every frame.
-        // A buffer switch recenters instead (the shared scroll handle still
-        // holds the old buffer's offset). Like vim, landing on a soft-wrapped
-        // line pulls the whole line into view, not just the caret's row: the
-        // scroll target is the line's last visual row moving down, its first
-        // moving up, clamped (in pixels, rows vary in height) so the caret
-        // itself stays visible when a single line runs taller than the
-        // viewport. One scroll_to_item call only — gpui keeps a single
-        // deferred scroll per frame, last call wins.
+        // A queued view (buffer switch, session restore) installs instead and
+        // wins the frame. Like vim, landing on a soft-wrapped line pulls the
+        // whole line into view, not just the caret's row: the scroll target is
+        // the line's last visual row moving down, its first moving up, clamped
+        // (in pixels, rows vary in height) so the caret itself stays visible
+        // when a single line runs taller than the viewport. One scroll_to_item
+        // call only — gpui keeps a single deferred scroll per frame, last call
+        // wins.
         let line_h = self.line_h();
-        if self.center_on_render {
-            self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center);
-            self.center_on_render = false;
+        if let Some(view) = self.pending_scroll.take() {
+            // Strict, not plain: at restore the offset is already 0, so a
+            // near-the-top target would read as "visible" and no-op.
+            match self.restore_row(view) {
+                Some(row) => self.scroll.scroll_to_item_strict(row, ScrollStrategy::Top),
+                None => self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center),
+            }
         } else if cur_row != self.last_row {
             let viewport = self.viewport_h();
             let c = self.rows_cache.as_ref().unwrap();

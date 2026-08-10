@@ -30,6 +30,13 @@ pub struct FileEntry {
     /// Caret as absolute char offset; `Document::jump_to` clamps it, so a
     /// file that shrank since last session is safe.
     pub caret: usize,
+    /// Document line shown at the top of the viewport. A line index, not a
+    /// pixel offset, so a changed font size, window height, or wrap width
+    /// still lands on the same text. Defaulted for sessions written before
+    /// this field existed; the render pass falls back to centering the caret
+    /// when this would scroll the caret off screen.
+    #[serde(default)]
+    pub top: usize,
 }
 
 /// Stable per-vault key: canonicalized so `darknotes .` and an absolute-path
@@ -90,13 +97,38 @@ mod tests {
             VaultSession {
                 active: 1,
                 files: vec![
-                    FileEntry { path: "/home/x/notes/a.md".into(), preview: false, caret: 42 },
-                    FileEntry { path: "/home/x/notes/b.md".into(), preview: true, caret: 0 },
+                    FileEntry {
+                        path: "/home/x/notes/a.md".into(),
+                        preview: false,
+                        caret: 42,
+                        top: 7,
+                    },
+                    FileEntry {
+                        path: "/home/x/notes/b.md".into(),
+                        preview: true,
+                        caret: 0,
+                        top: 0,
+                    },
                 ],
             },
         );
         let text = toml::to_string(&s).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
         assert_eq!(back.vaults, s.vaults);
+    }
+
+    /// A session written before `top` existed must still load, not wipe the
+    /// user's tabs.
+    #[test]
+    fn accepts_entries_without_top() {
+        let text = "\
+[vaults.\"/home/x/notes\"]
+active = 0
+files = [{ path = \"/home/x/notes/a.md\", preview = false, caret = 42 }]
+";
+        let s: Session = toml::from_str(text).unwrap();
+        let files = &s.vaults["/home/x/notes"].files;
+        assert_eq!(files[0].caret, 42);
+        assert_eq!(files[0].top, 0);
     }
 }
