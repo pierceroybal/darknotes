@@ -1933,6 +1933,25 @@ impl Render for Editor {
             (Some(pill), self.message.clone().unwrap_or_default())
         };
 
+        // Right statusline segment: `[3/17]` while a search is live (typing
+        // with incsearch, or hlsearch lit) plus the caret's percent through
+        // the doc. search_matches is memoized per (revision, query); render
+        // paints highlights from the same list, so this never adds a second
+        // scan.
+        let progress = {
+            let q = self.search_count_query();
+            let count = if q.is_empty() {
+                String::new()
+            } else {
+                let matches = self.search_matches(&q);
+                let at = search::match_position(&matches, self.doc().caret_offset());
+                format!("[{at}/{}] ", matches.len())
+            };
+            let (line, _) = self.doc().caret_line_col();
+            let total = self.doc().rope.len_lines().max(1);
+            format!("{count}{}%", (line + 1) * 100 / total)
+        };
+
         let open_path = self.doc().path().map(Path::to_path_buf);
         let tabline = self.render_tabline(&theme, cx);
         let trash_dir = self.vault.root.join(".trash");
@@ -2212,7 +2231,9 @@ impl Render for Editor {
                             .child(
                                 // Clip an over-long message, don't grow the layout.
                                 div().min_w_0().truncate().child(bar),
-                            ),
+                            )
+                            .child(div().flex_1()) // pushes the progress segment to the right edge
+                            .child(div().text_color(theme.muted).child(progress)),
                     ),
             )
             .children(self.render_picker(&theme))

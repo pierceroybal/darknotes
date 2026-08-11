@@ -109,6 +109,22 @@ impl Editor {
         }
     }
 
+    /// The query the `[n/m]` match counter should track. Same lit/typing
+    /// rules as `search_query`, but independent of the `hlsearch` option:
+    /// that setting only gates painted highlight color, not `n`/`N`
+    /// navigation or the count, so `:nohlsearch` (the option) must not hide
+    /// the counter the way it hides color.
+    pub(super) fn search_count_query(&self) -> String {
+        let prompt_open = self.vim.mode == Mode::Command && self.vim.prompt() != ':';
+        if prompt_open && self.search_cfg.incsearch {
+            self.vim.command_line().to_string()
+        } else if !prompt_open && self.search.hl {
+            self.search.query.clone()
+        } else {
+            String::new()
+        }
+    }
+
     /// A submitted `/`/`?` query. An empty query repeats the last search in the
     /// new direction. The jump starts from where the prompt opened — incsearch
     /// may have dragged the caret elsewhere while typing.
@@ -341,6 +357,13 @@ pub(super) fn shift_matches(
     out
 }
 
+/// 1-based index of the match at-or-before `caret` — the `[3/17]` numerator.
+/// After `/` or `n`/`N` the caret sits on a match start, so this is exact;
+/// between matches it reads as "past match N", and 0 means before the first.
+pub(super) fn match_position(matches: &[(usize, usize)], caret: usize) -> usize {
+    matches.partition_point(|&(s, _)| s <= caret)
+}
+
 /// Index into `matches` of the nearest match starting strictly after `from`
 /// (strictly before, when `backward`), wrapping around if `wrap`; the second
 /// value reports that it wrapped. Strictness is what makes `n` on a match
@@ -366,7 +389,7 @@ fn next_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_matches, narrow_matches, next_match, search_sensitive};
+    use super::{find_matches, match_position, narrow_matches, next_match, search_sensitive};
     use crate::config::Search as SearchConfig;
     use ropey::Rope;
 
@@ -500,5 +523,15 @@ mod tests {
         assert_eq!(next_match(&m, 0, true, true), Some((2, true)));
         assert_eq!(next_match(&m, 0, true, false), None);
         assert_eq!(next_match(&[], 0, false, true), None);
+    }
+
+    #[test]
+    fn match_position_is_one_based_at_or_before() {
+        let m = [(5, 7), (10, 12)];
+        assert_eq!(match_position(&m, 0), 0); // before the first match
+        assert_eq!(match_position(&m, 5), 1); // exactly on a match start
+        assert_eq!(match_position(&m, 8), 1); // between matches
+        assert_eq!(match_position(&m, 20), 2); // past the last
+        assert_eq!(match_position(&[], 3), 0);
     }
 }
