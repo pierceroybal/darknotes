@@ -84,6 +84,16 @@ timeoutlen = 1000
 # [keymap.insert] — insert mode only. E.g. jk-to-escape:
 #   "j k" = "normal-mode"
 
+# [notes.*] — declare your own new-note commands. Each section becomes a
+# `:{name}` ex command, a command-palette entry, and a bindable name (usable
+# in [keymap.*] above). All keys are optional; an existing note is reopened,
+# never overwritten.
+#
+# [notes.meeting]
+# dir      = "meetings"             # vault-relative folder, created if missing
+# name     = "%Y-%m-%d-standup"     # strftime; ".md" appended when absent
+# template = "templates/meeting.md" # vault-relative seed; missing file = empty note
+
 [search]
 # `/` (and `?` backward) in-document search, plain-text match. Option names are
 # vim's; ignorecase and incsearch default on (stock vim ships them off).

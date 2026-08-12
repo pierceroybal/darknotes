@@ -56,6 +56,10 @@ pub struct Config {
     pub watch_files: bool,
     pub keymap: Keymap,
     pub search: Search,
+    /// User-defined new-note commands: `[notes.{name}]` becomes `:{name}`, a
+    /// palette entry, and a bindable command name. Built-in commands win a
+    /// name collision.
+    pub notes: BTreeMap<String, NoteCmd>,
 }
 
 /// Line-number gutter mode. `relative` is hybrid: the cursor line shows its
@@ -86,6 +90,21 @@ pub struct Keymap {
     pub normal: BTreeMap<String, String>,
     /// Bindings live only in insert mode (e.g. `"j k" = "normal-mode"`).
     pub insert: BTreeMap<String, String>,
+}
+
+/// One `[notes.*]` entry: where a new note lands, what it's called, what seeds
+/// it. All paths are vault-relative.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct NoteCmd {
+    /// Folder the note lands in, created if missing. Empty = vault root.
+    pub dir: String,
+    /// File name, formatted through strftime (`%Y-%m-%d`). `.md` is appended
+    /// when absent. Empty = the section key.
+    pub name: String,
+    /// Template copied into a *new* note. Empty, or a file that doesn't
+    /// exist, means an empty note.
+    pub template: String,
 }
 
 /// `/`-search behavior (vim option names). Defaults are notes-friendly:
@@ -142,6 +161,7 @@ impl Default for Config {
             watch_files: true,
             keymap: Keymap::default(),
             search: Search::default(),
+            notes: BTreeMap::new(),
         }
     }
 }

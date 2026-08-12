@@ -241,17 +241,18 @@ impl Editor {
     /// Open the command palette: every registry command, its primary ex alias
     /// appended to the display so typing `:w`-style names finds it too.
     pub(super) fn open_command_palette(&mut self) {
-        let rows = COMMANDS
-            .iter()
-            .map(|c| {
-                let display = match c.ex.first() {
-                    Some(ex) => format!("{}  :{}", c.name, ex),
-                    None => c.name.to_string(),
-                };
-                Row::plain(display, PickItem::Command(c.name))
-            })
-            .collect();
-        self.picker = Some(Picker::over(": ", rows));
+        let builtin = COMMANDS.iter().map(|c| {
+            let display = match c.ex.first() {
+                Some(ex) => format!("{}  :{}", c.name, ex),
+                None => c.name.to_string(),
+            };
+            Row::plain(display, PickItem::Command(c.name))
+        });
+        let notes = self
+            .note_cmds
+            .keys()
+            .map(|name| Row::plain(format!("{name}  :{name}"), PickItem::Command(*name)));
+        self.picker = Some(Picker::over(": ", builtin.chain(notes).collect()));
     }
 
     /// Re-run the open picker's query. The fixed-list kinds narrow their rows

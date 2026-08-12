@@ -8,7 +8,7 @@ mod search;
 mod sidebar;
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use gpui::{
     Focusable, KeyDownEvent, KeyUpEvent, Keystroke, MouseButton, MouseDownEvent, MouseUpEvent,
     Pixels, ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
 };
-use crate::config::{Config, LineNumbers, Search as SearchConfig};
+use crate::config::{Config, LineNumbers, NoteCmd, Search as SearchConfig};
 use crate::document::{Document, Motion};
 use crate::jumps::{Jumps, Pos};
 use crate::keymap::{Ctx, Resolver};
@@ -215,6 +215,10 @@ pub struct Editor {
     search: SearchState,
     /// Search options from config (ignorecase, hlsearch, …).
     search_cfg: SearchConfig,
+    /// User-defined note commands from `[notes.*]`, keyed by leaked `'static`
+    /// name so palette rows and keymap validation can hold plain `&'static str`
+    /// like the built-in registry does.
+    note_cmds: BTreeMap<&'static str, NoteCmd>,
     /// Memoized match scan; see `MatchCache`. Shared by the incsearch jump and
     /// the render path, which otherwise scanned the buffer twice per keystroke.
     match_cache: Option<MatchCache>,
@@ -306,7 +310,30 @@ impl Editor {
             buffers.push(Buffer { doc, preview: true, top: 0 });
         }
         let vim = Vim::new(config.tab_width);
-        let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        // ponytail: names are leaked to `'static` so `PickItem::Command` and the
+        // command registry keep one string type. The config is read once at
+        // startup, so this is a fixed, small allocation — revisit if config ever
+        // becomes reloadable.
+        let note_cmds: BTreeMap<&'static str, NoteCmd> = config
+            .notes
+            .iter()
+            .map(|(name, n)| {
+                let mut n = n.clone();
+                if n.name.is_empty() {
+                    n.name = name.clone();
+                }
+                (&*Box::leak(name.clone().into_boxed_str()), n)
+            })
+            .collect();
+        for name in note_cmds.keys() {
+            if COMMANDS.iter().any(|c| c.name == *name || c.ex.contains(name)) {
+                eprintln!(
+                    "darknotes: notes: {name:?} is a built-in command; :{name} will not create a note"
+                );
+            }
+        }
+        let mut names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        names.extend(note_cmds.keys().copied());
         let keymap = Resolver::new(&config.keymap, DEFAULT_BINDINGS, &names);
         // Open the tree to the active file and park the sidebar cursor on it.
         let mut expanded = HashSet::new();
@@ -374,6 +401,7 @@ impl Editor {
             marks: HashMap::new(),
             search: SearchState::default(),
             search_cfg: config.search,
+            note_cmds,
             match_cache: None,
             cursor_blink: config.cursor_blink,
             blink_interval: config.cursor_blink_interval,
@@ -1651,6 +1679,10 @@ impl Editor {
                 let args = CmdArgs { bang, arg: arg.map(str::to_string) };
                 (c.run)(self, &args, window, cx);
             }
+            // A `[notes.*]` command. Registry first, so config can't shadow `:w`.
+            _ if arg.is_none() && self.note_cmds.contains_key(name) => {
+                self.run_note_cmd(name, window)
+            }
             _ => self.message = Some(format!("E492: Not an editor command: {cmd}")),
         }
     }
@@ -1660,17 +1692,30 @@ impl Editor {
     fn run_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
             (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx);
+        } else if self.note_cmds.contains_key(name) {
+            self.run_note_cmd(name, window);
         }
     }
 
     /// A palette pick. `takes_arg` commands have no argument yet, so they
     /// pre-fill the ex prompt (`:e `) instead of running; the rest run directly.
     fn run_picked_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(c) = COMMANDS.iter().find(|c| c.name == name) else { return };
+        let Some(c) = COMMANDS.iter().find(|c| c.name == name) else {
+            if self.note_cmds.contains_key(name) {
+                self.run_note_cmd(name, window);
+            }
+            return;
+        };
         match c.ex.first() {
             Some(ex) if c.takes_arg => self.vim.start_command(&format!("{ex} ")),
             _ => (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx),
         }
+    }
+
+    /// Run a `[notes.*]` command by name: create-if-missing, then open.
+    fn run_note_cmd(&mut self, name: &str, window: &mut Window) {
+        let Some(n) = self.note_cmds.get(name).cloned() else { return };
+        self.open_new_note(&n.dir, &n.name, &n.template, window);
     }
 }
 

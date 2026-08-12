@@ -162,13 +162,23 @@ impl Editor {
     }
 
     /// `:today` — open today's daily note, creating `daily/YYYY-MM-DD.md`
-    /// (seeded from `templates/daily.md` when present) on first use. Local
-    /// date, so the note rolls over at the user's midnight, not UTC's.
+    /// (seeded from `templates/daily.md` when present) on first use.
     pub(super) fn today(&mut self, window: &mut Window) {
-        let date = jiff::Zoned::now().date().to_string();
-        match create_daily(&self.vault.root, &date) {
+        self.open_new_note("daily", "%Y-%m-%d", "templates/daily.md", window);
+    }
+
+    /// Create-if-missing and open a note, the shared body of `:today` and every
+    /// `[notes.*]` command.
+    pub(super) fn open_new_note(
+        &mut self,
+        dir: &str,
+        name: &str,
+        template: &str,
+        window: &mut Window,
+    ) {
+        match create_note(&self.vault.root, dir, name, template) {
             Ok(path) => {
-                self.rescan_vault(); // the sidebar shows a first-of-the-day note immediately
+                self.rescan_vault(); // a first-of-its-kind note must show in the sidebar
                 self.open_path(path, window);
             }
             Err(e) => self.message = Some(format!("create failed: {e}")),
@@ -401,17 +411,29 @@ pub(super) fn open_or_empty(path: &Path) -> Document {
     })
 }
 
-/// The daily note for `date` (`daily/{date}.md` under `root`), created if
-/// missing — seeded from `templates/daily.md` when that file exists, empty
-/// otherwise. An existing note is never touched.
-// ponytail: template is copied verbatim; variable substitution rides the
+/// The note at `dir/{name}.md` under `root`, created if missing and seeded from
+/// the vault-relative `template` when that file exists. `name` is formatted
+/// through strftime against the local clock, so `%Y-%m-%d` rolls over at the
+/// user's midnight, not UTC's. An existing note is never touched — a `name`
+/// with no date specifiers resolves to the same path every time, so repeat
+/// invocations reopen it.
+// ponytail: template is copied verbatim; substitution inside the body rides the
 // general templates feature when it lands.
-fn create_daily(root: &Path, date: &str) -> std::io::Result<PathBuf> {
-    let path = root.join("daily").join(format!("{date}.md"));
+fn create_note(root: &Path, dir: &str, name: &str, template: &str) -> std::io::Result<PathBuf> {
+    // Fallible format: `name` is hand-edited config, and jiff's `strftime`
+    // Display impl panics on an unknown specifier.
+    let name = jiff::fmt::strtime::format(name, &jiff::Zoned::now())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let name = if name.ends_with(".md") { name } else { format!("{name}.md") };
+    let folder = root.join(dir);
+    let path = folder.join(name);
     if !path.exists() {
-        let seed =
-            std::fs::read_to_string(root.join("templates/daily.md")).unwrap_or_default();
-        std::fs::create_dir_all(root.join("daily"))?;
+        let seed = if template.is_empty() {
+            String::new()
+        } else {
+            std::fs::read_to_string(root.join(template)).unwrap_or_default()
+        };
+        std::fs::create_dir_all(&folder)?;
         std::fs::write(&path, seed)?;
     }
     Ok(path)
@@ -513,32 +535,49 @@ fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_line, create_daily, match_buffer, rel_display, resolve, resolve_link, unique_dest,
+        append_line, create_note, match_buffer, rel_display, resolve, resolve_link, unique_dest,
         unsaved_label, vault_relative,
     };
     use std::path::{Path, PathBuf};
 
     #[test]
-    fn create_daily_seeds_from_template_and_keeps_existing() {
-        let root = std::env::temp_dir().join("darknotes_create_daily_test");
+    fn create_note_seeds_from_template_and_keeps_existing() {
+        let root = std::env::temp_dir().join("darknotes_create_note_test");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
         // No template: created empty, `daily/` made on the way.
-        let p = create_daily(&root, "2026-07-17").unwrap();
+        let p = create_note(&root, "daily", "2026-07-17", "templates/daily.md").unwrap();
         assert_eq!(p, root.join("daily").join("2026-07-17.md"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
 
         // An existing note is never overwritten.
         std::fs::write(&p, "notes").unwrap();
-        create_daily(&root, "2026-07-17").unwrap();
+        create_note(&root, "daily", "2026-07-17", "templates/daily.md").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "notes");
 
         // A template seeds new days verbatim.
         std::fs::create_dir_all(root.join("templates")).unwrap();
         std::fs::write(root.join("templates").join("daily.md"), "# Log\n").unwrap();
-        let p2 = create_daily(&root, "2026-07-18").unwrap();
+        let p2 = create_note(&root, "daily", "2026-07-18", "templates/daily.md").unwrap();
         assert_eq!(std::fs::read_to_string(&p2).unwrap(), "# Log\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_note_formats_strftime_name_and_rejects_bad_specifier() {
+        let root = std::env::temp_dir().join("darknotes_create_note_strftime_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let p = create_note(&root, "", "%Y-%m-%d-standup", "").unwrap();
+        let today = jiff::Zoned::now().date().to_string();
+        assert_eq!(p, root.join(format!("{today}-standup.md")));
+
+        // A bad specifier returns Err rather than panicking (jiff's strftime
+        // Display impl panics on this; `strtime::format` doesn't).
+        assert!(create_note(&root, "", "%K", "").is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }
