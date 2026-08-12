@@ -1079,10 +1079,20 @@ impl Editor {
     /// into `key` for symbol keys, so releasing Shift mid-hold renames the
     /// still-held key (`:` → `;`) and a `key` match would misread its next
     /// pulse as a fresh press, inserting a stray character.
+    ///
+    /// On every backend, releasing a bare modifier never produces a `KeyUp`
+    /// (it only ever reaches `on_modifiers_changed`), and the OS keeps
+    /// retranslating a still-held key's modifiers on each native repeat
+    /// pulse. So an echo recognized here — by either path — carries the
+    /// corrected modifiers and must be saved back to `repeat_stroke`:
+    /// `arm_key_repeat`'s loop replays whatever is stored there, and a
+    /// still-held key with a since-released modifier would otherwise keep
+    /// repeating with the stale modifier baked in.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let same_key = self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key);
         let is_echo = self.repeat_stroke.is_some() && (ev.is_held || same_key);
         if self.key_repeat_interval > 0 && is_echo {
+            self.repeat_stroke = Some(ev.keystroke.clone());
             return;
         }
         self.handle_key(ev, window, cx);
@@ -1109,16 +1119,23 @@ impl Editor {
     /// `arm_blink`/`arm_fs_watch`'s bridge from gpui's background executor
     /// back onto the entity; replacing `repeat_timer` cancels whatever was
     /// running before (a different key was already repeating).
+    ///
+    /// Each tick re-reads `repeat_stroke` rather than closing over `stroke`
+    /// by value, so a mid-hold correction from `on_key` (a released
+    /// modifier) is picked up on the next replay instead of being repeated
+    /// forever with the modifiers it had when the hold started.
     fn arm_key_repeat(&mut self, stroke: Keystroke, window: &Window, cx: &mut Context<Self>) {
-        self.repeat_stroke = Some(stroke.clone());
+        self.repeat_stroke = Some(stroke);
         let delay = Duration::from_millis(self.key_repeat_delay);
         let interval = Duration::from_millis(self.key_repeat_interval);
         self.repeat_timer = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
             loop {
-                let ev = KeyDownEvent { keystroke: stroke.clone(), is_held: true };
-                let alive =
-                    this.update_in(cx, |this, window, cx| this.handle_key(&ev, window, cx));
+                let alive = this.update_in(cx, |this, window, cx| {
+                    let Some(stroke) = this.repeat_stroke.clone() else { return };
+                    let ev = KeyDownEvent { keystroke: stroke, is_held: true };
+                    this.handle_key(&ev, window, cx);
+                });
                 if alive.is_err() {
                     return;
                 }
