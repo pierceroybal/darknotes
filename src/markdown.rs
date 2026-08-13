@@ -27,6 +27,9 @@ pub enum SpanKind {
     /// A line inside leading `---` … `---` frontmatter.
     Frontmatter,
     Strong,
+    /// `*text*` / `_text_` — italic. Claims its bytes like `Strong`, so
+    /// nothing nested inside it re-scans.
+    Emphasis,
     Code,
     /// The visible text of a `[[wikilink]]`, `[text](url)`, or bare URL.
     Link,
@@ -366,20 +369,18 @@ pub fn list_continuation(line: &str) -> ListContinuation {
     ListContinuation::Item { prefix: format!("{indent}{next} {box_str}"), empty }
 }
 
-/// Single left-to-right pass for inline `code`, `**strong**`, `~~strike~~`,
-/// `[[wikilinks]]`, `[text](url)` links, and bare `http(s)://` URLs, emitting a
-/// `Marker` for each delimiter and the kind for the inner text. Positional
-/// scanning gives precedence to whatever opens first — a backtick consumes past
-/// any `[[` or URL inside it, so code spans stay literal. `~~` is the one arm
-/// that resumes inside its own run rather than past it, so strike composes with
-/// the emphasis nested in it. `**`/`~~` left unclosed on a line carry via
-/// `open_run` into the next one; the other delimiters don't need that since
-/// links, wikilinks, and code spans are never intentionally written across a
-/// line break. ASCII delimiters only, so scanning raw bytes is safe across
-/// multi-byte chars (continuation bytes are ≥ 0x80, never a delimiter byte).
-///
-// ponytail: single `*`/`_` emphasis and escapes are new SpanKind cases here —
-// model and renderer already handle them, and would slot into `OpenRun` too.
+/// Single left-to-right pass for inline `code`, `**strong**`, `*em*`/`_em_`,
+/// `~~strike~~`, `[[wikilinks]]`, `[text](url)` links, and bare `http(s)://`
+/// URLs, emitting a `Marker` for each delimiter and the kind for the inner
+/// text. Positional scanning gives precedence to whatever opens first — a
+/// backtick consumes past any `[[` or URL inside it, so code spans stay
+/// literal. `~~` is the one arm that resumes inside its own run rather than
+/// past it, so strike composes with the emphasis nested in it. `**`/`~~` left
+/// unclosed on a line carry via `open_run` into the next one; single-char
+/// emphasis is the one inline form that does not — an unclosed `*`/`_` stays
+/// literal rather than opening a run that spans lines. ASCII delimiters only,
+/// so scanning raw bytes is safe across multi-byte chars (continuation bytes
+/// are ≥ 0x80, never a delimiter byte).
 fn scan_inline(text: &str, out: &mut Vec<Span>, open_run: &mut OpenRun) {
     let b = text.as_bytes();
     let n = b.len();
@@ -459,6 +460,15 @@ fn scan_inline(text: &str, out: &mut Vec<Span>, open_run: &mut OpenRun) {
                     *open_run = OpenRun::Strong;
                     return;
                 }
+            }
+        } else if matches!(b[i], b'*' | b'_') && b.get(i + 1) != Some(&b[i]) && can_open(b, i) {
+            // Unclosed runs stay literal — no `OpenRun` carry, unlike `**`.
+            if let Some(end) = find_emphasis_close(b, i + 1, b[i]) {
+                out.push(Span { range: i..i + 1, kind: SpanKind::Marker });
+                out.push(Span { range: i + 1..end, kind: SpanKind::Emphasis });
+                out.push(Span { range: end..end + 1, kind: SpanKind::Marker });
+                i = end + 1;
+                continue;
             }
         } else if b[i] == b'~' && i + 1 < n && b[i + 1] == b'~' {
             if strike_close == Some(i) {
@@ -541,6 +551,47 @@ fn scan_inline(text: &str, out: &mut Vec<Span>, open_run: &mut OpenRun) {
 
 fn find_double(b: &[u8], from: usize, ch: u8) -> Option<usize> {
     (from..b.len().saturating_sub(1)).find(|&j| b[j] == ch && b[j + 1] == ch)
+}
+
+/// Word-ish byte: ASCII alphanumeric, or any UTF-8 lead/continuation byte
+/// (so `naïve_case` counts as intraword the same as `snake_case`).
+fn word_byte(b: Option<&u8>) -> bool {
+    b.is_some_and(|c| c.is_ascii_alphanumeric() || *c >= 0x80)
+}
+
+/// CommonMark-lite flanking. An emphasis delimiter opens only when what
+/// follows isn't whitespace or end-of-line — which is also what keeps a `* `
+/// list bullet and a lone `*` in prose (`2 * 3`) from opening a run. `_`
+/// additionally refuses to open inside a word, so `snake_case` stays literal.
+fn can_open(b: &[u8], i: usize) -> bool {
+    b.get(i + 1).is_some_and(|c| !c.is_ascii_whitespace())
+        && !(b[i] == b'_' && i > 0 && word_byte(b.get(i - 1)))
+}
+
+/// Mirror of `can_open`: a closer can't be preceded by whitespace, and `_`
+/// can't close intraword.
+fn can_close(b: &[u8], i: usize) -> bool {
+    i > 0 && !b[i - 1].is_ascii_whitespace() && !(b[i] == b'_' && word_byte(b.get(i + 1)))
+}
+
+/// The closing delimiter for a run opened with `ch`, skipping doubled
+/// delimiters — `**`/`__` belong to strong (or to literal text), never to a
+/// single-char run.
+fn find_emphasis_close(b: &[u8], from: usize, ch: u8) -> Option<usize> {
+    let mut j = from;
+    while j < b.len() {
+        if b[j] == ch {
+            if b.get(j + 1) == Some(&ch) {
+                j += 2;
+                continue;
+            }
+            if can_close(b, j) {
+                return Some(j);
+            }
+        }
+        j += 1;
+    }
+    None
 }
 
 /// End of a bare URL starting at `start`: runs to ASCII whitespace, then
@@ -707,11 +758,17 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
     let mut out_segments = Vec::with_capacity(segments.len());
     let mut map = Vec::with_capacity(text.len() + 1);
     let mut byte = 0;
+    // A bullet only survives concealment on a line that actually is a list
+    // item, and only as its leading marker — an emphasis `*` mid-line has
+    // the same one-byte slice and must drop.
+    let bullet_line = is_list_item(text);
     for seg in segments {
         let end = byte + seg.len;
         let slice = &text[byte..end];
         let drop = match seg.kind {
-            Some(SpanKind::Marker) => !keep_marker(slice),
+            Some(SpanKind::Marker) => {
+                !(bullet_line && out_text.trim().is_empty() && keep_marker(slice))
+            }
             // Rule and fence lines vanish (fence includes any language tag);
             // the renderer paints a hairline / the code band on the blank row.
             Some(SpanKind::Rule | SpanKind::CodeFence) => true,
@@ -733,6 +790,9 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
 /// List bullets and ordered-list numbers stay visible when rendering —
 /// structural prefixes with no rendered substitute. Heading `#`, `**`,
 /// backticks, and the blockquote `>` (replaced by a painted bar) are dropped.
+/// The caller also requires the line to be a list item and the marker to sit
+/// in the line's leading position — a bare string match can't tell a leading
+/// bullet from an emphasis `*` that happens to have the same one-byte slice.
 fn keep_marker(marker: &str) -> bool {
     let b = marker.as_bytes();
     matches!(marker, "-" | "*" | "+")
@@ -746,7 +806,7 @@ fn priority(k: SpanKind) -> u8 {
         // Never ranked — `flatten` diverts Strike into the struck bit first.
         SpanKind::Strike => 0,
         SpanKind::Marker | SpanKind::Task(_) => 4,
-        SpanKind::Strong | SpanKind::Code | SpanKind::Link => 3,
+        SpanKind::Strong | SpanKind::Emphasis | SpanKind::Code | SpanKind::Link => 3,
         SpanKind::CodeFence | SpanKind::CodeText => 2,
         SpanKind::Heading(_)
         | SpanKind::ListItem
@@ -1235,5 +1295,75 @@ mod tests {
         assert!(spans[0].iter().any(|s| s.kind == SpanKind::ListItem));
         assert!(spans[1].iter().any(|s| s.kind == SpanKind::BlockQuote));
         assert!(spans[2].iter().any(|s| s.kind == SpanKind::ListItem));
+    }
+
+    #[test]
+    fn emphasis_scans_and_conceals() {
+        for line in ["a *em* b", "a _em_ b"] {
+            let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+            assert_eq!(kind_at(&segs, 3), Some(SpanKind::Emphasis), "{line}");
+            assert_eq!(kind_at(&segs, 2), Some(SpanKind::Marker), "{line}");
+            let c = conceal(line, &segs);
+            assert_eq!(c.text, "a em b", "{line}");
+            assert_eq!(c.segments.iter().map(|s| s.len).sum::<usize>(), c.text.len());
+        }
+    }
+
+    #[test]
+    fn emphasis_delimiters_need_flanking_text() {
+        // Each of these must produce no Emphasis span at all: a list bullet,
+        // an intraword underscore, arithmetic, and a doubled delimiter.
+        for line in ["* item", "snake_case_name", "2*3 * 4", "__bold__", "a * b"] {
+            let spans = &parse(&Rope::from_str(line))[0];
+            assert!(spans.iter().all(|s| s.kind != SpanKind::Emphasis), "{line}");
+        }
+        // `**` still wins over the single-char arm.
+        let spans = &parse(&Rope::from_str("**b**"))[0];
+        assert!(spans.iter().any(|s| s.kind == SpanKind::Strong));
+        assert!(spans.iter().all(|s| s.kind != SpanKind::Emphasis));
+    }
+
+    #[test]
+    fn unclosed_emphasis_stays_literal_and_does_not_carry() {
+        // Unlike `**`/`~~`, a dangling `*` marks nothing — not even the rest
+        // of its own line — and the next line is untouched.
+        let spans = parse(&Rope::from_str("*open\nplain\n"));
+        assert!(spans[0].iter().all(|s| s.kind != SpanKind::Emphasis));
+        assert!(spans[1].iter().all(|s| s.kind != SpanKind::Emphasis));
+    }
+
+    #[test]
+    fn two_stray_asterisks_on_one_line_do_emphasize() {
+        // The accepted false positive, and what CommonMark does with the same
+        // input: both delimiters clear the flanking test, so "3 and 4" goes
+        // italic. Bounded to the line — no carry means it can't run on.
+        let line = "2*3 and 4*5";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(kind_at(&segs, 2), Some(SpanKind::Emphasis));
+        // A closer touching whitespace on its inner side still can't close,
+        // which is what keeps `2*3 * 4` and `*.rs and *.md` literal.
+        for line in ["2*3 * 4", "*.rs and *.md"] {
+            let spans = &parse(&Rope::from_str(line))[0];
+            assert!(spans.iter().all(|s| s.kind != SpanKind::Emphasis), "{line}");
+        }
+    }
+
+    #[test]
+    fn conceal_keeps_a_bullet_but_drops_emphasis_stars() {
+        // Both markers are the one-byte slice "*"; only the leading bullet
+        // on a list line survives.
+        let line = "* *em* x";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(conceal(line, &segs).text, "* em x");
+    }
+
+    #[test]
+    fn emphasis_composes_with_strike() {
+        // `~~` resumes inside its own run, so the nested emphasis still scans
+        // and carries the struck bit.
+        let line = "~~*em*~~";
+        let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
+        assert_eq!(kind_at(&segs, 3), Some(SpanKind::Emphasis));
+        assert!(seg_at(&segs, 3).struck);
     }
 }

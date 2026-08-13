@@ -640,7 +640,8 @@ fn segment_style(
     let Some(kind) = kind else { return normal };
     match kind {
         SpanKind::Heading(_) => (theme.heading, FontWeight::BOLD, FontStyle::Normal, None),
-        SpanKind::Strong => (strong_color(fg), FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Strong => (nudge(fg, 1.), FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Emphasis => (nudge(fg, 2.), FontWeight::NORMAL, FontStyle::Italic, None),
         SpanKind::Code | SpanKind::CodeText | SpanKind::CodeFence => {
             (theme.code, FontWeight::NORMAL, FontStyle::Normal, Some(theme.code_bg))
         }
@@ -660,20 +661,22 @@ fn segment_style(
 
 // ponytail: gpui's `layout_line` (text_system.rs) infers "same font" from
 // "same decoration" (color/underline/strikethrough) and merges adjacent runs
-// on that basis without checking weight — so a Strong run flanked by same-`fg`
-// text (exactly what concealment produces once the differently-colored `**`
-// marker is dropped) gets folded into the surrounding regular-weight run and
-// silently loses its bold. Nudging alpha by an imperceptible amount keeps the
-// two runs "different" so gpui resolves the bold font instead of assuming it's
-// unchanged. Remove this workaround (and the color nudge it does) whichever
-// comes first: (1) `LineElement` switches its shaping call from `shape_line`
-// to `shape_text` — likely when line wrapping is implemented, since
+// on that basis without checking weight or style — so a Strong or Emphasis
+// run flanked by same-`fg` text (exactly what concealment produces once the
+// differently-colored delimiter is dropped) gets folded into the surrounding
+// regular run and silently loses its bold or italic. Nudging alpha by an
+// imperceptible amount keeps a run "different" so gpui resolves its own font
+// instead of assuming it's unchanged. Strong and Emphasis use different step
+// counts so two adjacent runs of each don't merge into *each other* either.
+// Remove this workaround (and the color nudge it does) whichever comes
+// first: (1) `LineElement` switches its shaping call from `shape_line` to
+// `shape_text` — likely when line wrapping is implemented, since
 // `shape_text`'s `process_line` already resolves fonts per-run correctly and
 // this bug can't occur there; or (2) a gpui upgrade fixes `layout_line` to
 // compare fonts directly instead of inferring sameness from decoration
 // (reported upstream to zed-industries/zed).
-fn strong_color(fg: Hsla) -> Hsla {
-    Hsla { a: (fg.a - 0.001).max(0.0), ..fg }
+fn nudge(fg: Hsla, steps: f32) -> Hsla {
+    Hsla { a: (fg.a - steps * 0.001).max(0.0), ..fg }
 }
 
 /// `(byte offset of char column `col`, byte offset just past the char under it)`.
@@ -697,7 +700,7 @@ mod tests {
         caret_bytes, fence_block, heading_metrics, row_decor, segment_style, Gutter, RowDecor,
     };
     use crate::markdown::{self, SpanKind};
-    use gpui::Hsla;
+    use gpui::{FontStyle, FontWeight, Hsla};
     use ropey::Rope;
     use std::cell::Cell;
     use std::rc::Rc;
@@ -756,16 +759,24 @@ mod tests {
     }
 
     #[test]
-    fn strong_color_differs_from_plain_text() {
-        // Strong must not share an exact color with plain body text: gpui's
-        // layout_line treats equal-decoration adjacent runs as equal-font and
-        // merges them, dropping bold weight when concealment leaves Strong
-        // flanked by plain `fg` text (see `strong_color`'s doc comment).
+    fn strong_and_emphasis_colors_differ_from_plain_and_each_other() {
+        // Neither must share an exact color with plain body text or with each
+        // other: gpui's layout_line treats equal-decoration adjacent runs as
+        // equal-font and merges them, dropping weight/slant when concealment
+        // leaves a styled run flanked by plain `fg` text (see `nudge`'s doc
+        // comment).
         let fg: Hsla = gpui::rgb(0xcccccc).into();
         let theme = crate::theme::Theme::by_name("dark").unwrap();
-        let (strong_color, _, _, _) = segment_style(Some(SpanKind::Strong), fg, &theme);
+        let (strong_color, strong_weight, strong_style, _) =
+            segment_style(Some(SpanKind::Strong), fg, &theme);
+        let (em_color, em_weight, em_style, _) =
+            segment_style(Some(SpanKind::Emphasis), fg, &theme);
         let (plain_color, _, _, _) = segment_style(None, fg, &theme);
         assert_ne!(strong_color, plain_color);
+        assert_ne!(em_color, plain_color);
+        assert_ne!(strong_color, em_color);
+        assert_eq!((strong_weight, strong_style), (FontWeight::BOLD, FontStyle::Normal));
+        assert_eq!((em_weight, em_style), (FontWeight::NORMAL, FontStyle::Italic));
     }
 
     #[test]

@@ -502,7 +502,10 @@ impl Editor {
                 let plain = text.is_ascii()
                     && !text.contains('\t')
                     && segments.iter().all(|s| {
-                        !matches!(s.kind, Some(SpanKind::Heading(_)) | Some(SpanKind::Strong))
+                        !matches!(
+                            s.kind,
+                            Some(SpanKind::Heading(_) | SpanKind::Strong | SpanKind::Emphasis)
+                        )
                     });
                 match if band { ctx.mono_band_cols } else { ctx.mono_cols } {
                     Some(cols) if plain => wrap_columns(&text, cols),
