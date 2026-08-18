@@ -350,6 +350,9 @@ impl Editor {
         if self.vim.mode != Mode::Insert {
             self.doc_mut().clamp_caret_to_line();
         }
+        // Arriving from a grep hit, an outline pick or a `[[note#Heading]]`
+        // link opens the fold it lands in, like a search does.
+        self.reveal_caret_line();
     }
 
     /// Move the highlight `delta` rows, skipping group headers. Running off

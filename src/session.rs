@@ -37,6 +37,12 @@ pub struct FileEntry {
     /// when this would scroll the caret off screen.
     #[serde(default)]
     pub top: usize,
+    /// Titles of the headings whose sections are folded closed. Titles rather
+    /// than line indices: the file may have been edited between sessions, and a
+    /// title re-finds its heading where a stale index would hide the wrong
+    /// section. Defaulted like `top`, so an older session still loads.
+    #[serde(default)]
+    pub folds: Vec<String>,
 }
 
 /// Stable per-vault key: canonicalized so `darknotes .` and an absolute-path
@@ -102,12 +108,14 @@ mod tests {
                         preview: false,
                         caret: 42,
                         top: 7,
+                        folds: vec!["Phase 1".into(), "Phase 2".into()],
                     },
                     FileEntry {
                         path: "/home/x/notes/b.md".into(),
                         preview: true,
                         caret: 0,
                         top: 0,
+                        folds: Vec::new(),
                     },
                 ],
             },
@@ -117,8 +125,8 @@ mod tests {
         assert_eq!(back.vaults, s.vaults);
     }
 
-    /// A session written before `top` existed must still load, not wipe the
-    /// user's tabs.
+    /// A session written before `top` or `folds` existed must still load, not
+    /// wipe the user's tabs.
     #[test]
     fn accepts_entries_without_top() {
         let text = "\
@@ -130,5 +138,6 @@ files = [{ path = \"/home/x/notes/a.md\", preview = false, caret = 42 }]
         let files = &s.vaults["/home/x/notes"].files;
         assert_eq!(files[0].caret, 42);
         assert_eq!(files[0].top, 0);
+        assert!(files[0].folds.is_empty());
     }
 }

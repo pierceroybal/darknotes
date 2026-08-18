@@ -103,6 +103,20 @@ pub enum Action {
     /// `` `{a} `` / `'{a}`: to the mark, exactly or to its line's first
     /// non-blank. `''`/`` `` `` name the jumplist's newest entry.
     JumpToMark { name: char, line: bool },
+    /// `za`/`zo`/`zc`/`zR`/`zM`: fold the heading section at the caret, or the
+    /// whole document. Not a content change — folds are view state, so these
+    /// stay out of undo and out of `.` repeat.
+    Fold(FoldOp),
+}
+
+/// Which fold command ran — see `Action::Fold`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FoldOp {
+    Toggle,
+    Open,
+    Close,
+    OpenAll,
+    CloseAll,
 }
 
 /// Where to place the caret line within the viewport (`z` scroll commands).
@@ -419,7 +433,7 @@ impl Vim {
                 return self.apply_object(op, around, key, shift)
             }
             Pending::GPrefix => return self.complete_g_prefix(key, shift),
-            Pending::ZPrefix => return self.complete_z_prefix(key),
+            Pending::ZPrefix => return self.complete_z_prefix(key, shift),
             Pending::Indent { dedent } => return self.complete_indent(dedent, key),
             // Resolved above, before count parsing.
             Pending::Find { .. } | Pending::Replace { .. } | Pending::Mark { .. }
@@ -967,15 +981,22 @@ impl Vim {
     }
 
     /// Complete a `z`-sequence: position the caret line in the viewport
-    /// (`zz` center, `zt` top, `zb` bottom); anything else aborts. The
-    /// `+first-non-blank` variants (`z.`/`z<CR>`/`z-`) wait on a `^` motion;
-    /// `zh`/`zl` (horizontal) and `zf`/`zo` (folds) wait on those features.
-    fn complete_z_prefix(&mut self, key: &str) -> Vec<Action> {
+    /// (`zz` center, `zt` top, `zb` bottom) or work the folds (`za` toggle,
+    /// `zo`/`zc` open/close, `zR`/`zM` all); anything else aborts. The
+    /// `+first-non-blank` variants (`z.`/`z<CR>`/`z-`) wait on a `^` motion,
+    /// `zh`/`zl` (horizontal) on nowrap scrolling, and `zf` on manual folds —
+    /// heading sections are the only fold kind so far.
+    fn complete_z_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
         self.count = None;
-        match key {
-            "z" => vec![Action::Scroll(Scroll::Center)],
-            "t" => vec![Action::Scroll(Scroll::Top)],
-            "b" => vec![Action::Scroll(Scroll::Bottom)],
+        match (key, shift) {
+            ("z", false) => vec![Action::Scroll(Scroll::Center)],
+            ("t", false) => vec![Action::Scroll(Scroll::Top)],
+            ("b", false) => vec![Action::Scroll(Scroll::Bottom)],
+            ("a", false) => vec![Action::Fold(FoldOp::Toggle)],
+            ("o", false) => vec![Action::Fold(FoldOp::Open)],
+            ("c", false) => vec![Action::Fold(FoldOp::Close)],
+            ("r", true) => vec![Action::Fold(FoldOp::OpenAll)],
+            ("m", true) => vec![Action::Fold(FoldOp::CloseAll)],
             _ => vec![],
         }
     }
@@ -1593,6 +1614,32 @@ mod tests {
         assert_eq!(v.on_key(&k("t")), vec![Action::Scroll(Scroll::Top)]);
         v.on_key(&k("z"));
         assert_eq!(v.on_key(&k("b")), vec![Action::Scroll(Scroll::Bottom)]);
+    }
+
+    #[test]
+    fn z_fold_commands() {
+        let mut v = vim();
+        for (key, op) in
+            [("a", FoldOp::Toggle), ("o", FoldOp::Open), ("c", FoldOp::Close)]
+        {
+            v.on_key(&k("z"));
+            assert_eq!(v.on_key(&k(key)), vec![Action::Fold(op)]);
+        }
+        // `zR`/`zM` are the shifted pair — letters arrive lowercased with
+        // `shift` separate, so the sequence has to read it.
+        v.on_key(&k("z"));
+        assert_eq!(v.on_key(&shift("r", "R")), vec![Action::Fold(FoldOp::OpenAll)]);
+        v.on_key(&k("z"));
+        assert_eq!(v.on_key(&shift("m", "M")), vec![Action::Fold(FoldOp::CloseAll)]);
+        // Unshifted `zr`/`zm` (fold *levels*) aren't implemented, and must not
+        // fall through to their capital's meaning.
+        v.on_key(&k("z"));
+        assert!(v.on_key(&k("r")).is_empty());
+        v.on_key(&k("z"));
+        assert!(v.on_key(&k("m")).is_empty());
+        // Folding is view state: never undoable, never recorded for `.`.
+        assert!(!Action::Fold(FoldOp::Toggle).mutates());
+        assert!(!Action::Fold(FoldOp::Toggle).is_jump());
     }
 
     #[test]

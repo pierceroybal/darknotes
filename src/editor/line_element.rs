@@ -50,6 +50,13 @@ pub(super) enum CaretPaint {
 pub(super) struct Gutter {
     /// 0-based logical line this row belongs to.
     pub(super) line: usize,
+    /// `line`'s index in the fold-collapsed sequence — what relative numbering
+    /// counts in, so a closed fold reads as one line and `5j` lands where the
+    /// gutter says 5. Equals `line` in a document with no closed folds.
+    pub(super) rel: usize,
+    /// This row is a closed fold's header: the label's trailing space carries a
+    /// `▸` instead. Same char count, so the gutter never changes width.
+    pub(super) folded: bool,
     /// A wrapped line's continuation row: blanks of the same width, so its text
     /// stays aligned under the first row's.
     pub(super) continuation: bool,
@@ -61,6 +68,8 @@ pub(super) struct Gutter {
     pub(super) relative: bool,
     /// Cursor line, read at paint time — see `Editor::cur_line`.
     pub(super) cur_line: Rc<Cell<usize>>,
+    /// The cursor line's `rel`, read at paint time — see `Editor::cur_rel`.
+    pub(super) cur_rel: Rc<Cell<usize>>,
 }
 
 impl Gutter {
@@ -72,13 +81,36 @@ impl Gutter {
             return (format!(" {:>width$}  ", "").into(), theme.muted);
         }
         let cur = self.cur_line.get();
+        // Relative counts display lines (`rel`), absolute the real one: a fold
+        // header still names the line its heading is on.
         let n = if self.relative && self.line != cur {
-            self.line.abs_diff(cur)
+            self.rel.abs_diff(self.cur_rel.get())
         } else {
             self.line + 1
         };
         let color = if self.line == cur { theme.foreground } else { theme.muted };
-        (format!(" {n:>width$}  ").into(), color)
+        let mark = if self.folded { "▸" } else { " " };
+        (format!(" {n:>width$} {mark}").into(), color)
+    }
+
+    /// The label with the fold mark blanked, which is what the row's text
+    /// offset is measured from. `▸` is absent from most monospace fonts
+    /// (Courier Prime, the default, included), so it shapes through fallback at
+    /// an advance that need not match a space; measuring here keeps the chevron
+    /// inside the gutter's own cell instead of shoving that row's text right.
+    /// Identical to `resolve`'s label on every unfolded row.
+    pub(super) fn width_label(&self) -> SharedString {
+        let width = self.width;
+        if self.continuation {
+            return format!(" {:>width$}  ", "").into();
+        }
+        let cur = self.cur_line.get();
+        let n = if self.relative && self.line != cur {
+            self.rel.abs_diff(self.cur_rel.get())
+        } else {
+            self.line + 1
+        };
+        format!(" {n:>width$}  ").into()
     }
 }
 
@@ -233,7 +265,17 @@ impl Element for LineElement {
             let runs = [run(&font, text.len(), color)];
             window.text_system().shape_line(text, base_size, &runs, None)
         });
-        let gutter_w = gutter.as_ref().map_or(Pixels::ZERO, |g| g.width);
+        // A fold row's chevron may shape wider than the space it replaces, so
+        // its text offset comes from the unmarked label — see `width_label`.
+        let gutter_w = match (&gutter, self.gutter.as_ref()) {
+            (Some(_), Some(g)) if g.folded => {
+                let text = g.width_label();
+                let runs = [run(&font, text.len(), theme.muted)];
+                window.text_system().shape_line(text, base_size, &runs, None).width
+            }
+            (Some(shaped), _) => shaped.width,
+            _ => Pixels::ZERO,
+        };
         let shaped = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
@@ -709,12 +751,17 @@ mod tests {
     fn gutter_labels_track_the_cursor_line_at_a_fixed_width() {
         let theme = crate::theme::Theme::by_name("dark").unwrap();
         let cur = Rc::new(Cell::new(0usize));
+        // No folds: the display index is the line, so relative numbering is
+        // unchanged from before folding existed.
         let g = |line: usize, relative: bool, continuation: bool| Gutter {
             line,
+            rel: line,
+            folded: false,
             continuation,
             width: 3,
             relative,
             cur_line: cur.clone(),
+            cur_rel: cur.clone(),
         };
         let label = |gut: &Gutter| gut.resolve(&theme).0.to_string();
 
@@ -751,6 +798,28 @@ mod tests {
                 }
             }
         }
+
+        // A fold header marks the label's trailing cell, keeping its char count
+        // — and `width_label`, which the text offset is measured from, stays
+        // exactly the unmarked label.
+        cur.set(0);
+        let folded = Gutter { folded: true, ..g(10, false, false) };
+        assert_eq!(label(&folded), "  11 ▸");
+        assert_eq!(label(&folded).chars().count(), 6);
+        assert_eq!(folded.width_label().as_ref(), "  11  ");
+        assert_eq!(g(10, false, false).width_label(), folded.width_label());
+
+        // Relative numbering counts display lines, so a closed fold above the
+        // caret shortens every distance past it by the lines it hides.
+        let cur_rel = Rc::new(Cell::new(4usize)); // caret on line 20, 16 hidden above
+        let over_fold = Gutter {
+            line: 10,
+            rel: 3,
+            cur_line: Rc::new(Cell::new(20)),
+            cur_rel: cur_rel.clone(),
+            ..g(10, true, false)
+        };
+        assert_eq!(label(&over_fold), "   1  ");
 
         // The cursor line reads as foreground, everything else muted.
         cur.set(4);

@@ -190,6 +190,32 @@ pub struct Document {
     /// a jump to it clamps. Vim adjusts; matching that means routing every
     /// edit's `(offset, delta)` through here.
     marks: HashMap<char, usize>,
+    /// Headings the user has folded closed, in document order — see
+    /// `FoldAnchor`.
+    folded: Vec<FoldAnchor>,
+    /// `folded` resolved against the markdown parse: inclusive
+    /// `(header, last_hidden)` line ranges, sorted by start and
+    /// non-overlapping. Rebuilt by `sync_folds` — which needs a parse, so it
+    /// runs once per render rather than per edit. An edit that shifts lines
+    /// therefore leaves these stale until the frame lands, the same granularity
+    /// the markdown spans themselves are refreshed at.
+    folds: Vec<(usize, usize)>,
+    /// Bumped by every fold toggle. Pairs with `revision` as `sync_folds`'
+    /// staleness check, and is what the render layer's row key watches so a
+    /// fold change that moved neither caret nor content still rebuilds.
+    folds_gen: u64,
+    /// `(revision, folds_gen)` the current `folds` was derived from.
+    folds_key: (u64, u64),
+}
+
+/// A closed fold, anchored by title as well as line: an edit elsewhere shifts
+/// the line, and a title re-finds the heading where a stale index would hide
+/// the wrong section. Fold state is view state — deliberately absent from
+/// `Snapshot`, so undo can't restore folds from another shape of the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FoldAnchor {
+    line: usize,
+    title: String,
 }
 
 /// A content change confined to a single line, leaving the line count alone —
@@ -241,6 +267,10 @@ impl Document {
             goal_col: 0,
             last_edit: None,
             marks: HashMap::new(),
+            folded: Vec::new(),
+            folds: Vec::new(),
+            folds_gen: 0,
+            folds_key: (0, 0),
         }
     }
 
@@ -268,6 +298,10 @@ impl Document {
             goal_col: 0,
             last_edit: None,
             marks: HashMap::new(),
+            folded: Vec::new(),
+            folds: Vec::new(),
+            folds_gen: 0,
+            folds_key: (0, 0),
         })
     }
 
@@ -454,6 +488,251 @@ impl Document {
     /// A lowercase mark's offset, if set in this buffer.
     pub fn mark(&self, name: char) -> Option<usize> {
         self.marks.get(&name).copied()
+    }
+
+    // --- Folding ---------------------------------------------------------
+    //
+    // Closed folds live here rather than in the editor because vertical
+    // motions and linewise operators treat one as a single line, and both
+    // resolve against the document. They are view state: no `revision` bump,
+    // no place in a `Snapshot`, and the ranges are re-derived from the
+    // markdown parse instead of stored, so an edit that shifts lines can't
+    // strand one over the wrong text.
+
+    /// Generation of the closed-fold set — see the `folds_gen` field.
+    pub fn folds_gen(&self) -> u64 {
+        self.folds_gen
+    }
+
+    /// Every closed fold as an inclusive `(header, last_hidden)` line range,
+    /// sorted by start and non-overlapping.
+    pub fn folds(&self) -> &[(usize, usize)] {
+        &self.folds
+    }
+
+    /// Resolve `folded` against `spans` into line ranges, repairing anchors
+    /// whose heading has moved. Called once per row build: a document with no
+    /// folds returns on the first check, and a resolved set is reused until the
+    /// content or the fold set changes.
+    pub fn sync_folds(&mut self, spans: &markdown::Parsed) {
+        if self.folded.is_empty() {
+            if !self.folds.is_empty() {
+                self.folds.clear();
+                self.folds_gen += 1;
+            }
+            return;
+        }
+        if self.folds_key == (self.revision, self.folds_gen) {
+            return;
+        }
+
+        // Repair. An anchor still sitting on its heading stays; one whose line
+        // moved re-finds it by title; one whose heading is gone is dropped.
+        let rope = self.rope.clone(); // ropey clone is cheap (shared, CoW)
+        self.folded.retain_mut(|a| {
+            if heading_title(spans, &rope, a.line).as_deref() == Some(a.title.as_str()) {
+                return true;
+            }
+            match find_heading(spans, &rope, &a.title) {
+                Some(line) => {
+                    a.line = line;
+                    true
+                }
+                None => false,
+            }
+        });
+        self.folded.sort_unstable_by_key(|a| a.line);
+        // Two anchors can repair onto one line — duplicate titles resolve to
+        // the first, the rule `[[note#Heading]]` already follows.
+        self.folded.dedup_by_key(|a| a.line);
+
+        // Extents last, skipping any heading an already-closed fold swallows:
+        // overlapping ranges would break the sorted-and-disjoint promise
+        // `fold_at`'s search depends on.
+        let previous = std::mem::take(&mut self.folds);
+        for i in 0..self.folded.len() {
+            let start = self.folded[i].line;
+            if self.folds.last().is_some_and(|&(_, end)| start <= end) {
+                continue;
+            }
+            if let Some(range) = self.fold_extent(spans, start) {
+                self.folds.push(range);
+            }
+        }
+        // An edit can move, grow or dissolve a fold with no toggle involved —
+        // deleting the `#` from a header, or adding a heading that ends a
+        // section early. The render layer watches the generation to know its
+        // row geometry is stale, so a repair has to bump it like a toggle does.
+        if self.folds != previous {
+            self.folds_gen += 1;
+        }
+        self.folds_key = (self.revision, self.folds_gen);
+    }
+
+    /// The lines a fold on heading `start` hides: `(start, last_hidden)`,
+    /// inclusive. The section runs to the line before the next heading of the
+    /// same or shallower level — subheadings are swallowed — minus trailing
+    /// blank lines, so the blank separating two sections stays on screen.
+    /// `None` when nothing is left to hide, which is what makes a heading with
+    /// an empty section unfoldable.
+    fn fold_extent(&self, spans: &markdown::Parsed, start: usize) -> Option<(usize, usize)> {
+        let level = heading_level_at(spans, start)?;
+        let mut end = start;
+        for line in start + 1..self.rope.len_lines() {
+            if heading_level_at(spans, line).is_some_and(|l| l <= level) {
+                break;
+            }
+            end = line;
+        }
+        while end > start && self.line_is_blank(end) {
+            end -= 1;
+        }
+        (end > start).then_some((start, end))
+    }
+
+    /// The closed fold containing `line`, if any.
+    pub fn fold_at(&self, line: usize) -> Option<(usize, usize)> {
+        // Sorted and disjoint, so the last fold starting at or before `line` is
+        // the only candidate.
+        let i = self.folds.partition_point(|&(s, _)| s <= line).checked_sub(1)?;
+        let (start, end) = self.folds[i];
+        (line <= end).then_some((start, end))
+    }
+
+    /// `line`'s fold header, or `line` itself when no closed fold covers it.
+    pub fn fold_start(&self, line: usize) -> usize {
+        self.fold_at(line).map_or(line, |(start, _)| start)
+    }
+
+    /// The last line hidden by `line`'s closed fold, or `line` itself.
+    pub fn fold_end(&self, line: usize) -> usize {
+        self.fold_at(line).map_or(line, |(_, end)| end)
+    }
+
+    /// Expand a linewise range to cover any closed folds it touches — what
+    /// makes `dd` on a closed fold take the whole section.
+    fn fold_expand(&self, first: usize, last: usize) -> (usize, usize) {
+        (self.fold_start(first), self.fold_end(last))
+    }
+
+    /// `count` *display* lines below `line`, clamped to the last: a closed fold
+    /// is one step. Shared by vertical motion and the counted linewise
+    /// operators, so `3j` and `3dd` cover the same ground.
+    fn line_below(&self, line: usize, count: usize) -> usize {
+        let last = self.rope.len_lines().saturating_sub(1);
+        let mut line = self.fold_start(line);
+        for _ in 0..count {
+            let below = self.fold_end(line) + 1;
+            if below > last {
+                break;
+            }
+            line = below;
+        }
+        line
+    }
+
+    /// `count` display lines above `line`, clamped to the first.
+    fn line_above(&self, line: usize, count: usize) -> usize {
+        let mut line = self.fold_start(line);
+        for _ in 0..count {
+            let Some(above) = line.checked_sub(1) else { break };
+            line = self.fold_start(above);
+        }
+        line
+    }
+
+    /// The heading whose section contains `line`: `line` itself when it is one,
+    /// else the nearest heading above. `None` above the first heading.
+    fn enclosing_heading(&self, spans: &markdown::Parsed, line: usize) -> Option<usize> {
+        (0..=line.min(self.rope.len_lines().saturating_sub(1)))
+            .rev()
+            .find(|&l| heading_level_at(spans, l).is_some())
+    }
+
+    /// Mark heading `head` closed, if it is a heading with something to hide
+    /// and isn't closed already. Reports whether the set changed.
+    fn close_heading(&mut self, spans: &markdown::Parsed, head: usize) -> bool {
+        if self.folded.iter().any(|a| a.line == head) || self.fold_extent(spans, head).is_none() {
+            return false;
+        }
+        let Some(title) = heading_title(spans, &self.rope, head) else { return false };
+        self.folded.push(FoldAnchor { line: head, title });
+        true
+    }
+
+    /// Adopt a changed fold set: bump the generation (which is what makes the
+    /// render layer rebuild) and re-resolve the ranges immediately, so
+    /// `fold_at` and the motions are correct within this same keystroke rather
+    /// than one render behind.
+    fn folds_changed(&mut self, spans: &markdown::Parsed) {
+        self.folds_gen += 1;
+        self.sync_folds(spans);
+    }
+
+    /// `zc`: close the section under `line`'s heading — or the heading above
+    /// it, so it works from anywhere inside a section, as vim's does.
+    pub fn close_fold(&mut self, spans: &markdown::Parsed, line: usize) {
+        let Some(head) = self.enclosing_heading(spans, line) else { return };
+        if self.close_heading(spans, head) {
+            self.folds_changed(spans);
+        }
+    }
+
+    /// `zo`: open the fold `line` sits in. Silent when none is closed.
+    pub fn open_fold(&mut self, spans: &markdown::Parsed, line: usize) {
+        let Some((start, _)) = self.fold_at(line) else { return };
+        self.folded.retain(|a| a.line != start);
+        self.folds_changed(spans);
+    }
+
+    /// `za`.
+    pub fn toggle_fold(&mut self, spans: &markdown::Parsed, line: usize) {
+        match self.fold_at(line) {
+            Some(_) => self.open_fold(spans, line),
+            None => self.close_fold(spans, line),
+        }
+    }
+
+    /// `zR`.
+    pub fn open_all_folds(&mut self, spans: &markdown::Parsed) {
+        if self.folded.is_empty() {
+            return;
+        }
+        self.folded.clear();
+        self.folds_changed(spans);
+    }
+
+    /// `zM`: close every foldable heading. Nested sections close too; the
+    /// outermost fold is what ends up hiding them, and reopening it exposes
+    /// the inner ones still closed — vim's behavior.
+    pub fn close_all_folds(&mut self, spans: &markdown::Parsed) {
+        let mut changed = false;
+        for line in 0..self.rope.len_lines() {
+            if heading_level_at(spans, line).is_some() {
+                changed |= self.close_heading(spans, line);
+            }
+        }
+        if changed {
+            self.folds_changed(spans);
+        }
+    }
+
+    /// Titles of the closed folds, for the session snapshot.
+    pub fn fold_titles(&self) -> Vec<String> {
+        self.folded.iter().map(|a| a.title.clone()).collect()
+    }
+
+    /// Reinstate folds saved by a previous session. Their lines are unknowable
+    /// until the markdown parse exists, so each anchor is seeded past the end of
+    /// any document and resolved by title on the first `sync_folds` —
+    /// `usize::MAX` can never match a real heading, so repair always runs.
+    pub fn set_fold_titles(&mut self, titles: Vec<String>) {
+        if titles.is_empty() {
+            return;
+        }
+        self.folded =
+            titles.into_iter().map(|title| FoldAnchor { line: usize::MAX, title }).collect();
+        self.folds_gen += 1;
     }
 
     fn set_caret(&mut self, at: usize) {
@@ -687,8 +966,8 @@ impl Document {
     pub fn selection_span(&self, linewise: bool) -> (usize, usize) {
         let r = self.selections[0].range(); // r.end == max(anchor, head)
         if linewise {
-            let l0 = self.rope.char_to_line(r.start);
-            let l1 = self.rope.char_to_line(r.end);
+            let (l0, l1) = self
+                .fold_expand(self.rope.char_to_line(r.start), self.rope.char_to_line(r.end));
             let start = self.rope.line_to_char(l0);
             let end = if l1 + 1 >= self.rope.len_lines() {
                 self.rope.len_chars()
@@ -715,6 +994,9 @@ impl Document {
     /// at `len_chars` need not be the last line's, and treating it as such
     /// would swallow the trailing newline.
     fn linewise_del_span(&self, first: usize, last: usize) -> (std::ops::Range<usize>, usize) {
+        // A closed fold is one line to a linewise operator, so a range touching
+        // one covers all of it.
+        let (first, last) = self.fold_expand(first, last);
         let start = self.rope.line_to_char(first);
         if last + 1 >= self.rope.len_lines() {
             (start..self.rope.len_chars(), start.saturating_sub(1))
@@ -782,6 +1064,7 @@ impl Document {
     /// lines stay put (vim behavior). Drops the caret on the first line's
     /// first non-blank. Backs visual `>`/`<` and normal `>>`/`<<`.
     pub fn indent_lines(&mut self, l0: usize, l1: usize, width: usize, dedent: bool) {
+        let (l0, l1) = self.fold_expand(l0, l1);
         let l1 = l1.min(self.rope.len_lines().saturating_sub(1));
         // Bottom-up so earlier lines' char offsets stay valid mid-edit.
         for line in (l0..=l1).rev() {
@@ -828,7 +1111,8 @@ impl Document {
     /// `dd`: delete `count` whole lines starting at the caret's line.
     pub fn delete_lines(&mut self, count: usize) {
         let (line, _) = self.line_col_of(self.caret());
-        let (span, del_start) = self.linewise_del_span(line, line + count.max(1) - 1);
+        let last = self.line_below(line, count.max(1) - 1);
+        let (span, del_start) = self.linewise_del_span(line, last);
         let start = span.start;
         if del_start < span.end {
             self.set_register(self.rope.slice(span.clone()).to_string(), true);
@@ -847,13 +1131,15 @@ impl Document {
         let count = count.max(1);
         let (line, _) = self.line_col_of(self.caret());
         let last = self.rope.len_lines().saturating_sub(1);
-        if (up && line == 0) || (!up && line == last) {
+        // "No line that way" is measured in display lines: `dj` on the last
+        // line of a document ending in a closed fold is still a failed motion.
+        if (up && self.fold_start(line) == 0) || (!up && self.fold_end(line) == last) {
             return;
         }
         let (first, last_del) = if up {
-            (line.saturating_sub(count), line)
+            (self.line_above(line, count), line)
         } else {
-            (line, (line + count).min(last))
+            (line, self.line_below(line, count))
         };
         let (span, del_start) = self.linewise_del_span(first, last_del);
         let start = span.start;
@@ -1270,8 +1556,9 @@ impl Document {
     /// `yy`: copy `count` whole lines into the register (linewise). Caret stays.
     pub fn yank_lines(&mut self, count: usize) {
         let (line, _) = self.line_col_of(self.caret());
+        let (line, last) = self.fold_expand(line, self.line_below(line, count.max(1) - 1));
         let start = self.rope.line_to_char(line);
-        let end_line = (line + count.max(1)).min(self.rope.len_lines());
+        let end_line = (last + 1).min(self.rope.len_lines());
         let end = if end_line >= self.rope.len_lines() {
             self.rope.len_chars()
         } else {
@@ -1520,14 +1807,17 @@ impl Document {
                 let max = self.line_len_chars(line);
                 self.rope.line_to_char(line) + (col + count).min(max)
             }
+            // Vertical motion counts *display* lines: a closed fold is one
+            // step, which is what makes the relative line numbers beside it
+            // actionable (`5j` lands where the gutter says 5). `fold_start` on
+            // the landing line catches a caret that began inside a fold.
             Motion::LineUp => {
                 let (line, _) = self.line_col_of(from);
-                self.offset_in_line(line.saturating_sub(count), self.goal_col)
+                self.offset_in_line(self.line_above(line, count), self.goal_col)
             }
             Motion::LineDown => {
                 let (line, _) = self.line_col_of(from);
-                let last = self.rope.len_lines().saturating_sub(1);
-                self.offset_in_line((line + count).min(last), self.goal_col)
+                self.offset_in_line(self.line_below(line, count), self.goal_col)
             }
             Motion::LineStart => {
                 let (line, _) = self.line_col_of(from);
@@ -1805,6 +2095,233 @@ fn class_of(big: bool) -> fn(char) -> CharClass {
         |_| CharClass::Word
     } else {
         char_class
+    }
+}
+
+/// A heading line's level, read from the markdown parse. The scanner pushes a
+/// line's whole-line role span first, so the leading span decides. Reading the
+/// parse rather than scanning for `#` is what keeps a comment inside a fence,
+/// or a `#` in frontmatter, from looking like a heading.
+fn heading_level_at(spans: &markdown::Parsed, line: usize) -> Option<u8> {
+    match spans.get(line)?.first()?.kind {
+        markdown::SpanKind::Heading(level) => Some(level),
+        _ => None,
+    }
+}
+
+/// The title of the heading on `line`, markers stripped, or `None` when the
+/// line isn't a heading.
+fn heading_title(spans: &markdown::Parsed, rope: &Rope, line: usize) -> Option<String> {
+    heading_level_at(spans, line)?;
+    markdown::heading_text(&markdown::line_text(rope, line)).map(str::to_string)
+}
+
+/// Line of the first heading titled `title`, case-insensitively — a fold
+/// anchor's repair path. Duplicate titles resolve to the first, as they do for
+/// a `[[note#Heading]]` link.
+// ponytail: ASCII case folding and a whole-document walk, like that link
+// resolution. Only runs for an anchor whose line no longer holds its heading.
+fn find_heading(spans: &markdown::Parsed, rope: &Rope, title: &str) -> Option<usize> {
+    (0..rope.len_lines())
+        .find(|&l| heading_title(spans, rope, l).is_some_and(|t| t.eq_ignore_ascii_case(title)))
+}
+
+#[cfg(test)]
+mod folds {
+    use super::*;
+
+    /// A plan-shaped note: two H2 phases with an H3 inside the first, a fenced
+    /// block whose `#` comment must not read as a heading, and one blank line
+    /// separating each section from the next.
+    const PLAN: &str = "\
+# Plan
+
+intro
+
+## Phase 1
+
+body one
+
+### Detail
+
+detail body
+
+```sh
+# not a heading
+```
+
+## Phase 2
+
+body two
+";
+
+    fn doc(text: &str) -> Document {
+        let mut d = Document::new(text);
+        let spans = markdown::parse(&d.rope);
+        d.sync_folds(&spans);
+        d
+    }
+
+    fn spans_of(d: &Document) -> markdown::Parsed {
+        markdown::parse(&d.rope)
+    }
+
+    fn line_of(d: &Document, needle: &str) -> usize {
+        (0..d.rope.len_lines())
+            .find(|&l| markdown::line_text(&d.rope, l).contains(needle))
+            .unwrap_or_else(|| panic!("no line matching {needle:?}"))
+    }
+
+    #[test]
+    fn extent_swallows_subheadings_and_leaves_the_separating_blank() {
+        let d = doc(PLAN);
+        let spans = spans_of(&d);
+        let (p1, p2) = (line_of(&d, "## Phase 1"), line_of(&d, "## Phase 2"));
+
+        // Phase 1 runs to its last non-blank line: the `### Detail` subsection
+        // and the fence are inside it, the blank before `## Phase 2` is not.
+        let (start, end) = d.fold_extent(&spans, p1).unwrap();
+        assert_eq!(start, p1);
+        assert_eq!(end, p2 - 2);
+        assert!(d.line_is_blank(p2 - 1), "the separating blank stays visible");
+
+        // A subheading folds only its own section, stopping at the next H2.
+        let detail = line_of(&d, "### Detail");
+        assert_eq!(d.fold_extent(&spans, detail).unwrap(), (detail, p2 - 2));
+
+        // The H1 swallows everything below it; the last section reaches the end.
+        assert_eq!(d.fold_extent(&spans, 0).unwrap().1, line_of(&d, "body two"));
+        assert_eq!(d.fold_extent(&spans, p2).unwrap(), (p2, p2 + 2));
+
+        // A `#` inside a fence is code, not a heading — the parse says so, which
+        // is why fold extents read it instead of scanning for `#`.
+        assert!(d.fold_extent(&spans, line_of(&d, "not a heading")).is_none());
+        // Nor is a non-heading line, or a heading with nothing to hide.
+        assert!(d.fold_extent(&spans, line_of(&d, "intro")).is_none());
+        let empty = doc("## Empty\n\n## Next\n\nbody\n");
+        assert!(empty.fold_extent(&spans_of(&empty), 0).is_none());
+    }
+
+    #[test]
+    fn frontmatter_hashes_are_not_headings() {
+        let d = doc("---\ntitle: # not a heading\n---\n\n## Real\n\nbody\n");
+        let spans = spans_of(&d);
+        assert!(d.fold_extent(&spans, 1).is_none());
+        assert_eq!(d.fold_extent(&spans, 4).unwrap(), (4, 6));
+    }
+
+    #[test]
+    fn closing_and_opening_track_the_caret_line() {
+        let mut d = doc(PLAN);
+        let spans = spans_of(&d);
+        let p1 = line_of(&d, "## Phase 1");
+
+        // `za` from *inside* a section closes the section it belongs to.
+        d.toggle_fold(&spans, p1 + 2);
+        assert_eq!(d.folds(), &[(p1, line_of(&d, "## Phase 2") - 2)]);
+        assert_eq!(d.fold_titles(), vec!["Phase 1".to_string()]);
+        // The ranges are live immediately, not one render behind.
+        assert_eq!(d.fold_start(p1 + 2), p1);
+        assert_eq!(d.fold_end(p1), line_of(&d, "## Phase 2") - 2);
+
+        // …and toggling again from the header opens it.
+        d.toggle_fold(&spans, p1);
+        assert!(d.folds().is_empty());
+
+        // `zM` closes every foldable heading; a nested one is swallowed by its
+        // ancestor's range, so the ranges stay disjoint.
+        d.close_all_folds(&spans);
+        assert_eq!(d.folds(), &[(0, line_of(&d, "body two"))]);
+        assert!(d.fold_titles().len() > 1, "the inner headings are closed too");
+        // Opening the outer one exposes the inner folds, still closed.
+        d.open_fold(&spans, 0);
+        assert_eq!(d.folds().first(), Some(&(p1, line_of(&d, "## Phase 2") - 2)));
+
+        d.open_all_folds(&spans);
+        assert!(d.folds().is_empty() && d.fold_titles().is_empty());
+    }
+
+    #[test]
+    fn anchors_repair_against_a_moved_or_deleted_heading() {
+        let mut d = doc(PLAN);
+        let spans = spans_of(&d);
+        let p2 = line_of(&d, "## Phase 2");
+        d.close_fold(&spans, p2);
+        assert_eq!(d.folds(), &[(p2, p2 + 2)]);
+
+        // An edit above shifts the heading: the anchor re-finds it by title.
+        d.jump_to(0);
+        d.insert("added\n");
+        let spans = spans_of(&d);
+        d.sync_folds(&spans);
+        assert_eq!(d.folds(), &[(p2 + 1, p2 + 3)]);
+
+        // A session restore knows only titles; the first sync resolves them.
+        let mut d = doc(PLAN);
+        d.set_fold_titles(vec!["Phase 2".into(), "Gone".into()]);
+        d.sync_folds(&spans_of(&d));
+        assert_eq!(d.folds(), &[(p2, p2 + 2)], "the missing heading is dropped");
+        assert_eq!(d.fold_titles(), vec!["Phase 2".to_string()]);
+
+        // Two anchors resolving onto one heading collapse to a single fold.
+        let mut d = doc(PLAN);
+        d.set_fold_titles(vec!["Phase 2".into(), "phase 2".into()]);
+        d.sync_folds(&spans_of(&d));
+        assert_eq!(d.folds(), &[(p2, p2 + 2)]);
+    }
+
+    #[test]
+    fn vertical_motion_and_linewise_ops_count_a_fold_as_one_line() {
+        let mut d = doc(PLAN);
+        let spans = spans_of(&d);
+        let (p1, p2) = (line_of(&d, "## Phase 1"), line_of(&d, "## Phase 2"));
+        d.close_fold(&spans, p1);
+
+        // `j` from the line above the fold lands on its header, and one more
+        // clears the whole section — the blank line before Phase 2.
+        d.jump_to(d.rope.line_to_char(p1 - 1));
+        d.move_motion(Motion::LineDown, 1);
+        assert_eq!(d.caret_line_col().0, p1);
+        d.move_motion(Motion::LineDown, 1);
+        assert_eq!(d.caret_line_col().0, p2 - 1);
+        // `k` back over it, and a count crossing it in one go.
+        d.move_motion(Motion::LineUp, 2);
+        assert_eq!(d.caret_line_col().0, p1 - 1);
+        d.move_motion(Motion::LineDown, 3);
+        assert_eq!(d.caret_line_col().0, p2);
+
+        // `yy` on the closed fold takes the whole section, not the header line.
+        d.jump_to(d.rope.line_to_char(p1));
+        d.yank_lines(1);
+        let yanked = d.register_text().to_string();
+        assert!(yanked.starts_with("## Phase 1"), "{yanked:?}");
+        assert!(yanked.contains("detail body"), "{yanked:?}");
+        assert!(!yanked.contains("Phase 2"), "{yanked:?}");
+
+        // …and so does `dd`, leaving the blank line and Phase 2 behind.
+        d.delete_lines(1);
+        let left = d.rope.to_string();
+        assert!(!left.contains("Phase 1") && !left.contains("detail body"), "{left:?}");
+        assert!(left.contains("## Phase 2"));
+        assert_eq!(d.caret_line_col().0, p1);
+    }
+
+    #[test]
+    fn dj_on_a_trailing_fold_is_a_failed_motion() {
+        // No trailing newline, so the fold really does reach the last line.
+        let mut d = doc("body\n\n## Last\n\ntail");
+        let spans = spans_of(&d);
+        d.close_fold(&spans, 2);
+        assert_eq!(d.folds(), &[(2, 4)]);
+        d.jump_to(d.rope.line_to_char(2));
+        let before = d.rope.to_string();
+        d.delete_lines_dir(1, false); // `dj` with no display line below
+        assert_eq!(d.rope.to_string(), before);
+        // `dk` from there still works, and takes the whole fold with it. The
+        // span reaches the end of the buffer, so it swallows the newline
+        // *before* it rather than leaving a trailing blank line.
+        d.delete_lines_dir(1, true);
+        assert_eq!(d.rope.to_string(), "body");
     }
 }
 

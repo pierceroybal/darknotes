@@ -45,7 +45,7 @@ use crate::markdown::{self, line_text, SpanKind};
 use crate::session;
 use crate::theme::Theme;
 use crate::vault::{Row, Vault};
-use crate::vim::{Action, Mode, Scroll, Vim};
+use crate::vim::{Action, FoldOp, Mode, Scroll, Vim};
 use crate::watcher::VaultWatcher;
 
 const WELCOME: &str =
@@ -241,6 +241,10 @@ pub struct Editor {
     /// when a row paints, so moving the caret re-labels the gutter without
     /// invalidating a single cached row.
     cur_line: Rc<Cell<usize>>,
+    /// The caret's line in the fold-collapsed sequence, shared the same way.
+    /// Relative numbering measures against this so a closed fold counts once;
+    /// equal to `cur_line` in a document with no folds.
+    cur_rel: Rc<Cell<usize>>,
 }
 
 impl Editor {
@@ -281,6 +285,7 @@ impl Editor {
                 for e in s.files {
                     let Ok(mut doc) = Document::open(&e.path) else { continue };
                     doc.jump_to(e.caret);
+                    doc.set_fold_titles(e.folds);
                     // At most one preview buffer exists; against a hand-edited
                     // or stale file, the first preview wins and the rest pin.
                     let preview = e.preview && !seen_preview;
@@ -409,6 +414,7 @@ impl Editor {
             blink_timer: None,
             caret_paint: Rc::new(Cell::new(CaretPaint::Solid)),
             cur_line: Rc::new(Cell::new(0)),
+            cur_rel: Rc::new(Cell::new(0)),
         };
         this.arm_blink(cx);
         if config.watch_files {
@@ -703,8 +709,11 @@ impl Editor {
         let font = gpui::font(self.font_family.clone());
         let font_size = px(self.font_size);
         let theme = *cx.global::<Theme>();
+        // `width_label`, not the painted one: a fold row's chevron may shape
+        // wider than the space it replaces, and prepaint offsets that row's
+        // text by the unmarked width too.
         let gutter_w = el.gutter.as_ref().map_or(Pixels::ZERO, |g| {
-            let (text, _) = g.resolve(&theme);
+            let text = g.width_label();
             let runs = [run(&font, text.len(), theme.foreground)];
             window.text_system().shape_line(text, font_size, &runs, None).width
         });
@@ -1271,6 +1280,12 @@ impl Editor {
             actions = self.last_change.clone().unwrap_or_default();
         }
         let entering_insert = mode_before == Mode::Normal && self.vim.mode == Mode::Insert;
+        // Typing into a closed fold would be invisible editing — `o` on a fold
+        // header opens a line inside the hidden section. The linewise operators
+        // are deliberately not covered: they act on the whole fold, visibly.
+        if entering_insert {
+            self.reveal_caret_line();
+        }
         // Checkpoint a single undoable unit. Insert-mode edits are excluded so the
         // whole session coalesces into the entering-insert checkpoint; everything
         // else (normal- and visual-mode mutations) gets its own.
@@ -1430,9 +1445,23 @@ impl Editor {
     /// The single execution seam every input grammar funnels through.
     fn apply(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         let renumbers = action.renumbers();
+        // Landing inside a closed fold opens it — vim's `foldopen` default,
+        // which `is_jump` almost exactly enumerates (search, `n`/`N`, `G`/`gg`,
+        // `{`/`}`, `%`); the rest are the cross-file arrivals that record their
+        // own jump origin. Vertical motion is deliberately absent: `j`/`k` step
+        // *over* a fold, they never open it.
+        let is_jump = action.is_jump();
+        let opens_fold = is_jump
+            || matches!(
+                action,
+                Action::JumpToMark { .. }
+                    | Action::JumpBack
+                    | Action::JumpForward
+                    | Action::FollowLink
+            );
         // Record where a jump leaves from, before it moves the caret. Opens by
         // path record in `open_path` instead — see `Action::is_jump`.
-        if action.is_jump() {
+        if is_jump {
             self.push_jump();
         }
         match action {
@@ -1527,6 +1556,7 @@ impl Editor {
             Action::JumpForward => self.jump_history(false, window),
             Action::SetMark(name) => self.set_mark(name),
             Action::JumpToMark { name, line } => self.jump_to_mark(name, line, window),
+            Action::Fold(op) => self.fold(op),
             // Expanded into the recorded change in `feed_vim`, before dispatch;
             // never reaches here.
             Action::Repeat => {}
@@ -1537,6 +1567,41 @@ impl Editor {
             let width = self.vim.tab_width;
             self.doc_mut().renumber_block(line, width);
         }
+        if opens_fold {
+            self.reveal_caret_line();
+        }
+    }
+
+    /// `za`/`zo`/`zc`/`zR`/`zM`. Closing a section the caret sits inside parks
+    /// the caret on its header — the caret must never be left on a line that
+    /// isn't rendered.
+    fn fold(&mut self, op: FoldOp) {
+        let line = self.doc().caret_line_col().0;
+        let spans = self.spans();
+        match op {
+            FoldOp::Toggle => self.doc_mut().toggle_fold(&spans, line),
+            FoldOp::Open => self.doc_mut().open_fold(&spans, line),
+            FoldOp::Close => self.doc_mut().close_fold(&spans, line),
+            FoldOp::OpenAll => self.doc_mut().open_all_folds(&spans),
+            FoldOp::CloseAll => self.doc_mut().close_all_folds(&spans),
+        }
+        let head = self.doc().fold_start(line);
+        if head != line {
+            let at = self.doc().rope.line_to_char(head);
+            self.doc_mut().jump_to(at);
+        }
+    }
+
+    /// Open the closed fold the caret has landed in, if any — see `opens_fold`
+    /// in `apply`. Also the arrival path for jumps that don't go through an
+    /// `Action` (a grep or outline pick, a heading link).
+    fn reveal_caret_line(&mut self) {
+        let line = self.doc().caret_line_col().0;
+        if self.doc().fold_at(line).is_none() {
+            return;
+        }
+        let spans = self.spans();
+        self.doc_mut().open_fold(&spans, line);
     }
 
     /// `gd`/`gf`/`gx`: follow the link under the caret. A wikilink opens its
@@ -1611,6 +1676,7 @@ impl Editor {
                 } else {
                     b.top
                 },
+                folds: b.doc.fold_titles(),
             });
         }
         session::record(&self.vault.root, session::VaultSession { active, files });
@@ -1788,6 +1854,20 @@ impl Render for Editor {
             self.pending_scroll =
                 Some(PendingView { top: self.top_line(), caret: self.doc().caret_offset() });
         }
+        // Reparse first: whether a content change was confined to one line is
+        // what separates a patchable edit from a whole-document rebuild, and
+        // only the parse can establish it (a typed ``` moves a fence boundary
+        // and restyles everything below).
+        let (spans, edited_line) = self.spans_for_render();
+        // Then resolve the folds against that parse, before the row key is
+        // built. An edit can dissolve or resize a fold with no toggle — the
+        // generation moves for that too, and the key has to see it or the patch
+        // path would splice new rows into stale geometry.
+        self.doc_mut().sync_folds(&spans);
+        // The caret's display line, which relative numbering measures against
+        // (`Gutter::rel`). Resolved folds are a precondition, so it lands here
+        // rather than beside `cur_line` above.
+        self.cur_rel.set(rows::display_index(self.doc().folds(), self.cur_line.get()));
         // Reuse the previous rows when nothing they depend on changed — a
         // wheel scroll re-renders every frame and must not rebuild (much less
         // re-shape) the whole document each time. A caret-only change (j/k,
@@ -1804,17 +1884,13 @@ impl Render for Editor {
                 .then(|| self.doc().selection_span(self.vim.mode == Mode::VisualLine)),
             q: self.search_query(),
             wrap_width,
+            folds: self.doc().folds_gen(),
         };
         enum Plan {
             Hit,
             Patch,
             Full,
         }
-        // Reparse first: whether a content change was confined to one line is
-        // what separates a patchable edit from a whole-document rebuild, and
-        // only the parse can establish it (a typed ``` moves a fence boundary
-        // and restyles everything below).
-        let (_, edited_line) = self.spans_for_render();
         let line_count = self.doc().rope.len_lines();
         let plan = match &self.rows_cache {
             Some(c) if c.key == key => Plan::Hit,
@@ -1848,9 +1924,13 @@ impl Render for Editor {
                 let t0 = crate::perf::t0();
                 let mut c = self.rows_cache.take().unwrap();
                 let ctx = self.row_ctx(wrap_width, &theme, window);
-                let old_line =
-                    ctx.rope.char_to_line(c.key.caret.min(ctx.rope.len_chars()));
-                let new_line = ctx.cur_line;
+                // A caret inside a closed fold is rendered by the fold's header
+                // row, so that is the line to rebuild and to measure `cur_row`
+                // against — the hidden line's own row count is zero, and
+                // summing up to it would land one row past the fold.
+                let old_line = ctx
+                    .fold_start(ctx.rope.char_to_line(c.key.caret.min(ctx.rope.len_chars())));
+                let new_line = ctx.fold_start(ctx.cur_line);
                 let mut rows = Rc::try_unwrap(c.rows).unwrap_or_else(|rc| (*rc).clone());
                 let mut caret_in_line = 0;
                 // Higher line first, so the lower splice's length change

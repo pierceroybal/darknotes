@@ -31,6 +31,11 @@
 //!   virtualizes from a prefix-sum offsets table and never lazily measures, so
 //!   a height that depends on caret or scroll state invalidates the table.
 //!
+//! Folding rides on the same structure: a line hidden by a closed fold emits
+//! zero rows, which every row↔line walk in the editor already skips. Its header
+//! renders as the heading it is — the fold shows only in the gutter, resolved
+//! at paint time — so nothing about a fold reaches the row caches.
+//!
 //! A child module of `editor` so methods can touch private `Editor` state.
 
 use std::collections::HashMap;
@@ -65,6 +70,10 @@ pub(super) struct RowsKey {
     /// hlsearch); empty = none.
     pub(super) q: String,
     pub(super) wrap_width: Option<Pixels>,
+    /// `Document::folds_gen`. A fold toggle moves neither the caret nor the
+    /// content, so without it `za` would render as a cache hit and nothing
+    /// would happen on screen.
+    pub(super) folds: u64,
 }
 
 /// The last row build: what it was built from, its rows, the caret's row,
@@ -132,6 +141,41 @@ pub(super) struct RowCtx {
     /// line binary-search its own slice of them.
     pub(super) search_ranges: Rc<Vec<(usize, usize)>>,
     pub(super) num_width: usize,
+    /// Closed folds as inclusive `(header, last_hidden)` line ranges, sorted
+    /// and disjoint — see `Document::folds`.
+    pub(super) folds: Vec<(usize, usize)>,
+}
+
+impl RowCtx {
+    /// The closed fold covering `line`, if any. Ranges are sorted and disjoint,
+    /// so the last one starting at or before `line` is the only candidate.
+    pub(super) fn fold_at(&self, line: usize) -> Option<(usize, usize)> {
+        let i = self.folds.partition_point(|&(s, _)| s <= line).checked_sub(1)?;
+        let (start, end) = self.folds[i];
+        (line <= end).then_some((start, end))
+    }
+
+    /// `line`'s fold header, or `line` itself when no closed fold covers it.
+    pub(super) fn fold_start(&self, line: usize) -> usize {
+        self.fold_at(line).map_or(line, |(start, _)| start)
+    }
+
+    fn display_index(&self, line: usize) -> usize {
+        display_index(&self.folds, line)
+    }
+}
+
+/// `line`'s index in the fold-collapsed sequence — what relative line numbers
+/// count in, so a closed fold counts once and a line it hides shares its
+/// header's index. Folds are few and sorted, so a walk beats carrying a
+/// per-line table.
+pub(super) fn display_index(folds: &[(usize, usize)], line: usize) -> usize {
+    let hidden: usize = folds
+        .iter()
+        .take_while(|&&(start, _)| start < line)
+        .map(|&(start, end)| end.min(line) - start)
+        .sum();
+    line - hidden
 }
 
 /// Wrap boundaries for lines that need real shaping (non-ASCII, tabs, bold
@@ -304,6 +348,7 @@ impl Editor {
         });
 
         let num_width = rope.len_lines().to_string().len().max(3);
+        let folds = self.doc().folds().to_vec();
         let reveal_fences = fence_block(&spans, cur_line);
         // Ready the per-line form cache for this build. The dirty line is proved
         // against *this* cache's revision, so a cache that fell more than one
@@ -331,6 +376,7 @@ impl Editor {
             sel_lines,
             search_ranges,
             num_width,
+            folds,
         }
     }
 
@@ -378,6 +424,23 @@ impl Editor {
         window: &mut Window,
         out: &mut Vec<LineElement>,
     ) -> Option<usize> {
+        // A line hidden by a closed fold emits no rows at all, so
+        // `line_rows[i] == 0`. Every row↔line walk in the editor already
+        // advances past zero-row lines, and `sum(line_rows[..line])` maps a
+        // hidden line onto its header's row — both directions round-trip
+        // untouched. The header renders below like any other heading; the
+        // gutter's `▸` is the only thing that marks it.
+        let fold = ctx.fold_at(i);
+        if fold.is_some_and(|(start, _)| i > start) {
+            return None;
+        }
+        // A caret parked inside this fold — incsearch preview drags it there
+        // while typing — has no row of its own, so the header row answers for
+        // it. Without this `cur_row` keeps its initial 0 and the view snaps to
+        // the top of the document. Both exits below report it.
+        let caret_in_fold =
+            fold.filter(|&(start, end)| (start..=end).contains(&ctx.cur_line)).map(|_| 0);
+
         // Order matters here: everything the cache check needs is computed
         // first, and it is all O(1)-ish. `line_text` and `flatten` sit *below*
         // the check, because they are the two most expensive steps and a cache
@@ -424,7 +487,9 @@ impl Editor {
                 i,
                 LineForm { text, segments, metrics: (scale, pad), decor, row_starts },
             );
-            return None; // never the cursor line, so no caret row to report
+            // Never the cursor line, so the only caret it can own is one hidden
+            // inside the fold it heads.
+            return caret_in_fold;
         }
 
         // Cache miss (or an uncacheable line): the full per-line pipeline.
@@ -567,7 +632,9 @@ impl Editor {
             self.line_forms
                 .put(i, LineForm { text, segments, metrics: (scale, pad), decor, row_starts });
         }
-        caret_at
+        // `caret_at` already holds the real row when the caret is on the header
+        // itself; otherwise the header answers for a caret hidden in its fold.
+        caret_at.or(caret_in_fold)
     }
 
     /// Slice one line's display form into visual rows and push them onto `out`,
@@ -634,10 +701,14 @@ impl Editor {
             // move never invalidates a cached row (see `Gutter`).
             let gutter = (self.line_numbers != LineNumbers::Off).then(|| Gutter {
                 line: i,
+                rel: ctx.display_index(i),
+                // Only a fold header reaches here — hidden lines emit no rows.
+                folded: ctx.fold_at(i).is_some(),
                 continuation: k > 0,
                 width: ctx.num_width,
                 relative: self.line_numbers == LineNumbers::Relative,
                 cur_line: self.cur_line.clone(),
+                cur_rel: self.cur_rel.clone(),
             });
             out.push(LineElement {
                 text: text[b0..b1].to_string().into(),
@@ -739,6 +810,9 @@ pub(super) fn content_change_is_local(old: &RowsKey, new: &RowsKey) -> bool {
         && old.sel.is_none()
         && new.sel.is_none()
         && old.q == new.q
+        // A fold toggle hides or reveals a span of lines and renumbers every
+        // relative label below it — nothing local about it.
+        && old.folds == new.folds
 }
 
 /// Greedy word wrap for plain ASCII text in a monospace font: row-start byte
@@ -837,6 +911,7 @@ mod tests {
             sel,
             q: q.to_string(),
             wrap_width: Some(px(400.)),
+            folds: 0,
         };
 
         // No search: a caret move patches, as before.
@@ -855,10 +930,44 @@ mod tests {
         // columns while cached rows kept the old ones.
         let sel = Some((3, 7));
         assert!(!content_change_is_local(&key(1, 0, "", sel), &key(2, 1, "", sel)));
+        // A fold toggle moves neither caret nor content, so only the fold
+        // generation separates the two keys — and it must force a rebuild, or
+        // `za` would render as a cache hit and nothing would happen.
+        let mut folded = key(1, 0, "", None);
+        folded.folds = 1;
+        assert!(!caret_only_change(&key(1, 0, "", None), &folded));
+        assert!(!content_change_is_local(&key(1, 0, "", None), &folded));
         // Anything else that changes row content still forces a full rebuild.
         let mut wide = key(1, 9, "", None);
         wide.wrap_width = Some(px(500.));
         assert!(!caret_only_change(&key(1, 0, "", None), &wide));
+    }
+
+    #[test]
+    fn display_index_counts_a_closed_fold_once() {
+        use super::display_index;
+        // Two closed folds: lines 2–5 and 10–12 hidden behind their headers.
+        let folds = [(2usize, 5usize), (10, 12)];
+
+        // Before any fold, display index is the line itself.
+        assert_eq!(display_index(&folds, 0), 0);
+        assert_eq!(display_index(&folds, 2), 2);
+        // A hidden line shares its header's index — a caret dragged inside a
+        // fold labels the gutter as if it were on the header.
+        assert_eq!(display_index(&folds, 3), 2);
+        assert_eq!(display_index(&folds, 5), 2);
+        // Past the fold, every line shifts up by the 3 lines it hides.
+        assert_eq!(display_index(&folds, 6), 3);
+        assert_eq!(display_index(&folds, 10), 7);
+        // Both folds discount: 3 + 2 hidden lines by the time we're past them.
+        assert_eq!(display_index(&folds, 13), 8);
+
+        // The distance the gutter shows is the difference of two of these, and
+        // it must equal the number of `j` presses: from line 0 to line 13 the
+        // display lines are 0, 1, 2(fold), 6, 7, 8, 9, 10(fold), 13.
+        assert_eq!(display_index(&folds, 13) - display_index(&folds, 0), 8);
+        // No folds: unchanged from plain line numbering.
+        assert_eq!(display_index(&[], 42), 42);
     }
 
     #[test]
