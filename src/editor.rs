@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, hsla, prelude::*, px, svg, uniform_list, App, ClipboardItem, Context, Div, FocusHandle,
@@ -60,6 +60,10 @@ const SIDEBAR_WIDTH: f32 = 330.;
 // 200ms ever feels laggy.
 const FS_POLL_INTERVAL_MS: u64 = 200;
 
+/// Window for a tab double-click (pins a preview tab). Matches the 400ms
+/// gpui's Linux backends use for their own click counting.
+const DOUBLE_CLICK_MS: u64 = 400;
+
 /// Which pane keystrokes drive. One entity owns both panes and a single focus
 /// handle, so switching is a routing flag, not a GPUI focus change.
 #[derive(Clone, Copy, PartialEq)]
@@ -94,6 +98,8 @@ pub struct Editor {
     /// Previously active buffer — the `Ctrl-6` / `:b #` target. Re-pointed
     /// when a `:bd` shifts indices.
     alternate: Option<usize>,
+    /// Tab index and time of the last tabline click, for double-click detection.
+    last_tab_click: Option<(usize, Instant)>,
     vim: Vim,
     /// The last completed change as its emitted actions — what `.` replays.
     /// A change that entered insert mode carries the whole insert session
@@ -358,6 +364,7 @@ impl Editor {
             buffers,
             active,
             alternate: None,
+            last_tab_click: None,
             vim,
             last_change: None,
             pending_change: None,
@@ -1090,12 +1097,24 @@ impl Editor {
                             .text_color(if dirty { fg } else { hsla(0., 0., 0., 0.) })
                             .child("●"),
                     )
-                    .on_mouse_up(MouseButton::Left, move |ev: &MouseUpEvent, window, cx| {
+                    .on_mouse_up(MouseButton::Left, move |_ev: &MouseUpEvent, window, cx| {
                         switch.update(cx, |this, cx| {
+                            // Second click on the same tab within the window pins
+                            // a preview tab (VS Code): the next open appends a tab
+                            // instead of replacing it. Timed here rather than read
+                            // from `MouseUpEvent::click_count`, which never pinned
+                            // under WSLg — the same reason the key-repeat cadence
+                            // is app-driven.
+                            let now = Instant::now();
+                            let double = this.last_tab_click.replace((i, now)).is_some_and(
+                                |(prev, at)| {
+                                    prev == i
+                                        && now.duration_since(at)
+                                            < Duration::from_millis(DOUBLE_CLICK_MS)
+                                },
+                            );
                             this.activate(i, window);
-                            // Double-click pins a preview tab (VS Code): the
-                            // next open appends a tab instead of replacing it.
-                            if ev.click_count >= 2 {
+                            if double {
                                 this.buffers[i].preview = false;
                             }
                             cx.notify();
