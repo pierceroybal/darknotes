@@ -1021,6 +1021,13 @@ impl Editor {
         // survive at 1px.
         let mut sep = theme.muted;
         sep.a *= 0.4;
+        // Same-name disambiguator, dimmer than `muted` so it reads as a hint
+        // beside the filename on inactive tabs too, where the name is already
+        // muted.
+        let mut hint_fg = theme.muted;
+        hint_fg.a *= 0.7;
+        let paths: Vec<Option<&Path>> = self.buffers.iter().map(|b| b.doc.path()).collect();
+        let hints = tab_hints(&self.vault.root, &paths);
         div()
             .flex()
             .flex_row()
@@ -1069,6 +1076,11 @@ impl Editor {
                         // a crowded tab row shrinks tabs, never the layout
                         div().min_w_0().truncate().child(format!("{}: {name}", i + 1)),
                     )
+                    // After the name and shrinkable, so a crowded strip clips
+                    // the hint rather than the filename it qualifies.
+                    .when_some(hints[i].clone(), |d, hint| {
+                        d.child(div().min_w_0().truncate().ml_1().text_color(hint_fg).child(hint))
+                    })
                     // The dirty dot is always laid out — transparent when
                     // clean — so saving never shifts the tab's width.
                     .child(
@@ -1078,9 +1090,14 @@ impl Editor {
                             .text_color(if dirty { fg } else { hsla(0., 0., 0., 0.) })
                             .child("●"),
                     )
-                    .on_mouse_up(MouseButton::Left, move |_ev: &MouseUpEvent, window, cx| {
+                    .on_mouse_up(MouseButton::Left, move |ev: &MouseUpEvent, window, cx| {
                         switch.update(cx, |this, cx| {
                             this.activate(i, window);
+                            // Double-click pins a preview tab (VS Code): the
+                            // next open appends a tab instead of replacing it.
+                            if ev.click_count >= 2 {
+                                this.buffers[i].preview = false;
+                            }
                             cx.notify();
                         });
                     })
@@ -2402,11 +2419,49 @@ fn display_to_source(map: &[usize], display_byte: usize) -> usize {
     map.partition_point(|&m| m <= display_byte).saturating_sub(1)
 }
 
+/// Per-buffer disambiguator for the tab strip, one entry per `paths`: `None`
+/// while a file's basename is unique among the open buffers (or the buffer is
+/// unnamed — tab numbers already tell two `[No Name]`s apart), else the folder
+/// that tells it apart: the parent's name, or the whole vault-relative parent
+/// path when two same-named files also sit under same-named parents. `/` is the
+/// vault root.
+fn tab_hints(root: &Path, paths: &[Option<&Path>]) -> Vec<Option<String>> {
+    // (basename, short hint, full hint) per named buffer.
+    let parts: Vec<Option<(String, String, String)>> = paths
+        .iter()
+        .map(|path| {
+            let path = (*path)?;
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let parent = path.parent().unwrap_or(Path::new(""));
+            let rel = parent.strip_prefix(root).unwrap_or(parent);
+            let full = rel.to_string_lossy().replace('\\', "/");
+            let short = full.rsplit('/').next().unwrap_or_default().to_string();
+            let or_root = |s: String| if s.is_empty() { "/".to_string() } else { s };
+            Some((name, or_root(short), or_root(full)))
+        })
+        .collect();
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    let mut shorts: HashMap<(&str, &str), usize> = HashMap::new();
+    for (name, short, _) in parts.iter().flatten() {
+        *names.entry(name).or_default() += 1;
+        *shorts.entry((name, short)).or_default() += 1;
+    }
+    parts
+        .iter()
+        .map(|p| {
+            let (name, short, full) = p.as_ref()?;
+            let hint = if shorts[&(name.as_str(), short.as_str())] > 1 { full } else { short };
+            (names[name.as_str()] > 1).then(|| hint.clone())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::display_to_source;
+    use super::{display_to_source, tab_hints};
     use crate::markdown;
     use ropey::Rope;
+    use std::path::Path;
 
     #[test]
     fn display_to_source_lands_on_kept_bytes() {
@@ -2421,5 +2476,19 @@ mod tests {
         assert_eq!(display_to_source(&c.map, 0), 2);
         assert_eq!(display_to_source(&c.map, 4), 6);
         assert_eq!(display_to_source(&c.map, 5), 7);
+    }
+
+    #[test]
+    fn tab_hints_only_disambiguate_collisions() {
+        let root = Path::new("/v");
+        // Unique basenames — and unnamed buffers — get no hint.
+        let unique = [Some(Path::new("/v/a/STATE.md")), Some(Path::new("/v/b/notes.md")), None];
+        assert_eq!(tab_hints(root, &unique), [None, None, None]);
+        // Colliding names: the parent folder, `/` for a file at the vault root.
+        let flat = [Some(Path::new("/v/alpha/STATE.md")), Some(Path::new("/v/STATE.md"))];
+        assert_eq!(tab_hints(root, &flat), [Some("alpha".into()), Some("/".into())]);
+        // Same name *and* same parent name: the whole vault-relative parent.
+        let deep = [Some(Path::new("/v/a/sub/STATE.md")), Some(Path::new("/v/b/sub/STATE.md"))];
+        assert_eq!(tab_hints(root, &deep), [Some("a/sub".into()), Some("b/sub".into())]);
     }
 }
