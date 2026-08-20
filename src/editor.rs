@@ -29,7 +29,7 @@ use buffers::{
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
     caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, CaretPaint,
-    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
+    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD, QUOTE_PAD,
 };
 use picker::Picker;
 use row_list::row_list;
@@ -711,8 +711,8 @@ impl Editor {
         }
 
         // x → byte within this row's display text, mirroring paint's origin:
-        // past the gutter, inset when the row sits in a code band, shifted by
-        // the horizontal scroll.
+        // past the gutter, inset when the row carries a decoration (code band,
+        // quote bar), shifted by the horizontal scroll.
         let font = gpui::font(self.font_family.clone());
         let font_size = px(self.font_size);
         let theme = *cx.global::<Theme>();
@@ -726,6 +726,7 @@ impl Editor {
         });
         let pad = match el.decor {
             Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
+            Some(RowDecor::QuoteBar) => QUOTE_PAD,
             _ => Pixels::ZERO,
         };
         let runs = segments_to_runs(&el.text, &el.segments, &font, theme.foreground, &theme);

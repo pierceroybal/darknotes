@@ -246,7 +246,11 @@ impl ScanState {
             spans.push(Span { range: indent..marker_end, kind: SpanKind::Marker });
         } else if trimmed.starts_with('>') {
             spans.push(Span { range: 0..len, kind: SpanKind::BlockQuote });
-            spans.push(Span { range: indent..indent + 1, kind: SpanKind::Marker });
+            // Marker spans the `>` plus the one space after it, so every row of
+            // a concealed quote starts flush left — the painted bar's clearance
+            // is a paint inset, uniform across a wrapped line's rows.
+            let marker_end = (indent + 2).min(len);
+            spans.push(Span { range: indent..marker_end, kind: SpanKind::Marker });
         } else if let Some(marker_len) = list_marker(trimmed) {
             spans.push(Span { range: 0..len, kind: SpanKind::ListItem });
             spans.push(Span { range: indent..indent + marker_len, kind: SpanKind::Marker });
@@ -334,23 +338,41 @@ pub fn ordered_item(line: &str) -> Option<(u64, usize)> {
 }
 
 /// How a smart newline should treat the line under the caret. The vim grammar
-/// can't see buffer text, so list continuation is decided here.
+/// can't see buffer text, so prefix continuation is decided here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListContinuation {
-    /// Not a list item — a plain newline.
+    /// No carrying prefix — a plain newline.
     Plain,
-    /// A list item. `prefix` (indent + marker + space) carries onto the next
-    /// line; `empty` means the item had no content, so the caller may clear the
-    /// marker instead of repeating it.
+    /// A line whose prefix carries: a list marker, a blockquote `>`, or both.
+    /// `prefix` lands on the next line; `empty` means nothing followed it, so
+    /// the caller may clear the prefix instead of repeating it.
     Item { prefix: String, empty: bool },
 }
 
-/// Decide how Enter / `o` continues a markdown list from `line` (newline
+/// Decide how Enter / `o` continues the markdown line `line` (newline
 /// stripped). Ordered markers increment (`1.` → `2.`); unordered repeat the
 /// bullet. A task box counts as part of the marker: it carries onto the next
-/// line always unchecked, and doesn't count as item content.
-pub fn list_continuation(line: &str) -> ListContinuation {
+/// line always unchecked, and doesn't count as item content. A blockquote `>`
+/// carries too, wrapping whatever the quote holds — a nested quote or a list
+/// inside one continues as itself.
+pub fn line_continuation(line: &str) -> ListContinuation {
     let trimmed = line.trim_start();
+    // Blockquote: peel the `>` and the one space after it (when present) and
+    // continue the quoted line, so the prefix mirrors the source's own style.
+    if trimmed.starts_with('>') {
+        let at = (line.len() - trimmed.len())
+            + 1
+            + usize::from(trimmed.as_bytes().get(1) == Some(&b' '));
+        let (head, body) = line.split_at(at);
+        return match line_continuation(body) {
+            ListContinuation::Item { prefix, empty } => {
+                ListContinuation::Item { prefix: format!("{head}{prefix}"), empty }
+            }
+            ListContinuation::Plain => {
+                ListContinuation::Item { prefix: head.to_string(), empty: body.trim().is_empty() }
+            }
+        };
+    }
     let Some(marker_len) = list_marker(trimmed) else {
         return ListContinuation::Plain;
     };
@@ -951,10 +973,11 @@ mod tests {
             let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
             assert_eq!(conceal(line, &segs).text, line);
         }
-        // The `>` conceals — a painted bar replaces it at render time.
+        // The `>` and its space conceal — a painted bar replaces them, and the
+        // text's clearance from it is a paint inset (see `QUOTE_PAD`).
         let line = "> quote";
         let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
-        assert_eq!(conceal(line, &segs).text, " quote");
+        assert_eq!(conceal(line, &segs).text, "quote");
     }
 
     #[test]
@@ -1253,36 +1276,58 @@ mod tests {
     }
 
     #[test]
-    fn list_continuation_cases() {
+    fn line_continuation_cases() {
         use ListContinuation::*;
-        assert_eq!(list_continuation("plain text"), Plain);
+        assert_eq!(line_continuation("plain text"), Plain);
         assert_eq!(
-            list_continuation("  - item"),
+            line_continuation("  - item"),
             Item { prefix: "  - ".into(), empty: false }
         );
         // Ordered markers increment and keep their punctuation.
         assert_eq!(
-            list_continuation("3) item"),
+            line_continuation("3) item"),
             Item { prefix: "4) ".into(), empty: false }
         );
         // An empty item is flagged so Enter can clear it.
         assert_eq!(
-            list_continuation("- "),
+            line_continuation("- "),
             Item { prefix: "- ".into(), empty: true }
         );
         // Tasks continue as tasks, always unchecked; the box isn't content.
         assert_eq!(
-            list_continuation("- [x] done"),
+            line_continuation("- [x] done"),
             Item { prefix: "- [ ] ".into(), empty: false }
         );
         assert_eq!(
-            list_continuation("  2. [ ] a"),
+            line_continuation("  2. [ ] a"),
             Item { prefix: "  3. [ ] ".into(), empty: false }
         );
         for line in ["- [ ] ", "- [ ]"] {
             assert_eq!(
-                list_continuation(line),
+                line_continuation(line),
                 Item { prefix: "- [ ] ".into(), empty: true },
+                "{line}"
+            );
+        }
+        // A blockquote prefix carries, mirroring the source's own spacing, and
+        // wraps whatever it holds: a nested quote or a list inside it.
+        assert_eq!(
+            line_continuation("> quote"),
+            Item { prefix: "> ".into(), empty: false }
+        );
+        assert_eq!(line_continuation(">no space"), Item { prefix: ">".into(), empty: false });
+        assert_eq!(
+            line_continuation("  >> deep"),
+            Item { prefix: "  >> ".into(), empty: false }
+        );
+        assert_eq!(
+            line_continuation("> - [ ] task"),
+            Item { prefix: "> - [ ] ".into(), empty: false }
+        );
+        // Empty at every level, so Enter can clear it.
+        for line in ["> ", ">", "> - "] {
+            assert!(
+                matches!(line_continuation(line), Item { empty: true, .. }),
                 "{line}"
             );
         }

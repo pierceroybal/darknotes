@@ -397,11 +397,13 @@ impl Element for LineElement {
         // offset; clip to the area right of the gutter so left-overflow stops at
         // the gutter and right-overflow stops at the pane edge.
         let text_origin_x = bounds.origin.x + prepaint.gutter_w;
-        // Code rows inset all their content (text, caret, highlights) by
-        // CODE_MARGIN + CODE_PAD so it clears the band border; wrap width
-        // shrank to match in `append_line_rows`.
+        // Decorated rows inset all their content (text, caret, highlights):
+        // code rows by CODE_MARGIN + CODE_PAD so it clears the band border,
+        // quote rows by QUOTE_PAD so it clears the bar. Wrap width shrank to
+        // match in `append_line_rows`.
         let pad = match self.decor {
             Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
+            Some(RowDecor::QuoteBar) => QUOTE_PAD,
             _ => Pixels::ZERO,
         };
         let ox = text_origin_x + pad - self.scroll_x.get();
@@ -607,7 +609,9 @@ pub(super) enum RowDecor {
     /// close the border and round its corners; `append_line_rows` further
     /// restricts them to the first/last visual row of a wrapped line.
     CodeBand { top: bool, bottom: bool },
-    /// 3px bar at the left edge of a blockquote line (its `>` conceals).
+    /// 3px bar at the left edge of a blockquote line. The `>` and the space
+    /// after it conceal, and the row's text is inset `QUOTE_PAD` to clear the
+    /// bar — every visual row of a wrapped quote alike.
     QuoteBar,
     /// Hairline across the row replacing a `---`/`***`/`___` line.
     Rule,
@@ -620,6 +624,11 @@ pub(super) const CODE_MARGIN: Pixels = px(8.);
 /// sits `CODE_MARGIN + CODE_PAD` from the pane edge; wrap width shrinks by
 /// twice that sum for band lines, keeping wrapped rows inside the border.
 pub(super) const CODE_PAD: Pixels = px(8.);
+
+/// Text inset on a blockquote row, clearing the 3px bar. Uniform across a
+/// wrapped line's rows — the `>` and its space both conceal, so no row carries
+/// an inset of its own — and wrap width shrinks by it.
+pub(super) const QUOTE_PAD: Pixels = px(8.);
 
 /// Decoration for line `line`, from its spans. The scanner pushes a line's
 /// role span first, so the leading span's kind decides — which also covers

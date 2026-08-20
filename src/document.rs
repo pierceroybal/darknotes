@@ -456,8 +456,8 @@ impl Document {
         self.last_edit = None;
     }
 
-    /// Whether markdown-aware editing conveniences (list continuation, list-line
-    /// Tab, span styling) apply: true for `.md` files and pathless scratch
+    /// Whether markdown-aware editing conveniences (prefix continuation,
+    /// list-line Tab, span styling) apply: true for `.md` files and pathless scratch
     /// buffers (no file yet, destined to become a note), false for any other
     /// real extension.
     pub fn is_markdown(&self) -> bool {
@@ -754,12 +754,12 @@ impl Document {
         self.set_caret(at + added);
     }
 
-    /// Smart newline: continue a markdown list when the caret's line is a list
-    /// item, else a plain newline. The list prefix lands at the caret, so the
-    /// text after it follows the new marker (splitting an item mid-line works).
-    /// `clear_empty` (Enter, not `o`) steps an empty item out of the list
-    /// instead of repeating its marker: an indented item dedents by `width`
-    /// (one level per press, marker kept), a top-level one erases the marker,
+    /// Smart newline: carry the caret line's markdown prefix — a list marker or
+    /// a blockquote `>` — onto the new line, else a plain newline. The prefix
+    /// lands at the caret, so text after it follows the new marker (splitting an
+    /// item mid-line works). `clear_empty` (Enter, not `o`) steps an empty item
+    /// out instead of repeating its prefix: an indented item dedents by `width`
+    /// (one level per press, marker kept), an unindented one erases the prefix,
     /// leaving the empty line.
     pub fn insert_newline(&mut self, clear_empty: bool, width: usize) {
         if !self.is_markdown() {
@@ -768,7 +768,7 @@ impl Document {
         }
         let (line, _) = self.line_col_of(self.caret());
         let text: String = self.rope.line(line).chars().filter(|&c| c != '\n').collect();
-        match markdown::list_continuation(&text) {
+        match markdown::line_continuation(&text) {
             ListContinuation::Item { empty, .. } if empty && clear_empty => {
                 if text.starts_with(' ') {
                     self.indent(width, true);
@@ -3187,6 +3187,32 @@ mod tests {
         d.move_motion(Motion::LineEnd, 1);
         d.insert_newline(false, 2);
         assert_eq!(d.rope.to_string(), "  - \n  - ");
+    }
+
+    #[test]
+    fn smart_newline_carries_quote_prefix() {
+        // A quote continues like a list item, and a list inside it carries too.
+        let mut d = Document::new("> quoted");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "> quoted\n> ");
+        assert_eq!(d.caret_line_col(), (1, 2));
+
+        // Enter on the empty quote drops back to plain text.
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "> quoted\n");
+
+        // Mid-line: the prefix lands at the caret, so the tail stays quoted.
+        let mut d = Document::new("> one two");
+        d.jump_to(6);
+        d.insert_newline(true, 2);
+        assert_eq!(d.rope.to_string(), "> one \n> two");
+
+        // `o` (clear_empty=false) repeats an empty quote instead of clearing it.
+        let mut d = Document::new("> - a");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_newline(false, 2);
+        assert_eq!(d.rope.to_string(), "> - a\n> - ");
     }
 
     #[test]

@@ -50,7 +50,7 @@ use crate::vim::Mode;
 
 use super::{
     caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, Editor,
-    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
+    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD, QUOTE_PAD,
 };
 
 /// Everything the editor's row list is built from, beyond session constants
@@ -123,6 +123,9 @@ pub(super) struct RowCtx {
     /// `mono_cols` shrunk by the `CODE_MARGIN + CODE_PAD` text inset — the
     /// column budget for code-band lines, which wrap inside the band's border.
     pub(super) mono_band_cols: Option<usize>,
+    /// `mono_cols` shrunk by `QUOTE_PAD` — the budget for blockquote lines,
+    /// whose text is inset past the painted bar.
+    pub(super) mono_quote_cols: Option<usize>,
     pub(super) mode: Mode,
     /// View posture: no line reveals its source, the cursor line included.
     pub(super) view: bool,
@@ -188,9 +191,15 @@ pub(super) fn display_index(folds: &[(usize, usize)], line: usize) -> usize {
 #[derive(Default)]
 pub(super) struct ShapeWrapCache {
     width: Pixels,
-    cur: HashMap<(String, Vec<Segment>), Vec<usize>>,
-    prev: HashMap<(String, Vec<Segment>), Vec<usize>>,
+    cur: HashMap<WrapKey, Vec<usize>>,
+    prev: HashMap<WrapKey, Vec<usize>>,
 }
+
+/// Display text, its segments, and the row's text-inset class (0 none, 1 code
+/// band, 2 quote). The inset is part of the key because the same text at two
+/// insets wraps at two different widths — `> **bold**` and `**bold**` conceal
+/// to identical text and segments.
+type WrapKey = (String, Vec<Segment>, u8);
 
 /// Everything about a row build that depends only on the line's text and spans:
 /// its concealed display form, heading metrics, block decoration, and wrap
@@ -288,7 +297,7 @@ impl ShapeWrapCache {
     }
 
     /// Look up boundaries, promoting a previous-generation hit.
-    fn get(&mut self, key: &(String, Vec<Segment>)) -> Option<Vec<usize>> {
+    fn get(&mut self, key: &WrapKey) -> Option<Vec<usize>> {
         if let Some(v) = self.cur.get(key) {
             return Some(v.clone());
         }
@@ -335,7 +344,7 @@ impl Editor {
         // ('i' and 'M' advance alike ⇒ monospace); the per-line gate in
         // `append_line_rows` keeps the exact shaped path for anything the
         // walk can't promise.
-        let mono: Option<(usize, usize)> = wrap_width.and_then(|w| {
+        let mono: Option<(usize, usize, usize)> = wrap_width.and_then(|w| {
             let advance = |s: &'static str| {
                 let runs = [run(&font, 1, theme.foreground)];
                 window.text_system().shape_line(s.into(), font_size, &runs, None).width
@@ -343,7 +352,7 @@ impl Editor {
             let (iw, mw) = (advance("i"), advance("M"));
             ((iw - mw).abs() < px(0.01) && iw > Pixels::ZERO).then(|| {
                 let cols = |w: Pixels| ((w / iw) as usize).max(1);
-                (cols(w), cols(w - (CODE_MARGIN + CODE_PAD) * 2.))
+                (cols(w), cols(w - (CODE_MARGIN + CODE_PAD) * 2.), cols(w - QUOTE_PAD))
             })
         });
 
@@ -365,8 +374,9 @@ impl Editor {
             font_size,
             line_h: self.line_h(),
             wrap_width,
-            mono_cols: mono.map(|(c, _)| c),
-            mono_band_cols: mono.map(|(_, c)| c),
+            mono_cols: mono.map(|(c, ..)| c),
+            mono_band_cols: mono.map(|(_, c, _)| c),
+            mono_quote_cols: mono.map(|(.., c)| c),
             mode,
             view: self.vim.view,
             cur_line,
@@ -557,13 +567,19 @@ impl Editor {
         let row_starts: Vec<usize> = match ctx.wrap_width {
             None => vec![0],
             Some(w) => {
-                // Code-band text is inset by CODE_MARGIN + CODE_PAD per side
-                // (paint shifts it right); wrap inside the inset width — a
-                // reduced column budget on the mono walk, a reduced pixel
-                // width when shaping — so wrapped rows stay clear of the
-                // band's right border.
-                let band = matches!(decor, Some(RowDecor::CodeBand { .. }));
-                let w = if band { w - (CODE_MARGIN + CODE_PAD) * 2. } else { w };
+                // A decorated row's text is inset by paint — a code band by
+                // CODE_MARGIN + CODE_PAD per side, a quote by QUOTE_PAD on the
+                // left — so wrap inside the inset width: a reduced column
+                // budget on the mono walk, a reduced pixel width when shaping.
+                // Otherwise wrapped rows spill past the band's right border or
+                // the pane edge.
+                let (w, mono_cols, inset) = match decor {
+                    Some(RowDecor::CodeBand { .. }) => {
+                        (w - (CODE_MARGIN + CODE_PAD) * 2., ctx.mono_band_cols, 1)
+                    }
+                    Some(RowDecor::QuoteBar) => (w - QUOTE_PAD, ctx.mono_quote_cols, 2),
+                    _ => (w, ctx.mono_cols, 0),
+                };
                 let plain = text.is_ascii()
                     && !text.contains('\t')
                     && segments.iter().all(|s| {
@@ -572,10 +588,10 @@ impl Editor {
                             Some(SpanKind::Heading(_) | SpanKind::Strong | SpanKind::Emphasis)
                         )
                     });
-                match if band { ctx.mono_band_cols } else { ctx.mono_cols } {
+                match mono_cols {
                     Some(cols) if plain => wrap_columns(&text, cols),
                     _ => {
-                        let key = (text.clone(), segments.clone());
+                        let key = (text.clone(), segments.clone(), inset);
                         match self.wrap_cache.get(&key) {
                             Some(starts) => starts,
                             None => {
