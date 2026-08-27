@@ -1552,7 +1552,19 @@ impl Editor {
             Action::InsertText(s) => self.doc_mut().insert(&s),
             Action::Newline { clear_empty } => {
                 let width = self.vim.tab_width;
-                self.doc_mut().insert_newline(clear_empty, width);
+                // Enter at the end of an unclosed opening fence pairs the closer
+                // below and lands between the two. Whether the fence is unclosed
+                // is a parse question, so it is answered here — the document has
+                // no spans.
+                let (line, col) = self.doc().caret_line_col();
+                let text = line_text(&self.doc().rope, line);
+                let closer = (self.doc().is_markdown() && col == text.chars().count())
+                    .then(|| markdown::fence_to_close(&self.spans(), &text, line))
+                    .flatten();
+                match closer {
+                    Some(c) => self.doc_mut().insert_fence_close(&c),
+                    None => self.doc_mut().insert_newline(clear_empty, width),
+                }
             }
             Action::Tab { width, dedent } => self.doc_mut().indent(width, dedent),
             Action::DeleteBackward => self.doc_mut().delete_backward(),

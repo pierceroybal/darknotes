@@ -787,6 +787,17 @@ impl Document {
         }
     }
 
+    /// Enter at the end of an unclosed opening fence: drop `closer` two lines
+    /// down and leave the caret on the empty line between the two, so the fence
+    /// is typed once. Whether to is the caller's call — the parse answers it
+    /// (`markdown::fence_to_close`), and this layer has no spans.
+    pub fn insert_fence_close(&mut self, closer: &str) {
+        let at = self.caret();
+        self.rope.insert(at, &format!("\n\n{closer}"));
+        self.touch(); // crosses newlines: whole-document reparse
+        self.set_caret(at + 1);
+    }
+
     /// Insert-mode Tab (`dedent` = Shift-Tab). On a list item, Tab shifts the
     /// whole line right by `width` spaces and Shift-Tab outdents it — so a bullet
     /// nests regardless of caret column, the caret riding with the content. Off a
@@ -3187,6 +3198,15 @@ mod tests {
         d.move_motion(Motion::LineEnd, 1);
         d.insert_newline(false, 2);
         assert_eq!(d.rope.to_string(), "  - \n  - ");
+    }
+
+    #[test]
+    fn insert_fence_close_lands_between_the_fences() {
+        let mut d = Document::new("```rust");
+        d.move_motion(Motion::LineEnd, 1);
+        d.insert_fence_close("```");
+        assert_eq!(d.rope.to_string(), "```rust\n\n```");
+        assert_eq!(d.caret_line_col(), (1, 0));
     }
 
     #[test]

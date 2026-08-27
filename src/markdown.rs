@@ -203,7 +203,7 @@ impl ScanState {
 
         // Fenced code: ``` / ~~~ toggles; lines between are code text. No inline
         // scan inside — its contents are literal.
-        let is_fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        let is_fence = fence_marker(text).is_some();
         if self.in_fence {
             let kind = if is_fence { SpanKind::CodeFence } else { SpanKind::CodeText };
             spans.push(Span { range: 0..len, kind });
@@ -309,6 +309,18 @@ pub fn is_list_item(line: &str) -> bool {
     list_marker(line.trim_start()).is_some()
 }
 
+/// The fence marker opening `line` (newline stripped): its indent plus the run
+/// of ``` / ~~~, or `None` when the line isn't a fence. The whole run comes
+/// back so a generated closer can match the opener's length. Shared by the span
+/// scanner and the smart newline that pairs a closing fence.
+pub fn fence_marker(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let b = trimmed.as_bytes();
+    let c = *b.first().filter(|&&c| c == b'`' || c == b'~')?;
+    let run = b.iter().take_while(|&&x| x == c).count(); // ASCII: bytes are chars
+    (run >= 3).then(|| &line[..(line.len() - trimmed.len()) + run])
+}
+
 /// The GFM task box on `line` (newline stripped): byte offset of its `[` and
 /// the checked state. A box is `[ ]`/`[x]`/`[X]` directly after a list
 /// marker's space, followed by a space or end-of-line. Shared by the span
@@ -389,6 +401,19 @@ pub fn line_continuation(line: &str) -> ListContinuation {
     };
     let box_str = if task { "[ ] " } else { "" };
     ListContinuation::Item { prefix: format!("{indent}{next} {box_str}"), empty }
+}
+
+/// The closing fence a smart newline should pair with `line`, whose text is
+/// `text`: `Some` only when that line opens a fence and the document is still
+/// inside one at EOF, so nothing closes it. The closer mirrors the opener's
+/// indent and marker run, dropping any language tag.
+pub fn fence_to_close(parsed: &Parsed, text: &str, line: usize) -> Option<String> {
+    // `states[i]` is the state *before* line `i`, so `[line + 1]` is what this
+    // line leaves and `last()` is EOF. The marker is what keeps this off the
+    // lines *inside* a fence, which leave `in_fence` set just the same.
+    let opens = parsed.states.get(line + 1)?.in_fence;
+    let unclosed = parsed.states.last()?.in_fence;
+    (opens && unclosed).then(|| fence_marker(text).map(str::to_string)).flatten()
 }
 
 /// Single left-to-right pass for inline `code`, `**strong**`, `*em*`/`_em_`,
@@ -1331,6 +1356,38 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn fence_marker_and_pairing() {
+        // The marker is the indent plus the whole run; a language tag is not part
+        // of it, and two delimiters are not a fence.
+        assert_eq!(fence_marker("```"), Some("```"));
+        assert_eq!(fence_marker("```rust"), Some("```"));
+        assert_eq!(fence_marker("~~~"), Some("~~~"));
+        assert_eq!(fence_marker("````js"), Some("````"));
+        assert_eq!(fence_marker("  ```"), Some("  ```"));
+        for line in ["``", "`` `", "~~text~~", "plain", ""] {
+            assert_eq!(fence_marker(line), None, "{line}");
+        }
+
+        // An opener with nothing closing it is the one case that pairs.
+        let p = parse(&Rope::from_str("a\n```rust\n"));
+        assert_eq!(fence_to_close(&p, "```rust", 1), Some("```".into()));
+        // An indented opener pairs at its own indent.
+        let p = parse(&Rope::from_str("- item\n  ```\n"));
+        assert_eq!(fence_to_close(&p, "  ```", 1), Some("  ```".into()));
+        // A closed block: neither of its fences pairs.
+        let p = parse(&Rope::from_str("```\ncode\n```\nb\n"));
+        assert_eq!(fence_to_close(&p, "```", 0), None);
+        assert_eq!(fence_to_close(&p, "```", 2), None);
+        // A line *inside* an unclosed block leaves `in_fence` set too, so the
+        // marker is what rules it out.
+        let p = parse(&Rope::from_str("```\ncode\n"));
+        assert_eq!(fence_to_close(&p, "code", 1), None);
+        // Frontmatter is frontmatter: a fence inside it never opened one.
+        let p = parse(&Rope::from_str("---\n```\n---\nb\n"));
+        assert_eq!(fence_to_close(&p, "```", 1), None);
     }
 
     #[test]
