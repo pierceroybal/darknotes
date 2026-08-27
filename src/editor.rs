@@ -1960,7 +1960,7 @@ impl Render for Editor {
                 // re-labels every row here without touching one.
                 let t0 = crate::perf::t0();
                 let mut c = self.rows_cache.take().unwrap();
-                let ctx = self.row_ctx(wrap_width, &theme, window);
+                let ctx = self.row_ctx(wrap_width, &theme, window, edited_line);
                 // A caret inside a closed fold is rendered by the fold's header
                 // row, so that is the line to rebuild and to measure `cur_row`
                 // against — the hidden line's own row count is zero, and
@@ -2007,7 +2007,7 @@ impl Render for Editor {
             }
             Plan::Full => {
                 let t0 = crate::perf::t0();
-                let ctx = self.row_ctx(wrap_width, &theme, window);
+                let ctx = self.row_ctx(wrap_width, &theme, window, edited_line);
                 let line_count = ctx.rope.len_lines();
                 let (rows, cur_row, line_rows) = self.build_rows(&ctx, window);
                 let rows = Rc::new(rows);

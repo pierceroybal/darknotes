@@ -309,8 +309,16 @@ impl ShapeWrapCache {
 
 impl Editor {
     /// Assemble the per-build inputs shared by every line. `window` shapes
-    /// the two one-glyph monospace probes.
-    pub(super) fn row_ctx(&mut self, wrap_width: Option<Pixels>, theme: &Theme, window: &mut Window) -> RowCtx {
+    /// the two one-glyph monospace probes. `edited_line` is
+    /// `Editor::spans_for_render`'s verdict — `Some` only when the reparse
+    /// stayed local, which is the same proof the per-line form cache needs.
+    pub(super) fn row_ctx(
+        &mut self,
+        wrap_width: Option<Pixels>,
+        theme: &Theme,
+        window: &mut Window,
+        edited_line: Option<usize>,
+    ) -> RowCtx {
         let spans = self.spans();
         let rope = self.doc().rope.clone(); // ropey clone is cheap (shared, CoW)
         let mode = self.vim.mode;
@@ -359,12 +367,18 @@ impl Editor {
         let num_width = rope.len_lines().to_string().len().max(3);
         let folds = self.doc().folds().to_vec();
         let reveal_fences = fence_block(&spans, cur_line);
-        // Ready the per-line form cache for this build. The dirty line is proved
-        // against *this* cache's revision, so a cache that fell more than one
-        // edit behind is discarded rather than partially trusted.
+        // Ready the per-line form cache for this build. Both proofs are needed:
+        // `edited_line` says the *parse* stayed local (a typed ``` moves a fence
+        // boundary and restyles every line below it), and `single_line_edit`
+        // says this cache sits at the revision immediately before that edit —
+        // the two caches can be at different revisions, since a click hit-test
+        // or a fold op advances the parse alone.
         let revision = self.doc().revision();
-        let forms_dirty =
-            self.doc().single_line_edit(self.line_forms.revision()).map(|e| e.line);
+        let forms_dirty = self
+            .doc()
+            .single_line_edit(self.line_forms.revision())
+            .map(|e| e.line)
+            .filter(|&l| edited_line == Some(l));
         self.line_forms.begin(revision, wrap_width, rope.len_lines(), forms_dirty);
         RowCtx {
             rope,
