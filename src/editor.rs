@@ -489,8 +489,11 @@ impl Editor {
     /// open buffers whose backing file changed (keeping the caret's offset,
     /// clamped, rather than snapping to the top), flag ones whose file was
     /// deleted, warn (never clobber) dirty ones, and rescan the vault tree
-    /// once per batch for anything else (create/delete/rename anywhere under
-    /// the vault root).
+    /// once per batch (create/delete/rename anywhere under the vault root).
+    ///
+    /// A path backing an open buffer needs that rescan too, and only on an
+    /// existence transition: the file appearing or disappearing adds or drops
+    /// a sidebar row, while a plain edit to it leaves the tree alone.
     ///
     /// For a path backing an open buffer, the file is read once and that read
     /// answers everything — existence, and (by hashing against the document's
@@ -525,12 +528,14 @@ impl Editor {
                 let disk = match std::fs::read_to_string(path) {
                     Ok(s) => s,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Already flagged: don't re-warn on every duplicate
-                        // remove event some backends fire for one deletion.
+                        // Already flagged: don't re-warn — or rescan — on
+                        // every duplicate remove event some backends fire for
+                        // one deletion.
                         if !self.buffers[i].doc.is_missing() {
                             self.buffers[i].doc.set_missing(true);
                             let name = self.buffer_display(&self.buffers[i]);
                             self.message = Some(format!("file deleted: {name}"));
+                            tree_changed = true; // its sidebar row went too
                             repaint = true;
                         }
                         continue;
@@ -546,12 +551,16 @@ impl Editor {
                     // content-identical external one). Nothing to report.
                     if self.buffers[i].doc.is_missing() {
                         self.buffers[i].doc.set_missing(false);
+                        tree_changed = true;
                         repaint = true;
                     }
                     continue;
                 }
                 if self.buffers[i].doc.is_dirty() {
-                    self.buffers[i].doc.set_missing(false); // back, even if we won't reload it
+                    // Back, even if we won't reload it. Only the transition
+                    // touches the tree; a plain external edit doesn't.
+                    tree_changed |= self.buffers[i].doc.is_missing();
+                    self.buffers[i].doc.set_missing(false);
                     // Dedupe against `warned_hash`, never `disk_hash`: this
                     // content was seen, not adopted, and `save` reads
                     // `disk_hash` to decide whether overwriting is safe.
@@ -564,6 +573,7 @@ impl Editor {
                     }
                 } else {
                     let caret = self.buffers[i].doc.caret_offset();
+                    tree_changed |= self.buffers[i].doc.is_missing();
                     self.buffers[i].doc = open_or_empty(path);
                     self.buffers[i].doc.jump_to(caret); // clamped; best-effort vs. shifted content
                     repaint |= i == self.active;
