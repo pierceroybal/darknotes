@@ -23,6 +23,10 @@ gpui = "0.2"
 jiff = "0.2.32"
 notify = "8"
 nucleo-matcher = "0.3"
+# System link opener. gpui has its own, but it routes through the XDG portal,
+# which is a dead end on WSL (no browser inside the distro); this reaches the
+# Windows host. MIT.
+open = "5"
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

@@ -11,6 +11,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -1696,8 +1697,34 @@ impl Editor {
                 }
             }
         } else if let Some(url) = markdown::url_at(&text, col) {
-            cx.open_url(&url);
+            self.open_external(&url, cx);
         }
+    }
+
+    /// Hand a URL to the system browser. On WSL that has to be the Windows
+    /// host's browser — see `is_wsl` — via the `open` crate, which passes the
+    /// URL to PowerShell's `Start-Process` through an environment variable, so
+    /// there is no quoting to get wrong. Everywhere else gpui's opener (XDG
+    /// portal, then `xdg-open` and friends) is the right answer.
+    fn open_external(&mut self, url: &str, cx: &mut Context<Self>) {
+        if !is_wsl() {
+            cx.open_url(url);
+            return;
+        }
+        let url = url.to_string();
+        cx.spawn(async move |this, cx| {
+            // Launching a Windows binary through WSL interop is slow enough to
+            // be worth keeping off the render thread; `that_detached` doesn't
+            // wait for the browser to exit.
+            let opened = cx.background_executor().spawn(async move { open::that_detached(url) });
+            if let Err(e) = opened.await {
+                let _ = this.update(cx, |this, cx| {
+                    this.message = Some(format!("could not open link: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// Re-read the vault from disk (a save may have created a new file).
@@ -2496,6 +2523,21 @@ fn tab_hints(root: &Path, paths: &[Option<&Path>]) -> Vec<Option<String>> {
             (names[name.as_str()] > 1).then(|| hint.clone())
         })
         .collect()
+}
+
+/// Whether we're running under WSL, cached after the first read.
+///
+/// It changes where a link goes: a WSL distro has no browser of its own, so
+/// the Linux openers all dead-end (gpui's portal call reaches a real
+/// `xdg-desktop-portal`, whose app chooser then reports "No Apps available").
+/// The link belongs to the Windows host instead.
+fn is_wsl() -> bool {
+    static WSL: OnceLock<bool> = OnceLock::new();
+    *WSL.get_or_init(|| {
+        cfg!(target_os = "linux")
+            && std::fs::read_to_string("/proc/version")
+                .is_ok_and(|v| v.to_ascii_lowercase().contains("microsoft"))
+    })
 }
 
 #[cfg(test)]
