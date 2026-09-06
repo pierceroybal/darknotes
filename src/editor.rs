@@ -24,8 +24,8 @@ use crate::document::{Document, Motion};
 use crate::jumps::{Jumps, Pos};
 use crate::keymap::{Ctx, Resolver};
 use buffers::{
-    open_or_empty, rel_display, resolve, resolve_link, unique_dest, vault_relative, with_md_ext,
-    Buffer,
+    note_arg_count, open_or_empty, rel_display, resolve, resolve_link, unique_dest,
+    vault_relative, with_md_ext, Buffer,
 };
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
@@ -1819,7 +1819,9 @@ impl Editor {
 
     /// Run a submitted `:` command: parse `(name, bang, arg)`, look up the
     /// registry entry by ex alias, dispatch. An arg to a command that takes
-    /// none (`:q x`) is not that command → E492, like the unknown case.
+    /// none (`:q x`) is not that command → E492, like the unknown case. A
+    /// `[notes.*]` command whose `name` has no `{arg}`/`{argN}` placeholder
+    /// takes no arg either, by the same rule.
     fn exec_command(&mut self, cmd: &str, window: &mut Window, cx: &mut Context<Self>) {
         let cmd = cmd.trim();
         if cmd.is_empty() {
@@ -1832,8 +1834,12 @@ impl Editor {
                 (c.run)(self, &args, window, cx);
             }
             // A `[notes.*]` command. Registry first, so config can't shadow `:w`.
-            _ if arg.is_none() && self.note_cmds.contains_key(name) => {
-                self.run_note_cmd(name, window)
+            _ if self
+                .note_cmds
+                .get(name)
+                .is_some_and(|n| arg.is_none() || note_arg_count(&n.name) > 0) =>
+            {
+                self.run_note_cmd(name, arg, window)
             }
             _ => self.message = Some(format!("E492: Not an editor command: {cmd}")),
         }
@@ -1845,16 +1851,22 @@ impl Editor {
         if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
             (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx);
         } else if self.note_cmds.contains_key(name) {
-            self.run_note_cmd(name, window);
+            self.run_note_cmd(name, None, window);
         }
     }
 
-    /// A palette pick. `takes_arg` commands have no argument yet, so they
-    /// pre-fill the ex prompt (`:e `) instead of running; the rest run directly.
+    /// A palette pick. `takes_arg` commands, and `[notes.*]` commands whose
+    /// `name` references `{arg}`/`{argN}`, have no argument yet, so they
+    /// pre-fill the ex prompt (`:e `) instead of running; the rest run
+    /// directly.
     fn run_picked_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = COMMANDS.iter().find(|c| c.name == name) else {
-            if self.note_cmds.contains_key(name) {
-                self.run_note_cmd(name, window);
+            match self.note_cmds.get(name) {
+                Some(n) if note_arg_count(&n.name) > 0 => {
+                    self.vim.start_command(&format!("{name} "))
+                }
+                Some(_) => self.run_note_cmd(name, None, window),
+                None => {}
             }
             return;
         };
@@ -1864,10 +1876,26 @@ impl Editor {
         }
     }
 
-    /// Run a `[notes.*]` command by name: create-if-missing, then open.
-    fn run_note_cmd(&mut self, name: &str, window: &mut Window) {
+    /// Run a `[notes.*]` command by name: create-if-missing, then open. `arg`
+    /// fills the `{arg}`/`{argN}` placeholders in the configured `name`; a
+    /// `name` that needs more words than `arg` has (including none at all,
+    /// e.g. bare `:study` against `name = "{arg}/..."`) refuses rather than
+    /// creating a note with a literal, unfilled placeholder.
+    fn run_note_cmd(&mut self, name: &str, arg: Option<&str>, window: &mut Window) {
         let Some(n) = self.note_cmds.get(name).cloned() else { return };
-        self.open_new_note(&n.dir, &n.name, &n.template, window);
+        let needed = note_arg_count(&n.name);
+        let got = arg.map_or(0, |a| a.split_whitespace().count());
+        if got < needed {
+            let usage = if needed == 1 {
+                " <name>".to_string()
+            } else {
+                (1..=needed).map(|i| format!(" <arg{i}>")).collect()
+            };
+            let article = if needed == 1 { "an argument" } else { "arguments" };
+            self.message = Some(format!("{name} requires {article}: :{name}{usage}"));
+            return;
+        }
+        self.open_new_note(&n.dir, &n.name, &n.template, arg, window);
     }
 }
 

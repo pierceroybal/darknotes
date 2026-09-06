@@ -93,6 +93,36 @@ timeoutlen = 1000
 # dir      = "meetings"             # vault-relative folder, created if missing
 # name     = "%Y-%m-%d-standup"     # strftime; ".md" appended when absent
 # template = "templates/meeting.md" # vault-relative seed; missing file = empty note
+#
+# `name` may include a literal `{arg}`, filled in with whatever follows the
+# command on the `:` line (":study genesis" → arg = "genesis"); a command
+# whose `name` has no `{arg}`/`{argN}` still takes no argument. `{arg}` can
+# also sit inside a path segment to route into a subfolder named after it —
+# handy for one command covering many similarly-shaped notes:
+#
+# [notes.study]
+# dir  = "bible-study"
+# name = "{arg}/%Y-%m-%d-study" # :study genesis -> bible-study/genesis/2026-09-06-study.md
+#
+# `{arg1}`, `{arg2}`, … (`{arg}` is `{arg1}`) split the typed text on
+# whitespace into that many arguments, right-anchored: the trailing words each
+# become their own argument, and everything before them — a multi-word book
+# name included — is joined into the first. A character invalid in a
+# file/folder name (a colon, say) is swapped for `_` in each argument before
+# it's used:
+#
+# [notes.study]
+# dir  = "bible-study"
+# name = "{arg1}/{arg2}"
+# # :study john 12:12-19    -> bible-study/john/12_12-19.md
+# # :study 1 John 3:16      -> bible-study/1 John/3_16.md
+#
+# Calling a command whose `name` needs more words than it's given (bare
+# `:study`, too few words, or a keybinding — which can't supply any) refuses
+# rather than creating a note with a literal, unfilled "{argN}" in its path.
+# This only fills in the note's name/path; substituting `{arg}`-style
+# placeholders into the template's *body* is a separate, not-yet-built
+# feature.
 
 [search]
 # `/` (and `?` backward) in-document search, plain-text match. Option names are

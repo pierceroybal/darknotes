@@ -164,19 +164,21 @@ impl Editor {
     /// `:today` — open today's daily note, creating `daily/YYYY-MM-DD.md`
     /// (seeded from `templates/daily.md` when present) on first use.
     pub(super) fn today(&mut self, window: &mut Window) {
-        self.open_new_note("daily", "%Y-%m-%d", "templates/daily.md", window);
+        self.open_new_note("daily", "%Y-%m-%d", "templates/daily.md", None, window);
     }
 
     /// Create-if-missing and open a note, the shared body of `:today` and every
-    /// `[notes.*]` command.
+    /// `[notes.*]` command. `arg` fills a `{arg}` placeholder in `name` — see
+    /// `create_note`.
     pub(super) fn open_new_note(
         &mut self,
         dir: &str,
         name: &str,
         template: &str,
+        arg: Option<&str>,
         window: &mut Window,
     ) {
-        match create_note(&self.vault.root, dir, name, template) {
+        match create_note(&self.vault.root, dir, name, template, arg) {
             Ok(path) => {
                 self.rescan_vault(); // a first-of-its-kind note must show in the sidebar
                 self.open_path(path, window);
@@ -411,29 +413,124 @@ pub(super) fn open_or_empty(path: &Path) -> Document {
     })
 }
 
+/// A `[notes.*]` `name` fills this with the ex-command's first (or only)
+/// trailing argument (`:study genesis` → `arg = "genesis"`); `{arg1}` is a
+/// synonym, and `{arg2}`, `{arg3}`, … pick up further words. `name` like
+/// `"{arg1}/{arg2}"` files the note in a subfolder named after the first
+/// argument.
+pub(super) const ARG_PLACEHOLDER: &str = "{arg}";
+
+/// A note name doesn't need more positional arguments than this; keeps
+/// `note_arg_count`'s scan bounded without needing a regex dependency.
+const MAX_NOTE_ARGS: usize = 9;
+
+/// How many of `{arg}`/`{arg1}`..`{argN}` a `[notes.*]` `name` references (0
+/// if none). `{arg}` and `{arg1}` are the same slot, so a `name` mixing them
+/// isn't an error, just redundant.
+pub(super) fn note_arg_count(name: &str) -> usize {
+    let mut n = usize::from(name.contains(ARG_PLACEHOLDER) || name.contains("{arg1}"));
+    for i in 2..=MAX_NOTE_ARGS {
+        if name.contains(&format!("{{arg{i}}}")) {
+            n = i;
+        }
+    }
+    n
+}
+
+/// Split `raw` into exactly `count` (>= 1) positional arguments on
+/// whitespace, right-anchored: the trailing `count - 1` words each become
+/// their own argument, and everything before them — however many words, in
+/// whatever original spacing — is joined into the first. This lets a
+/// multi-word first argument coexist with single-word ones after it, as long
+/// as only the first argument ever needs to hold multiple words. Returns
+/// `None` if `raw` doesn't have at least `count` words.
+fn split_note_args(raw: &str, count: usize) -> Option<Vec<String>> {
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    if words.len() < count {
+        return None;
+    }
+    let split_at = words.len() - (count - 1);
+    let mut args = vec![words[..split_at].join(" ")];
+    args.extend(words[split_at..].iter().map(|w| w.to_string()));
+    Some(args)
+}
+
+/// Replace characters that are unsafe or reserved in a file/folder name on
+/// common filesystems (colon included) or that could add path structure the
+/// caller didn't ask for (slash, backslash), plus control characters, with `_`.
+fn sanitize_arg(arg: &str) -> String {
+    arg.chars()
+        .map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '_' } else { c })
+        .collect()
+}
+
 /// The note at `dir/{name}.md` under `root`, created if missing and seeded from
 /// the vault-relative `template` when that file exists. `name` is formatted
 /// through strftime against the local clock, so `%Y-%m-%d` rolls over at the
-/// user's midnight, not UTC's. An existing note is never touched — a `name`
-/// with no date specifiers resolves to the same path every time, so repeat
-/// invocations reopen it.
+/// user's midnight, not UTC's — done before any `{arg}` substitution, so an
+/// argument containing `%` can't be misread as a strftime specifier. An
+/// existing note is never touched — a `name` with no date specifiers (and no
+/// unresolved `{arg}`) resolves to the same path every time, so repeat
+/// invocations reopen it. `name` may contain `/`; every folder on the way,
+/// including ones contributed by an argument, is created as needed.
+///
+/// `arg` is caller-typed text riding straight into a file path: each
+/// positional argument is sanitized (see `sanitize_arg`) before substitution,
+/// so it can't inject new path segments of its own, and the fully-substituted
+/// `name` is still rejected if it would step outside `dir` via a literal `..`
+/// segment. `name` referencing more argument slots than `arg` supplies words
+/// for is an error rather than leaving a slot unfilled.
 // ponytail: template is copied verbatim; substitution inside the body rides the
 // general templates feature when it lands.
-fn create_note(root: &Path, dir: &str, name: &str, template: &str) -> std::io::Result<PathBuf> {
+fn create_note(
+    root: &Path,
+    dir: &str,
+    name: &str,
+    template: &str,
+    arg: Option<&str>,
+) -> std::io::Result<PathBuf> {
     // Fallible format: `name` is hand-edited config, and jiff's `strftime`
     // Display impl panics on an unknown specifier.
     let name = jiff::fmt::strtime::format(name, &jiff::Zoned::now())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let needed = note_arg_count(&name);
+    let name = if needed == 0 {
+        name
+    } else {
+        let args = split_note_args(arg.unwrap_or(""), needed).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("needs {needed} argument(s): {name:?}"),
+            )
+        })?;
+        let mut name = name;
+        if let Some(a0) = args.first() {
+            let a0 = sanitize_arg(a0);
+            name = name.replace(ARG_PLACEHOLDER, &a0).replace("{arg1}", &a0);
+        }
+        for (i, a) in args.iter().enumerate().skip(1) {
+            name = name.replace(&format!("{{arg{}}}", i + 1), &sanitize_arg(a));
+        }
+        name
+    };
+    if Path::new(&name)
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("note name escapes its folder: {name}"),
+        ));
+    }
     let name = if name.ends_with(".md") { name } else { format!("{name}.md") };
-    let folder = root.join(dir);
-    let path = folder.join(name);
+    let path = root.join(dir).join(name);
     if !path.exists() {
         let seed = if template.is_empty() {
             String::new()
         } else {
             std::fs::read_to_string(root.join(template)).unwrap_or_default()
         };
-        std::fs::create_dir_all(&folder)?;
+        std::fs::create_dir_all(path.parent().unwrap_or(root))?;
         std::fs::write(&path, seed)?;
     }
     Ok(path)
@@ -547,19 +644,19 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         // No template: created empty, `daily/` made on the way.
-        let p = create_note(&root, "daily", "2026-07-17", "templates/daily.md").unwrap();
+        let p = create_note(&root, "daily", "2026-07-17", "templates/daily.md", None).unwrap();
         assert_eq!(p, root.join("daily").join("2026-07-17.md"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
 
         // An existing note is never overwritten.
         std::fs::write(&p, "notes").unwrap();
-        create_note(&root, "daily", "2026-07-17", "templates/daily.md").unwrap();
+        create_note(&root, "daily", "2026-07-17", "templates/daily.md", None).unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "notes");
 
         // A template seeds new days verbatim.
         std::fs::create_dir_all(root.join("templates")).unwrap();
         std::fs::write(root.join("templates").join("daily.md"), "# Log\n").unwrap();
-        let p2 = create_note(&root, "daily", "2026-07-18", "templates/daily.md").unwrap();
+        let p2 = create_note(&root, "daily", "2026-07-18", "templates/daily.md", None).unwrap();
         assert_eq!(std::fs::read_to_string(&p2).unwrap(), "# Log\n");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -571,13 +668,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        let p = create_note(&root, "", "%Y-%m-%d-standup", "").unwrap();
+        let p = create_note(&root, "", "%Y-%m-%d-standup", "", None).unwrap();
         let today = jiff::Zoned::now().date().to_string();
         assert_eq!(p, root.join(format!("{today}-standup.md")));
 
         // A bad specifier returns Err rather than panicking (jiff's strftime
         // Display impl panics on this; `strtime::format` doesn't).
-        assert!(create_note(&root, "", "%K", "").is_err());
+        assert!(create_note(&root, "", "%K", "", None).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_note_substitutes_arg_into_subfolder() {
+        let root = std::env::temp_dir().join("darknotes_create_note_arg_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `{arg}` builds a subfolder under `dir`, created on the way; `%`-free
+        // arg text rides through untouched by the strftime pass.
+        let p = create_note(&root, "bible-study", "{arg}/study", "", Some("genesis")).unwrap();
+        assert_eq!(p, root.join("bible-study").join("genesis").join("study.md"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+
+        // No `{arg}` in `name`: the argument is simply unused.
+        let p2 = create_note(&root, "daily", "%Y-%m-%d", "", Some("ignored")).unwrap();
+        let today = jiff::Zoned::now().date().to_string();
+        assert_eq!(p2, root.join("daily").join(format!("{today}.md")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_note_sanitizes_unsafe_characters_in_args() {
+        let root = std::env::temp_dir().join("darknotes_create_note_sanitize_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A colon (invalid in file/folder names on several filesystems) is
+        // swapped for an underscore before it ever reaches the path.
+        let p = create_note(&root, "study", "{arg}", "", Some("12:12-19")).unwrap();
+        assert_eq!(p, root.join("study").join("12_12-19.md"));
+
+        // A slash in the argument can't inject a path segment the config
+        // didn't ask for: it's sanitized before the path is built, so this
+        // lands as one oddly named (but harmless, in-`dir`) file rather than
+        // escaping anywhere.
+        let p2 = create_note(&root, "study", "{arg}", "", Some("/etc/passwd")).unwrap();
+        let expected = "/etc/passwd".replace('/', "_");
+        assert_eq!(p2, root.join("study").join(format!("{expected}.md")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_note_rejects_a_literal_parent_dir_arg() {
+        let root = std::env::temp_dir().join("darknotes_create_note_escape_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Sanitizing `/` out of arguments closes off slash-based traversal;
+        // a bare ".." (no slash to sanitize) is the one shape still capable
+        // of pointing outside `dir`, so it's rejected outright.
+        assert!(create_note(&root, "study", "{arg}", "", Some("..")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_note_splits_multiple_args_right_anchored() {
+        let root = std::env::temp_dir().join("darknotes_create_note_multiarg_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Single-word book + reference.
+        let p = create_note(&root, "bible-study", "{arg1}/{arg2}", "", Some("john 12:12-19"))
+            .unwrap();
+        assert_eq!(p, root.join("bible-study").join("john").join("12_12-19.md"));
+
+        // A multi-word book name: everything but the last word (the
+        // reference) is joined back into the first argument.
+        let p2 = create_note(&root, "bible-study", "{arg1}/{arg2}", "", Some("1 John 3:16"))
+            .unwrap();
+        assert_eq!(p2, root.join("bible-study").join("1 John").join("3_16.md"));
+
+        // Too few words for the placeholders the name references is an error.
+        assert!(create_note(&root, "bible-study", "{arg1}/{arg2}", "", Some("genesis")).is_err());
+        assert!(create_note(&root, "bible-study", "{arg1}/{arg2}", "", None).is_err());
 
         let _ = std::fs::remove_dir_all(&root);
     }
