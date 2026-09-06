@@ -336,7 +336,7 @@ pub fn task_box(line: &str) -> Option<(usize, bool)> {
     } else {
         return None;
     };
-    (rest.get(3).map_or(true, |&b| b == b' ')).then_some((at, checked))
+    (rest.get(3).is_none_or(|&b| b == b' ')).then_some((at, checked))
 }
 
 /// Ordered-list item as `(number, digit count)`; `None` for unordered items
@@ -822,7 +822,7 @@ pub fn conceal(text: &str, segments: &[Segment]) -> Concealed {
             _ => false,
         };
         if drop {
-            map.extend(std::iter::repeat(out_text.len()).take(seg.len));
+            map.extend(std::iter::repeat_n(out_text.len(), seg.len));
         } else {
             map.extend((0..seg.len).map(|i| out_text.len() + i));
             out_text.push_str(slice);

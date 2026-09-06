@@ -1,1 +1,8 @@
 /target
+/dist
+
+# Release archives, if you ever assemble one by hand the way CI does.
+/darknotes-*.tar.gz
+/darknotes-*.tar.gz.sha256
+
+.DS_Store

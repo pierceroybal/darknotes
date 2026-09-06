@@ -463,7 +463,7 @@ impl Document {
     pub fn is_markdown(&self) -> bool {
         self.path
             .as_deref()
-            .map_or(true, |p| p.extension().is_some_and(|e| e == "md"))
+            .is_none_or(|p| p.extension().is_some_and(|e| e == "md"))
     }
 
     fn caret(&self) -> usize {
@@ -1449,7 +1449,7 @@ impl Document {
             return;
         }
         self.rope.remove(from..from + count);
-        self.rope.insert(from, &std::iter::repeat(ch).take(count).collect::<String>());
+        self.rope.insert(from, &std::iter::repeat_n(ch, count).collect::<String>());
         self.touch_line(line, 0); // `count` chars replace `count` chars
         self.set_caret(from + count - 1);
     }

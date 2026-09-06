@@ -251,7 +251,7 @@ impl Editor {
         let notes = self
             .note_cmds
             .keys()
-            .map(|name| Row::plain(format!("{name}  :{name}"), PickItem::Command(*name)));
+            .map(|name| Row::plain(format!("{name}  :{name}"), PickItem::Command(name)));
         self.picker = Some(Picker::over(": ", builtin.chain(notes).collect()));
     }
 

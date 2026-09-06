@@ -937,7 +937,7 @@ impl Editor {
         let floor = -handle.max_offset().height;
         // The viewport slides in base-row steps; a taller heading row just
         // takes two of them to clear, like a wrapped line takes two rows.
-        off.y = off.y - line_h * n as f32;
+        off.y -= line_h * n as f32;
         if off.y < floor {
             off.y = floor;
         }

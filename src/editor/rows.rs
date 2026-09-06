@@ -479,7 +479,7 @@ impl Editor {
         let selection = ctx
             .sel_lines
             .filter(|&(first, last)| i >= first && i <= last)
-            .and_then(|_| ctx.sel_span)
+            .and(ctx.sel_span)
             .and_then(|(lo, hi)| line_highlight(&ctx.rope, i, lo, hi));
         let search: Vec<Highlight> = if ctx.search_ranges.is_empty() {
             Vec::new()

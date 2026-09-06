@@ -247,8 +247,10 @@ mod tests {
 
     #[test]
     fn unknown_command_is_dropped() {
-        let mut cfg = config::Keymap::default();
-        cfg.insert = BTreeMap::from([("j k".to_string(), "bogus".to_string())]);
+        let cfg = config::Keymap {
+            insert: BTreeMap::from([("j k".to_string(), "bogus".to_string())]),
+            ..Default::default()
+        };
         let mut r = Resolver::new(&cfg, &[], NAMES);
         let res = r.feed(&[Ctx::Insert], &k("j"));
         assert_eq!(res.replay.len(), 1); // binding dropped → key passes through
@@ -257,8 +259,10 @@ mod tests {
 
     #[test]
     fn user_binding_shadows_default() {
-        let mut cfg = config::Keymap::default();
-        cfg.global = BTreeMap::from([("ctrl-s".to_string(), "open-file".to_string())]);
+        let cfg = config::Keymap {
+            global: BTreeMap::from([("ctrl-s".to_string(), "open-file".to_string())]),
+            ..Default::default()
+        };
         let mut r = Resolver::new(&cfg, &[(Ctx::Global, "ctrl-s", "save")], NAMES);
         let res = r.feed(&[Ctx::Global], &ctrl("s"));
         assert_eq!(res.command.as_deref(), Some("open-file"));

@@ -2,6 +2,16 @@
 name = "darknotes"
 version = "0.1.0"
 edition = "2024"
+# Edition 2024 alone needs 1.85; the dependency tree pushes the floor to 1.88
+# (image, ar_archive_writer, home). Verified by the `msrv` CI job.
+rust-version = "1.88"
+description = "A modal, keyboard-driven markdown notes editor for a folder of plain files"
+repository = "https://github.com/pierceroybal/darknotes"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["notes", "markdown", "editor", "vim", "gpui"]
+categories = ["text-editors"]
+exclude = ["/.github", "/assets/**/*.txt", "/assets/screenshot.png"]
 
 [features]
 # In-app performance instrumentation (src/perf.rs). Off by default so plain
@@ -30,3 +40,17 @@ open = "5"
 ropey = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+# CI runs clippy with `-D warnings`, so the divergences below are declared once
+# here rather than suppressed at each site.
+[lints.clippy]
+# The nested `if let ... { if cond {` shape predates this crate adopting
+# let-chains. Collapsing them is a valid cleanup, not a defect; until that
+# happens deliberately, it shouldn't fail the build.
+collapsible_if = "allow"
+# `BUILTINS` in theme.rs is a name -> constructor table. A type alias for
+# `&[(&str, fn() -> Theme)]` would name it without clarifying it.
+type_complexity = "allow"
+# The `--detach` re-spawn in main.rs orphans its child on purpose: the point is
+# to hand the shell back while the window lives on. Waiting would defeat it.
+zombie_processes = "allow"
