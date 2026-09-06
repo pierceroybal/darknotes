@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The suite is pure unit tests over the rope, the vim grammar, the
+      # markdown scanner, and config parsing. Nothing opens a window, so no
+      # display or GPU is needed — only the link step needs the libraries above.
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Build
+        run: cargo build
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-deps
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `-- -D warnings` applies to this crate only, not to dependencies, so a
+      # warning introduced upstream can't break the build. The few lints this
+      # codebase diverges from on purpose are declared in Cargo.toml's
+      # [lints.clippy], each with its reason, keeping this gate meaningful for
+      # everything else. Clippy runs the rustc lints too, so plain compiler
+      # warnings are caught here as well.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/linux-deps
+      # Keeps the `rust-version` claim in Cargo.toml true. Edition 2024 alone
+      # needs 1.85; the dependency tree raises the floor to 1.88.
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets

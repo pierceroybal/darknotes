@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Must already exist."
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tagging v0.2.0 while Cargo.toml still says 0.1.0 would ship archives whose
+  # names lie about their contents. Catch it before anything is built.
+  check-version:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: v
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::tag $tag implies version $version, but Cargo.toml says $manifest"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.name }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on 22.04 rather than latest so the binary links against an
+          # older glibc and runs on distros that aren't the newest Ubuntu.
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            targets: ""
+          # One archive covering both Mac architectures, joined with lipo below.
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-deps
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir -p dist && cp target/release/darknotes dist/
+
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/darknotes \
+            target/aarch64-apple-darwin/release/darknotes \
+            target/x86_64-apple-darwin/release/darknotes
+          lipo -info dist/darknotes
+
+      # The fonts and icons are compiled into the binary, and both the OFL and
+      # the ISC require their notices to travel with a redistribution. Bundling
+      # them here is what makes the published archives compliant — see
+      # THIRD-PARTY.md. `shasum -a 256` is used over `sha256sum` because it is
+      # the one present on both runners.
+      - name: Assemble archive
+        run: |
+          set -eux
+          version="${{ needs.check-version.outputs.version }}"
+          name="darknotes-${version}-${{ matrix.name }}"
+          mkdir -p "$name/licenses"
+          cp dist/darknotes "$name/"
+          chmod +x "$name/darknotes"
+          cp README.md THIRD-PARTY.md LICENSE-MIT LICENSE-APACHE "$name/"
+          cp assets/fonts/OFL-Inter.txt \
+             assets/fonts/OFL-CourierPrime.txt \
+             assets/icons/LICENSE-lucide.txt "$name/licenses/"
+          tar czf "${name}.tar.gz" "$name"
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darknotes-${{ matrix.name }}
+          path: |
+            darknotes-*.tar.gz
+            darknotes-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          Download the archive for your platform, unpack it, and put `darknotes`
+          on your `PATH`:
+
+          ```sh
+          tar xzf darknotes-*-<platform>.tar.gz
+          sudo install -m755 darknotes-*/darknotes /usr/local/bin/darknotes
+          ```
+
+          The macOS build is a universal binary (Apple Silicon and Intel) and is
+          **unsigned**, so the first launch needs a right-click -> Open, or
+          `xattr -d com.apple.quarantine /usr/local/bin/darknotes`.
+
+          The Linux build is x86_64, against glibc 2.35 (Ubuntu 22.04).
+
+          Each archive carries `README.md`, both project licenses, and the
+          notices for the fonts and icons compiled into the binary. The
+          `.sha256` files alongside each archive are for verification.
+          NOTES
+
+      # Published as a draft on purpose: it gives you a chance to write the
+      # changelog (the Releases page has a "Generate release notes" button that
+      # appends the commit log) and to spot-check a download before anyone sees
+      # it. Publish from that page when you're happy with it.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" \
+            --draft \
+            --title "darknotes $tag" \
+            --notes-file notes.md \
+            artifacts/*

@@ -1,0 +1,16 @@
+name: Install Linux system dependencies
+description: >
+  System libraries GPUI needs to build and link on Linux. This is the single
+  source of truth for that list: CI installs it on every push, and README.md
+  quotes it for contributors, so it cannot quietly drift out of date.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config libfontconfig-dev libfreetype-dev \
+          libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+          libvulkan-dev libvulkan1 mesa-vulkan-drivers libclang-dev
