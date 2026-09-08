@@ -413,37 +413,40 @@ pub(super) fn open_or_empty(path: &Path) -> Document {
     })
 }
 
-/// A `[notes.*]` `name` fills this with the ex-command's first (or only)
-/// trailing argument (`:study genesis` → `arg = "genesis"`); `{arg1}` is a
-/// synonym, and `{arg2}`, `{arg3}`, … pick up further words. `name` like
-/// `"{arg1}/{arg2}"` files the note in a subfolder named after the first
-/// argument.
-pub(super) const ARG_PLACEHOLDER: &str = "{arg}";
+/// The `{arg}`/`{argN}` slots in a `[notes.*]` `name`, in order, as
+/// `(byte range of the token, N)` with `N >= 1`; `{arg}` is `{arg1}`. A slot
+/// is exactly `{arg`, digits, `}` — anything else (`{argx}`, `{arg0}`) is
+/// literal text. Both `note_arg_count` and the substitution in `create_note`
+/// read this, so they can't disagree about what gets replaced.
+fn note_arg_slots(name: &str) -> impl Iterator<Item = (std::ops::Range<usize>, usize)> {
+    name.match_indices("{arg").filter_map(move |(start, _)| {
+        let digits_at = start + "{arg".len();
+        let end = digits_at + name[digits_at..].find('}')?;
+        let digits = &name[digits_at..end];
+        let n = if digits.is_empty() {
+            1
+        } else {
+            digits.parse::<usize>().ok().filter(|&n| n >= 1)?
+        };
+        Some((start..end + 1, n))
+    })
+}
 
-/// A note name doesn't need more positional arguments than this; keeps
-/// `note_arg_count`'s scan bounded without needing a regex dependency.
-const MAX_NOTE_ARGS: usize = 9;
-
-/// How many of `{arg}`/`{arg1}`..`{argN}` a `[notes.*]` `name` references (0
-/// if none). `{arg}` and `{arg1}` are the same slot, so a `name` mixing them
-/// isn't an error, just redundant.
+/// How many positional arguments a `[notes.*]` `name` needs: the highest slot
+/// it references, 0 if none. `{arg}` and `{arg1}` are the same slot, so a
+/// `name` mixing them isn't an error, just redundant; `{arg3}` alone still
+/// needs three words, with the first two unused.
 pub(super) fn note_arg_count(name: &str) -> usize {
-    let mut n = usize::from(name.contains(ARG_PLACEHOLDER) || name.contains("{arg1}"));
-    for i in 2..=MAX_NOTE_ARGS {
-        if name.contains(&format!("{{arg{i}}}")) {
-            n = i;
-        }
-    }
-    n
+    note_arg_slots(name).map(|(_, n)| n).max().unwrap_or(0)
 }
 
 /// Split `raw` into exactly `count` (>= 1) positional arguments on
 /// whitespace, right-anchored: the trailing `count - 1` words each become
-/// their own argument, and everything before them — however many words, in
-/// whatever original spacing — is joined into the first. This lets a
-/// multi-word first argument coexist with single-word ones after it, as long
-/// as only the first argument ever needs to hold multiple words. Returns
-/// `None` if `raw` doesn't have at least `count` words.
+/// their own argument, and everything before them — however many words — is
+/// joined into the first with single spaces. This lets a multi-word first
+/// argument coexist with single-word ones after it, as long as only the first
+/// argument ever needs to hold multiple words. Returns `None` if `raw`
+/// doesn't have at least `count` words.
 fn split_note_args(raw: &str, count: usize) -> Option<Vec<String>> {
     let words: Vec<&str> = raw.split_whitespace().collect();
     if words.len() < count {
@@ -474,12 +477,13 @@ fn sanitize_arg(arg: &str) -> String {
 /// invocations reopen it. `name` may contain `/`; every folder on the way,
 /// including ones contributed by an argument, is created as needed.
 ///
-/// `arg` is caller-typed text riding straight into a file path: each
-/// positional argument is sanitized (see `sanitize_arg`) before substitution,
-/// so it can't inject new path segments of its own, and the fully-substituted
-/// `name` is still rejected if it would step outside `dir` via a literal `..`
-/// segment. `name` referencing more argument slots than `arg` supplies words
-/// for is an error rather than leaving a slot unfilled.
+/// `arg` is user-typed text riding straight into a file path: each argument
+/// is sanitized (`sanitize_arg`) so it can't add path segments, and a
+/// substituted `name` is rejected if any segment is `.`/`..` — the one escape
+/// a slash-free argument has left. A placeholder-free `name` isn't checked:
+/// `..` there is the vault owner's config, the same authority as `:e ../foo`.
+/// Too few words for the slots `name` references is an error, never an
+/// unfilled slot.
 // ponytail: template is copied verbatim; substitution inside the body rides the
 // general templates feature when it lands.
 fn create_note(
@@ -503,25 +507,29 @@ fn create_note(
                 format!("needs {needed} argument(s): {name:?}"),
             )
         })?;
-        let mut name = name;
-        if let Some(a0) = args.first() {
-            let a0 = sanitize_arg(a0);
-            name = name.replace(ARG_PLACEHOLDER, &a0).replace("{arg1}", &a0);
+        // One pass over the original text, so a substituted argument that
+        // happens to contain `{arg2}` is never itself substituted.
+        let mut filled = String::with_capacity(name.len());
+        let mut tail = 0;
+        for (range, n) in note_arg_slots(&name) {
+            filled.push_str(&name[tail..range.start]);
+            filled.push_str(&sanitize_arg(&args[n - 1]));
+            tail = range.end;
         }
-        for (i, a) in args.iter().enumerate().skip(1) {
-            name = name.replace(&format!("{{arg{}}}", i + 1), &sanitize_arg(a));
+        filled.push_str(&name[tail..]);
+        // Only an argument-filled name is checked, and then all of it: a
+        // config-authored `../{arg}` is refused along with an argument of `..`.
+        if Path::new(&filled)
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("note name escapes its folder: {filled}"),
+            ));
         }
-        name
+        filled
     };
-    if Path::new(&name)
-        .components()
-        .any(|c| !matches!(c, Component::Normal(_)))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("note name escapes its folder: {name}"),
-        ));
-    }
     let name = if name.ends_with(".md") { name } else { format!("{name}.md") };
     let path = root.join(dir).join(name);
     if !path.exists() {
@@ -632,8 +640,8 @@ fn match_buffer(arg: &str, names: &[String]) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_line, create_note, match_buffer, rel_display, resolve, resolve_link, unique_dest,
-        unsaved_label, vault_relative,
+        append_line, create_note, match_buffer, note_arg_count, rel_display, resolve,
+        resolve_link, unique_dest, unsaved_label, vault_relative,
     };
     use std::path::{Path, PathBuf};
 
@@ -736,6 +744,42 @@ mod tests {
     }
 
     #[test]
+    fn note_arg_count_reads_any_slot_number() {
+        assert_eq!(note_arg_count("%Y-%m-%d"), 0);
+        assert_eq!(note_arg_count("{arg}"), 1);
+        assert_eq!(note_arg_count("{arg1}/{arg}"), 1);
+        assert_eq!(note_arg_count("{arg1}/{arg2}"), 2);
+        // The highest slot wins; lower ones needn't appear.
+        assert_eq!(note_arg_count("{arg3}"), 3);
+        // Any number of digits.
+        assert_eq!(note_arg_count("{arg12}"), 12);
+        // Not slots: literal text, no argument demanded.
+        assert_eq!(note_arg_count("{argx}"), 0);
+        assert_eq!(note_arg_count("{arg0}"), 0);
+        assert_eq!(note_arg_count("{arg"), 0);
+        assert_eq!(note_arg_count("{arg1{arg2}"), 2);
+    }
+
+    #[test]
+    fn create_note_leaves_a_placeholder_free_name_unchecked() {
+        let root = std::env::temp_dir().join("darknotes_create_note_unchecked_test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // `..` in a config-authored `name` is the vault owner's call (same
+        // authority as `dir = "../x"`); only argument-filled names are guarded.
+        let p = create_note(&root, "study", "../shared/note", "", None).unwrap();
+        assert_eq!(p, root.join("study").join("../shared/note.md"));
+        assert!(root.join("shared").join("note.md").exists());
+
+        // With a placeholder in play the whole substituted name is checked,
+        // config-authored `..` included.
+        assert!(create_note(&root, "study", "../{arg}", "", Some("x")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn create_note_splits_multiple_args_right_anchored() {
         let root = std::env::temp_dir().join("darknotes_create_note_multiarg_test");
         let _ = std::fs::remove_dir_all(&root);
@@ -755,6 +799,11 @@ mod tests {
         // Too few words for the placeholders the name references is an error.
         assert!(create_note(&root, "bible-study", "{arg1}/{arg2}", "", Some("genesis")).is_err());
         assert!(create_note(&root, "bible-study", "{arg1}/{arg2}", "", None).is_err());
+
+        // An argument containing a slot token isn't re-substituted: the
+        // replacement is one pass over the configured name.
+        let p3 = create_note(&root, "bible-study", "{arg1}/{arg2}", "", Some("{arg2} x")).unwrap();
+        assert_eq!(p3, root.join("bible-study").join("{arg2}").join("x.md"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
