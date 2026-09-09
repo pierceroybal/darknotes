@@ -117,12 +117,12 @@ timeoutlen = 1000
 # # :study john 12:12-19    -> bible-study/john/12_12-19.md
 # # :study 1 John 3:16      -> bible-study/1 John/3_16.md
 #
-# Calling a command whose `name` needs more words than it's given (bare
-# `:study`, too few words, or a keybinding — which can't supply any) refuses
-# rather than creating a note with a literal, unfilled "{argN}" in its path.
-# This only fills in the note's name/path; substituting `{arg}`-style
-# placeholders into the template's *body* is a separate, not-yet-built
-# feature.
+# Typing a command with fewer words than its `name` needs (bare `:study`, or
+# one word for a two-slot name) refuses rather than creating a note with a
+# literal, unfilled "{argN}" in its path. A keybinding or palette pick has no
+# words to offer, so it opens the `:` line pre-filled with the command
+# (`:study `) for you to finish. Only the note's name/path is filled in; the
+# template body is copied verbatim.
 
 [search]
 # `/` (and `?` backward) in-document search, plain-text match. Option names are

@@ -1833,8 +1833,10 @@ impl Editor {
                 let args = CmdArgs { bang, arg: arg.map(str::to_string) };
                 (c.run)(self, &args, window, cx);
             }
-            // A `[notes.*]` command. Registry first, so config can't shadow `:w`.
-            _ if self
+            // A `[notes.*]` command, only when no built-in owns the name:
+            // config can't shadow `:w`, and `:q x` is E492 even with a
+            // `[notes.q]` declared.
+            None if self
                 .note_cmds
                 .get(name)
                 .is_some_and(|n| arg.is_none() || note_arg_count(&n.name) > 0) =>
@@ -1850,24 +1852,17 @@ impl Editor {
     fn run_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(c) = COMMANDS.iter().find(|c| c.name == name) {
             (c.run)(self, &CmdArgs { bang: false, arg: None }, window, cx);
-        } else if self.note_cmds.contains_key(name) {
-            self.run_note_cmd(name, None, window);
+        } else {
+            self.run_note_cmd_or_prompt(name, window);
         }
     }
 
-    /// A palette pick. `takes_arg` commands, and `[notes.*]` commands whose
-    /// `name` references `{arg}`/`{argN}`, have no argument yet, so they
+    /// A palette pick. `takes_arg` commands have no argument yet, so they
     /// pre-fill the ex prompt (`:e `) instead of running; the rest run
-    /// directly.
+    /// directly. `[notes.*]` commands follow the same rule.
     fn run_picked_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = COMMANDS.iter().find(|c| c.name == name) else {
-            match self.note_cmds.get(name) {
-                Some(n) if note_arg_count(&n.name) > 0 => {
-                    self.vim.start_command(&format!("{name} "))
-                }
-                Some(_) => self.run_note_cmd(name, None, window),
-                None => {}
-            }
+            self.run_note_cmd_or_prompt(name, window);
             return;
         };
         match c.ex.first() {
@@ -1876,11 +1871,27 @@ impl Editor {
         }
     }
 
+    /// A `[notes.*]` command reached without an ex line (a key binding or a
+    /// palette pick). One whose `name` references `{arg}`/`{argN}` has no
+    /// argument yet, so it pre-fills the ex prompt (`:study `) instead of
+    /// running — the same shape as a bare `:capture` from a leader key. The
+    /// rest run directly. Unknown names are ignored.
+    fn run_note_cmd_or_prompt(&mut self, name: &str, window: &mut Window) {
+        match self.note_cmds.get(name) {
+            Some(n) if note_arg_count(&n.name) > 0 => {
+                self.vim.start_command(&format!("{name} "))
+            }
+            Some(_) => self.run_note_cmd(name, None, window),
+            None => {}
+        }
+    }
+
     /// Run a `[notes.*]` command by name: create-if-missing, then open. `arg`
     /// fills the `{arg}`/`{argN}` placeholders in the configured `name`; a
-    /// `name` that needs more words than `arg` has (including none at all,
-    /// e.g. bare `:study` against `name = "{arg}/..."`) refuses rather than
-    /// creating a note with a literal, unfilled placeholder.
+    /// `name` that needs more words than `arg` has (a typed bare `:study`
+    /// against `name = "{arg}/..."`, or one word for two slots) refuses with
+    /// a usage line rather than creating a note with a literal, unfilled
+    /// placeholder.
     fn run_note_cmd(&mut self, name: &str, arg: Option<&str>, window: &mut Window) {
         let Some(n) = self.note_cmds.get(name).cloned() else { return };
         let needed = note_arg_count(&n.name);
