@@ -1163,6 +1163,29 @@ impl Document {
         self.set_caret(self.rope.line_to_char(self.rope.char_to_line(at)));
     }
 
+    /// `yj`/`yk`: copy the caret's line plus `count` lines in a direction,
+    /// linewise (`up` = `yk`). Same failed-motion rule as `delete_lines_dir`:
+    /// nothing that way → no-op. The caret moves to the first yanked line.
+    pub fn yank_lines_dir(&mut self, count: usize, up: bool) {
+        let count = count.max(1);
+        let (line, _) = self.line_col_of(self.caret());
+        let last = self.rope.len_lines().saturating_sub(1);
+        if (up && self.fold_start(line) == 0) || (!up && self.fold_end(line) == last) {
+            return;
+        }
+        let (first, last_y) =
+            if up { (self.line_above(line, count), line) } else { (line, self.line_below(line, count)) };
+        let (first, last_y) = self.fold_expand(first, last_y);
+        let start = self.rope.line_to_char(first);
+        let end = if last_y + 1 >= self.rope.len_lines() {
+            self.rope.len_chars()
+        } else {
+            self.rope.line_to_char(last_y + 1)
+        };
+        self.set_register(self.rope.slice(start..end).to_string(), true);
+        self.set_caret(start);
+    }
+
     /// Char span `[start, end)` of a text object at the caret, plus whether it
     /// is linewise (paragraphs are, words aren't). `None` when there's nothing
     /// under the caret (empty line for a word, empty buffer for a paragraph).
@@ -2866,6 +2889,29 @@ mod tests {
         d.move_motion(Motion::FileStart, 1); // first line
         d.delete_lines_dir(1, true);
         assert_eq!(d.rope.to_string(), "a\nb");
+    }
+
+    #[test]
+    fn yj_yk_yank_adjacent_lines() {
+        // yj: current line + the one below, into the register — content unchanged.
+        let mut d = Document::new("a\nb\nc");
+        d.yank_lines_dir(1, false);
+        assert_eq!(d.register_text(), "a\nb\n");
+        assert_eq!(d.rope.to_string(), "a\nb\nc");
+
+        // yk on the first line is a no-op — no line above to join.
+        let mut d = Document::new("a\nb\nc");
+        d.set_register("unchanged".into(), false);
+        d.yank_lines_dir(1, true);
+        assert_eq!(d.register_text(), "unchanged");
+
+        // yk: current line + the one above. The slice itself has no trailing
+        // newline (it runs to EOF) — `set_register` normalizes linewise text
+        // to always end in one.
+        let mut d = Document::new("a\nb\nc");
+        d.move_motion(Motion::LineDown, 2); // line "c"
+        d.yank_lines_dir(1, true);
+        assert_eq!(d.register_text(), "b\nc\n");
     }
 
     #[test]

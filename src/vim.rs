@@ -80,10 +80,10 @@ pub enum Action {
     /// `gd`/`gf`/`gx`: follow the link under the caret (wikilink → note,
     /// URL → browser). Link detection lives in the editor.
     FollowLink,
-    /// `gj`/`gk`: move one *visual* row (a wrapped line's rows count
-    /// individually). Resolved by the editor — only its row cache knows
-    /// wrap boundaries.
-    MoveDisplay { down: bool },
+    /// `gj`/`gk` (and `j`/`k`/`Ctrl-E`/`Ctrl-Y` in view): move `count` *visual*
+    /// rows (a wrapped line's rows count individually). Resolved by the
+    /// editor — only its row cache knows wrap boundaries.
+    MoveDisplay { down: bool, count: usize },
     /// Normal-mode Enter: flip the `[ ]`/`[x]` task box on the caret's line.
     /// The editor owns detection (the grammar can't see buffer text) and
     /// checkpoints undo only when a box is present — which is why this is
@@ -107,6 +107,23 @@ pub enum Action {
     /// whole document. Not a content change — folds are view state, so these
     /// stay out of undo and out of `.` repeat.
     Fold(FoldOp),
+    /// A bare Escape in view posture: leave `:view`, caret to first
+    /// non-blank of the focus line, screen untouched.
+    ExitView,
+    /// `yj`/`yk` (and view's `y NN 3j`): linewise yank of the caret's line
+    /// plus `count` lines in a direction (`up` = `yk`).
+    YankLinesVertical { count: usize, up: bool },
+    /// View posture: label every visible logical line so a pending row-label
+    /// command (`yy NN`, `V NN`, `Enter NN`) has a target to type.
+    ShowRowLabels,
+    /// View posture: a row label completed as `n` (1-based from the top
+    /// label) — run `then` against the line it names.
+    RowLabelPick { n: usize, then: LabelThen },
+    /// View posture `f`: label every visible link.
+    HintsStart,
+    /// View posture: a link-hint label completed as `label` — follow the
+    /// link it names.
+    HintPick(String),
 }
 
 /// Which fold command ran — see `Action::Fold`.
@@ -170,6 +187,8 @@ impl Action {
                 | Action::YankLines(..)
                 | Action::YankObject(..)
                 | Action::YankSelection { .. }
+                | Action::YankLinesVertical { .. }
+                | Action::RowLabelPick { then: LabelThen::YankLines(_), .. }
         )
     }
 
@@ -229,6 +248,23 @@ enum Op {
     Change,
 }
 
+/// What a completed row label feeds (view posture, see `Pending::RowLabel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LabelThen {
+    /// `yy NN` / `Y NN` / `3yy NN`: yank `count` lines from the labeled row.
+    YankLines(usize),
+    /// `y NN …`: the operator waits for a vertical target (`3j`, `k`, `y`).
+    YankOp,
+    /// `V NN` / `v NN`: linewise visual anchored on the labeled row.
+    Visual,
+    /// `Enter NN`: toggle the task box on the labeled row.
+    Toggle,
+}
+
+/// The alphabet link hints label with — home row first, prefix-free at every
+/// width. `f` in view labels every visible link with letters from here.
+pub const HINT_ALPHABET: &[u8] = b"asdfghjkl";
+
 /// Mid-sequence grammar state beyond a pending count (which is tracked
 /// separately, since a count coexists with an operator — `d3w`). One key-press
 /// resolves whichever variant is active. New multi-key forms (`f`/`t`, more
@@ -260,6 +296,12 @@ enum Pending {
     /// distinguishes `m{a}` from a jump, `line` the `'{a}` (first non-blank of
     /// the line) form from `` `{a} `` (exact position).
     Mark { set: bool, line: bool },
+    /// View posture (`yy NN`, `V NN`, `Enter NN`): collecting a fixed-width row
+    /// label. `typed`/`digits` accumulate as digits arrive; `then` names what
+    /// runs once the label completes.
+    RowLabel { then: LabelThen, typed: u32, digits: u8 },
+    /// View posture `f`: collecting a fixed-width link-hint label.
+    Hint { typed: [u8; 2], n: u8 },
 }
 
 /// The vim grammar: a mode-aware state machine that consumes keystrokes — some
@@ -285,6 +327,14 @@ pub struct Vim {
     /// search, `:` commands, and task toggling live. A posture, not a mode —
     /// it survives `reset()` (buffer switches) like config does.
     pub view: bool,
+    /// Digit width of a row label (view posture): fixed for the duration of
+    /// one pending label so it completes without a terminator. Set by the
+    /// editor when it shows labels.
+    pub label_width: u8,
+    /// Letter width of a link hint (view posture `f`): 1 while the number of
+    /// visible links fits `HINT_ALPHABET`, else 2. Set by the editor when it
+    /// shows hints.
+    pub hint_width: u8,
 }
 
 impl Vim {
@@ -298,6 +348,8 @@ impl Vim {
             tab_width,
             last_find: None,
             view: false,
+            label_width: 2,
+            hint_width: 1,
         }
     }
 
@@ -309,6 +361,22 @@ impl Vim {
     /// is never the lead of an `f f` binding).
     pub fn in_sequence(&self) -> bool {
         !matches!(self.pending, Pending::None)
+    }
+
+    /// A row label (`yy NN`, `V NN`, `Enter NN`) is mid-collection.
+    pub fn awaiting_label(&self) -> bool {
+        matches!(self.pending, Pending::RowLabel { .. })
+    }
+
+    /// A link hint (`f`) is mid-collection.
+    pub fn awaiting_hint(&self) -> bool {
+        matches!(self.pending, Pending::Hint { .. })
+    }
+
+    /// Abandon whatever is pending — a label/hint aborted by the editor (no
+    /// row for the number, no link for the letters).
+    pub fn cancel_pending(&mut self) {
+        self.pending = Pending::None;
     }
 
     pub fn reset(&mut self) {
@@ -374,9 +442,12 @@ impl Vim {
         let shift = m.shift;
 
         if key == "escape" {
+            // A pending count or sequence cancels first; only a bare Escape
+            // leaves view — cancel-then-exit, not both in one press.
+            let idle = self.count.is_none() && !self.in_sequence();
             self.count = None;
             self.pending = Pending::None;
-            return vec![];
+            return if idle && self.view { vec![Action::ExitView] } else { vec![] };
         }
 
         // The viewport scrolls and the jumplist walk are the only chord
@@ -390,6 +461,13 @@ impl Vim {
                 match key {
                     "d" => vec![Action::ScrollHalf { down: true }],
                     "u" => vec![Action::ScrollHalf { down: false }],
+                    // In view, Ctrl-E/Ctrl-Y are exactly `j`/`k`.
+                    "e" if self.view => {
+                        vec![Action::MoveDisplay { down: true, count: self.take_count() }]
+                    }
+                    "y" if self.view => {
+                        vec![Action::MoveDisplay { down: false, count: self.take_count() }]
+                    }
                     "e" => vec![Action::ScrollLines { down: true, count: self.take_count() }],
                     "y" => vec![Action::ScrollLines { down: false, count: self.take_count() }],
                     "o" => vec![Action::JumpBack],
@@ -404,6 +482,15 @@ impl Vim {
             };
             self.count = None;
             return acts;
+        }
+
+        // Row-label and link-hint digits/letters are collected here, before
+        // count parsing claims them — a label's `07` must not read as a count.
+        if let Pending::RowLabel { then, typed, digits } = self.pending {
+            return self.resolve_row_label(then, typed, digits, key);
+        }
+        if let Pending::Hint { typed, n } = self.pending {
+            return self.resolve_hint(typed, n, key);
         }
 
         // A pending literal-char state (`f`/`t`'s target, `r`'s replacement)
@@ -437,7 +524,16 @@ impl Vim {
             Pending::Indent { dedent } => return self.complete_indent(dedent, key),
             // Resolved above, before count parsing.
             Pending::Find { .. } | Pending::Replace { .. } | Pending::Mark { .. }
-            | Pending::None => {}
+            | Pending::RowLabel { .. } | Pending::Hint { .. } | Pending::None => {}
+        }
+
+        // View posture: `j`/`k` move the screen a visual row, horizontal
+        // motions have nothing to move (the caret is hidden, its column
+        // meaningless) and drop. `None` hands the key to the table below.
+        if self.view {
+            if let Some(actions) = self.view_key(key, shift) {
+                return actions;
+            }
         }
 
         // Motions come from one table shared with visual and operator-pending;
@@ -587,6 +683,60 @@ impl Vim {
         }
     }
 
+    /// View posture: `j`/`k` (and arrows) move one *visual* row so the pinned
+    /// screen scrolls a row per press; horizontal motions have nothing to
+    /// move (the caret is hidden, its column meaningless) and drop. A command
+    /// that acts on a line (`y`, `v`/`V`, Enter, `f`) arms a row label or link
+    /// hint instead of acting on the hidden caret directly. `None` hands the
+    /// key to the normal table.
+    fn view_key(&mut self, key: &str, shift: bool) -> Option<Vec<Action>> {
+        match (key, shift) {
+            ("j", false) | ("down", _) => {
+                Some(vec![Action::MoveDisplay { down: true, count: self.take_count() }])
+            }
+            ("k", false) | ("up", _) => {
+                Some(vec![Action::MoveDisplay { down: false, count: self.take_count() }])
+            }
+            // `yy`/`y NN …`: refined to `YankLines` on a doubled `y` or a row
+            // label, in `resolve_row_label`.
+            ("y", false) => self.start_label(LabelThen::YankOp),
+            ("y", true) => {
+                let n = self.take_count();
+                self.start_label(LabelThen::YankLines(n))
+            }
+            // `v`/`V` both behave as `V` in view — no charwise copy yet.
+            ("v", _) => {
+                self.count = None;
+                self.start_label(LabelThen::Visual)
+            }
+            ("enter", _) => {
+                self.count = None;
+                self.start_label(LabelThen::Toggle)
+            }
+            // `f` labels every visible link; `F` has nothing to do without a
+            // caret and drops below with the other horizontal keys.
+            ("f", false) => {
+                self.count = None;
+                self.pending = Pending::Hint { typed: [0; 2], n: 0 };
+                Some(vec![Action::HintsStart])
+            }
+            ("h", _) | ("l", _) | ("left", _) | ("right", _) | ("w", _) | ("b", _) | ("e", _)
+            | ("0", _) | ("^", _) | ("$", _) | ("%", _) | ("f", true) | ("t", _) | (";", _)
+            | (",", _) => {
+                self.count = None;
+                Some(vec![])
+            }
+            _ => None,
+        }
+    }
+
+    /// Arm a row label: the editor shows one per visible line, and the next
+    /// complete label feeds `then` (`resolve_row_label`).
+    fn start_label(&mut self, then: LabelThen) -> Option<Vec<Action>> {
+        self.pending = Pending::RowLabel { then, typed: 0, digits: 0 };
+        Some(vec![Action::ShowRowLabels])
+    }
+
     fn command_key(&mut self, ks: &Keystroke) -> Vec<Action> {
         let m = &ks.modifiers;
         match ks.key.as_str() {
@@ -630,6 +780,11 @@ impl Vim {
         let key = ks.key.as_str();
         let m = &ks.modifiers;
         let shift = m.shift;
+        // `v` behaves as `V` in view — charwise copy isn't in v1, so a bare
+        // `v` while already visual must never flip a linewise selection
+        // charwise. Row-label entry (`view_key`) already lands in
+        // `VisualLine` directly; this only covers a `v` typed once inside it.
+        let shift = shift || (self.view && key == "v");
 
         if key == "escape" {
             self.count = None;
@@ -798,6 +953,14 @@ impl Vim {
                 ]),
             };
         }
+        // In view the caret is hidden and horizontal, so a label-armed
+        // operator (`y NN …`) has nothing but a vertical target to complete
+        // it with — `y07f`/`y07;`/`y07iw` all abort here rather than reaching
+        // the (nonsensical, from a hidden caret) horizontal machinery below.
+        if self.view && !matches!(key, "y" | "j" | "k" | "down" | "up") {
+            self.count = None;
+            return vec![];
+        }
         // `f`/`F`/`t`/`T` need one more key (their target char); park the
         // operator + count until it arrives.
         if let Some(make) = find_ctor(key, shift) {
@@ -829,11 +992,14 @@ impl Vim {
                     self.enter_insert(vec![Action::DeleteMotion(m, count)])
                 }
             },
-            // `dj`/`dk`: the line motion isn't an op-target (charwise would be
-            // surprising), so handle it here as a linewise delete. `yj`/`cj` etc.
-            // would join this arm when wanted.
+            // `dj`/`dk`/`yj`/`yk`: the line motion isn't an op-target (charwise
+            // would be surprising), so handle it here as a linewise delete/yank.
             Some(spec) if matches!(spec.motion, Motion::LineUp | Motion::LineDown) => match op {
                 Op::Delete => vec![Action::DeleteLinesVertical {
+                    count,
+                    up: matches!(spec.motion, Motion::LineUp),
+                }],
+                Op::Yank => vec![Action::YankLinesVertical {
                     count,
                     up: matches!(spec.motion, Motion::LineUp),
                 }],
@@ -903,6 +1069,68 @@ impl Vim {
         }
     }
 
+    /// Collect a fixed-width row label (`label_width` digits). Digits are the
+    /// label, never a count — a count typed before the verb already sits in
+    /// `self.count`. A second `y` refines a bare `y` to a one-line yank before
+    /// the first digit; any other non-digit aborts.
+    fn resolve_row_label(&mut self, then: LabelThen, typed: u32, digits: u8, key: &str) -> Vec<Action> {
+        let digit = key.chars().next().filter(|_| key.len() == 1).and_then(|c| c.to_digit(10));
+        match (digit, key, then, digits) {
+            (None, "y", LabelThen::YankOp, 0) => {
+                let n = self.take_count();
+                self.pending = Pending::RowLabel { then: LabelThen::YankLines(n), typed, digits };
+                vec![]
+            }
+            (Some(d), ..) => {
+                let (typed, digits) = (typed * 10 + d, digits + 1);
+                if digits < self.label_width {
+                    self.pending = Pending::RowLabel { then, typed, digits };
+                    return vec![];
+                }
+                self.pending = Pending::None;
+                match then {
+                    // Only `yy`/`Y` honor a leading count; `3y07 2j` would
+                    // otherwise glue the digits into one count.
+                    LabelThen::YankOp => {
+                        self.count = None;
+                        self.pending = Pending::Operator(Op::Yank);
+                    }
+                    // Flip *before* the editor's jump: `Document::set_caret`
+                    // collapses the selection onto the labeled line, so no
+                    // `CollapseSelection` is needed. A jump while already
+                    // visual would extend instead.
+                    LabelThen::Visual => self.mode = Mode::VisualLine,
+                    LabelThen::YankLines(_) | LabelThen::Toggle => {}
+                }
+                vec![Action::RowLabelPick { n: typed as usize, then }]
+            }
+            _ => {
+                self.pending = Pending::None;
+                self.count = None;
+                vec![]
+            }
+        }
+    }
+
+    /// Collect a fixed-width link-hint label (`hint_width` letters from
+    /// `HINT_ALPHABET`). Anything else aborts.
+    fn resolve_hint(&mut self, mut typed: [u8; 2], n: u8, key: &str) -> Vec<Action> {
+        let b = key.as_bytes();
+        if b.len() == 1 && HINT_ALPHABET.contains(&b[0]) {
+            typed[n as usize] = b[0];
+            let n = n + 1;
+            if n < self.hint_width {
+                self.pending = Pending::Hint { typed, n };
+                return vec![];
+            }
+            self.pending = Pending::None;
+            return vec![Action::HintPick(String::from_utf8_lossy(&typed[..n as usize]).into_owned())];
+        }
+        self.pending = Pending::None;
+        self.count = None;
+        vec![]
+    }
+
     /// `;`/`,`: re-run the last `f`/`F`/`t`/`T`, `reverse` (`,`) flipping its
     /// direction. Neither key updates the stored motion, so a chain of `;`
     /// keeps going the same way.
@@ -946,22 +1174,27 @@ impl Vim {
 
     /// Complete a `g`-sequence: `gg` jumps to file start (or to `{count}gg`'s
     /// line), `gt`/`gT` cycle buffers, `gd`/`gf`/`gx` follow the link under the
-    /// caret, `gj`/`gk` move by visual row, `gJ` joins lines without a
-    /// separator; anything else aborts.
+    /// caret (in view, they label links like `f` instead — there is no caret to
+    /// follow one under), `gj`/`gk` move `count` visual rows, `gJ` joins lines
+    /// without a separator; anything else aborts.
     fn complete_g_prefix(&mut self, key: &str, shift: bool) -> Vec<Action> {
-        // `gg` and `gJ` read the count; the rest ignore it.
-        // ponytail: `2gt`/`3gj` (counts) ignored.
+        // `gg`/`gJ`/`gj`/`gk` read the count; the rest ignore it.
         match (key, shift) {
             ("g", _) => self.move_action(Motion::FileStart),
             ("j", true) => vec![Action::JoinLines { count: self.take_count(), space: false }],
+            ("j", false) => vec![Action::MoveDisplay { down: true, count: self.take_count() }],
+            ("k", false) => vec![Action::MoveDisplay { down: false, count: self.take_count() }],
+            ("d" | "f" | "x", false) if self.view => {
+                self.count = None;
+                self.pending = Pending::Hint { typed: [0; 2], n: 0 };
+                vec![Action::HintsStart]
+            }
             _ => {
                 self.count = None;
                 match (key, shift) {
                     ("t", false) => vec![Action::BufferNext],
                     ("t", true) => vec![Action::BufferPrev],
                     ("d" | "f" | "x", false) => vec![Action::FollowLink],
-                    ("j", false) => vec![Action::MoveDisplay { down: true }],
-                    ("k", false) => vec![Action::MoveDisplay { down: false }],
                     _ => vec![],
                 }
             }
@@ -1301,15 +1534,19 @@ mod tests {
             v.on_key(&shift("j", "J")),
             vec![Action::JoinLines { count: 1, space: false }]
         );
-        // A count rides along; plain `gj` is still the display move.
+        // Plain `gj` is the display move.
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 1 }]);
+        // A count rides along for both `gJ` and `gj`: `3gj` moves three rows.
         v.on_key(&k("3"));
         v.on_key(&k("g"));
         assert_eq!(
             v.on_key(&shift("j", "J")),
             vec![Action::JoinLines { count: 3, space: false }]
         );
+        v.on_key(&k("3"));
         v.on_key(&k("g"));
-        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true }]);
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 3 }]);
     }
 
     #[test]
@@ -1855,9 +2092,9 @@ mod tests {
     fn gj_gk_move_by_display_row() {
         let mut v = vim();
         v.on_key(&k("g"));
-        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true }]);
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 1 }]);
         v.on_key(&k("g"));
-        assert_eq!(v.on_key(&k("k")), vec![Action::MoveDisplay { down: false }]);
+        assert_eq!(v.on_key(&k("k")), vec![Action::MoveDisplay { down: false, count: 1 }]);
     }
 
     #[test]
@@ -1978,12 +2215,28 @@ mod tests {
     fn view_drops_mutations_keeps_navigation() {
         let mut v = vim();
         v.view = true;
-        // Navigation, task toggling, and scrolling stay live.
-        assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 1)]);
-        assert_eq!(v.on_key(&named("enter")), vec![Action::ToggleTask]);
-        // Yanks stay live (copying while reading).
-        v.on_key(&k("y"));
-        assert_eq!(v.on_key(&k("y")), vec![Action::YankLines(1)]);
+        // `j`/`k` move the screen a visual row, not the (hidden) caret a line.
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 1 }]);
+        v.on_key(&k("3"));
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 3 }]);
+        // Horizontal motions have nothing to move and drop, taking any
+        // pending count with them.
+        assert!(v.on_key(&k("h")).is_empty());
+        v.on_key(&k("3"));
+        assert!(v.on_key(&k("w")).is_empty());
+        assert_eq!(v.on_key(&k("j")), vec![Action::MoveDisplay { down: true, count: 1 }]);
+        assert!(v.on_key(&k("$")).is_empty());
+        // Task toggling stays live, through a row label (Enter is a
+        // line-targeted command — see `row_label_grammar_in_view`); cancel it
+        // so it doesn't leak into the asserts below. Ctrl-E/Y equal j/k.
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ShowRowLabels]);
+        assert!(v.on_key(&named("escape")).is_empty());
+        let ctrl_e = Keystroke {
+            key: "e".into(),
+            key_char: Some("e".into()),
+            modifiers: Modifiers { control: true, ..Default::default() },
+        };
+        assert_eq!(v.on_key(&ctrl_e), vec![Action::MoveDisplay { down: true, count: 1 }]);
         // Edits drop: x, p, u, dd.
         assert!(v.on_key(&k("x")).is_empty());
         assert!(v.on_key(&k("p")).is_empty());
@@ -1993,9 +2246,190 @@ mod tests {
         // Insert entry is a dead end: `o` emits nothing, mode stays normal.
         assert!(v.on_key(&k("o")).is_empty());
         assert_eq!(v.mode, Mode::Normal);
-        // The `:` prompt still works (it's how `:view` exits).
+        // The `:` prompt still works (it's how `:view` exits, along with Escape).
         v.on_key(&k(":"));
         assert_eq!(v.mode, Mode::Command);
+        v.on_key(&named("escape")); // back to Normal, still in view
+        // Escape: a pending count cancels first; only a bare Escape leaves view.
+        v.on_key(&k("3"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert!(v.view);
+        assert_eq!(v.on_key(&named("escape")), vec![Action::ExitView]);
+    }
+
+    #[test]
+    fn row_label_grammar_in_view() {
+        // `yy 07`: a doubled `y` refines to a one-line yank before the label.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        assert_eq!(v.on_key(&k("y")), vec![Action::ShowRowLabels]);
+        assert!(v.awaiting_label());
+        assert_eq!(v.on_key(&k("y")), vec![]);
+        assert_eq!(v.on_key(&k("0")), vec![]);
+        assert_eq!(
+            v.on_key(&k("7")),
+            vec![Action::RowLabelPick { n: 7, then: LabelThen::YankLines(1) }]
+        );
+        assert!(!v.in_sequence());
+
+        // A leading count survives to the doubled `y` (`3yy07`); `Y07` is the
+        // same shape with the count implicit.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("3"));
+        v.on_key(&k("y"));
+        v.on_key(&k("y"));
+        v.on_key(&k("0"));
+        assert_eq!(
+            v.on_key(&k("7")),
+            vec![Action::RowLabelPick { n: 7, then: LabelThen::YankLines(3) }]
+        );
+
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&shift("y", "Y"));
+        v.on_key(&k("0"));
+        assert_eq!(
+            v.on_key(&k("7")),
+            vec![Action::RowLabelPick { n: 7, then: LabelThen::YankLines(1) }]
+        );
+
+        // `y 07 …`: the label completes the operator, which then waits for a
+        // vertical target — `3j` sweeps it, a doubled `y` takes one line, and
+        // a horizontal key aborts cleanly.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("y"));
+        v.on_key(&k("0"));
+        v.on_key(&k("7"));
+        v.on_key(&k("3"));
+        assert_eq!(
+            v.on_key(&k("j")),
+            vec![Action::YankLinesVertical { count: 3, up: false }]
+        );
+
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("y"));
+        v.on_key(&k("0"));
+        v.on_key(&k("7"));
+        assert_eq!(v.on_key(&k("y")), vec![Action::YankLines(1)]);
+        assert!(!v.in_sequence());
+
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("y"));
+        v.on_key(&k("0"));
+        v.on_key(&k("7"));
+        assert_eq!(v.on_key(&k("w")), vec![]);
+        assert!(!v.in_sequence());
+
+        // `V 07` / `v 07`: linewise visual anchored on the labeled row (`v`
+        // behaves as `V` in view).
+        for first in [shift("v", "V"), k("v")] {
+            let mut v = vim();
+            v.view = true;
+            v.label_width = 2;
+            assert_eq!(v.on_key(&first), vec![Action::ShowRowLabels]);
+            v.on_key(&k("0"));
+            assert_eq!(
+                v.on_key(&k("7")),
+                vec![Action::RowLabelPick { n: 7, then: LabelThen::Visual }]
+            );
+            assert_eq!(v.mode, Mode::VisualLine);
+            v.on_key(&k("3"));
+            assert_eq!(v.on_key(&k("j")), vec![Action::Move(Motion::LineDown, 3)]);
+            assert_eq!(v.on_key(&k("y")), vec![Action::YankSelection { linewise: true }]);
+            assert_eq!(v.mode, Mode::Normal);
+        }
+
+        // `Enter 07`: toggle the labeled row's task box.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        assert_eq!(v.on_key(&named("enter")), vec![Action::ShowRowLabels]);
+        v.on_key(&k("0"));
+        assert_eq!(
+            v.on_key(&k("7")),
+            vec![Action::RowLabelPick { n: 7, then: LabelThen::Toggle }]
+        );
+
+        // A non-digit, non-refining key aborts the label cleanly.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("y"));
+        assert_eq!(v.on_key(&k("x")), vec![]);
+        assert!(!v.in_sequence());
+
+        // Escape cancels a pending label without leaving view; a second,
+        // idle Escape then exits.
+        let mut v = vim();
+        v.view = true;
+        v.label_width = 2;
+        v.on_key(&k("y"));
+        assert!(v.awaiting_label());
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert!(!v.awaiting_label());
+        assert!(v.view);
+        assert_eq!(v.on_key(&named("escape")), vec![Action::ExitView]);
+
+        // Outside view, `yy`/`V` are unchanged — no label involved.
+        let mut v = vim();
+        v.on_key(&k("y"));
+        assert_eq!(v.on_key(&k("y")), vec![Action::YankLines(1)]);
+        v.on_key(&shift("v", "V"));
+        assert_eq!(v.mode, Mode::VisualLine);
+    }
+
+    #[test]
+    fn link_hints_in_view() {
+        let mut v = vim();
+        v.view = true;
+        assert_eq!(v.on_key(&k("f")), vec![Action::HintsStart]);
+        assert!(v.awaiting_hint());
+        v.hint_width = 1;
+        assert_eq!(v.on_key(&k("a")), vec![Action::HintPick("a".into())]);
+
+        let mut v = vim();
+        v.view = true;
+        v.hint_width = 2;
+        v.on_key(&k("f"));
+        assert_eq!(v.on_key(&k("a")), vec![]);
+        assert_eq!(v.on_key(&k("s")), vec![Action::HintPick("as".into())]);
+
+        // A letter outside the alphabet aborts cleanly.
+        let mut v = vim();
+        v.view = true;
+        v.on_key(&k("f"));
+        assert_eq!(v.on_key(&k("x")), vec![]);
+        assert!(!v.in_sequence());
+
+        // Escape cancels the hint without leaving view.
+        let mut v = vim();
+        v.view = true;
+        v.on_key(&k("f"));
+        assert!(v.on_key(&named("escape")).is_empty());
+        assert!(v.view);
+        assert!(!v.awaiting_hint());
+
+        // `gd`/`gf`/`gx` are hint aliases in view — there's no caret to
+        // follow a link under.
+        let mut v = vim();
+        v.view = true;
+        v.on_key(&k("g"));
+        assert_eq!(v.on_key(&k("d")), vec![Action::HintsStart]);
+
+        // Outside view, `f` still arms the ordinary find-motion.
+        let mut v = vim();
+        assert!(v.on_key(&k("f")).is_empty());
+        assert_eq!(v.on_key(&k("x")), vec![Action::Move(Motion::FindChar('x'), 1)]);
     }
 
     #[test]

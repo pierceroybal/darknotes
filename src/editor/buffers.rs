@@ -72,6 +72,15 @@ impl Editor {
         self.vim.reset(); // clears transient state, keeps config (tab width)
         self.keymap.clear(); // a pending binding sequence dies with the buffer
         self.seq_timer = None;
+        // View state is per-buffer geometry, not config — none of it survives
+        // a switch. The restored `PendingView` wins this frame; adoption
+        // follows on the first motion.
+        self.view_anchor = None;
+        self.view_focus = None;
+        self.labels = None;
+        self.label_base.set(None);
+        self.hints.borrow_mut().clear();
+        self.select_base.set(None);
         // A mid-prompt buffer switch (Ctrl-P) must not restore a stale caret
         // into the new buffer. The query itself survives — vim search is global.
         self.search.origin = None;

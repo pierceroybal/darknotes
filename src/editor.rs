@@ -7,7 +7,7 @@ mod rows;
 mod search;
 mod sidebar;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -35,8 +35,8 @@ use line_element::{
 use picker::Picker;
 use row_list::row_list;
 use rows::{
-    caret_only_change, content_change_is_local, row_offsets, LineForms, RowsCache, RowsKey,
-    ShapeWrapCache,
+    caret_only_change, content_change_is_local, display_index, row_offsets, LineForms, RowsCache,
+    RowsKey, ShapeWrapCache,
 };
 use search::{search_sensitive, MatchCache, SearchState};
 use sidebar::{expand_ancestors, FilePrompt, PromptAction};
@@ -46,7 +46,7 @@ use crate::markdown::{self, line_text, SpanKind};
 use crate::session;
 use crate::theme::Theme;
 use crate::vault::{Row, Vault};
-use crate::vim::{Action, FoldOp, Mode, Scroll, Vim};
+use crate::vim::{Action, FoldOp, LabelThen, Mode, Scroll, Vim, HINT_ALPHABET};
 use crate::watcher::VaultWatcher;
 
 const WELCOME: &str =
@@ -252,6 +252,70 @@ pub struct Editor {
     /// Relative numbering measures against this so a closed fold counts once;
     /// equal to `cur_line` in a document with no folds.
     cur_rel: Rc<Cell<usize>>,
+    /// View posture: the caret's pinned screen row, in visual rows below the
+    /// first fully visible row. `None` = adopt from the current geometry at
+    /// the next view motion (entry, `zz`/`zt`/`zb`, buffer switch). Shrinks
+    /// itself near the document's top, where a deeper anchor would need the
+    /// screen to scroll above row 0 — the render pin is what keeps this
+    /// true, for every way the caret can move, not just `j`/`k`.
+    view_anchor: Option<usize>,
+    /// A label-targeted command is in flight (`yy 07`, `V 07 …`): the caret it
+    /// displaced and the top row at that moment, restored when the grammar's
+    /// sequence and visual mode have both ended.
+    view_focus: Option<(usize, usize)>,
+    /// Row labels on screen (`yy`/`V`/Enter in view): the first labeled line
+    /// and how many lines carry one. `None` = no labels.
+    labels: Option<LabelState>,
+    /// Shared with every row's `Gutter` and read at paint time: `(display
+    /// index of the first labeled line, label count, digit width)` while
+    /// labels show. Paint-time, so showing labels rebuilds no rows when the
+    /// gutter is already on.
+    label_base: Rc<Cell<Option<(usize, usize, usize)>>>,
+    /// Link hints on screen (`f` in view): one per visible link. Shared with
+    /// every row element and read at paint time, keyed by logical line and
+    /// display byte, so showing hints rebuilds no rows.
+    hints: Rc<RefCell<Vec<Hint>>>,
+    /// While a row-label pick is being extended with a count + direction
+    /// (`V 07 3j`, `y 07 3j`): the display index of the row it started from.
+    /// Shared with every row's `Gutter` and read at paint time, so the gutter
+    /// re-labels relative to the start with no rebuild as the count grows.
+    select_base: Rc<Cell<Option<usize>>>,
+}
+
+/// Row labels currently on screen — see `Editor::labels`.
+struct LabelState {
+    top_line: usize,
+    count: usize,
+}
+
+/// One link hint on screen — see `Editor::hints`.
+pub(super) struct Hint {
+    line: usize,
+    /// Byte offset into the line's *display* text (all its rows joined).
+    byte: usize,
+    label: SharedString,
+    /// Source column for `follow_link_at`.
+    col: usize,
+}
+
+/// `count` hint labels from `HINT_ALPHABET`, in alphabet order: `a s d …`
+/// when `width == 1`, else `aa as ad … sa ss …` (every first letter's block
+/// exhausted before the next). Fewer labels than `count` only if `count`
+/// exceeds what `width` can name.
+fn hint_labels(count: usize, width: usize) -> Vec<String> {
+    if width == 1 {
+        return HINT_ALPHABET.iter().take(count).map(|&b| (b as char).to_string()).collect();
+    }
+    let mut out = Vec::with_capacity(count);
+    'outer: for &a in HINT_ALPHABET {
+        for &b in HINT_ALPHABET {
+            out.push(format!("{}{}", a as char, b as char));
+            if out.len() == count {
+                break 'outer;
+            }
+        }
+    }
+    out
 }
 
 impl Editor {
@@ -423,6 +487,12 @@ impl Editor {
             caret_paint: Rc::new(Cell::new(CaretPaint::Solid)),
             cur_line: Rc::new(Cell::new(0)),
             cur_rel: Rc::new(Cell::new(0)),
+            view_anchor: None,
+            view_focus: None,
+            labels: None,
+            label_base: Rc::new(Cell::new(None)),
+            hints: Rc::new(RefCell::new(Vec::new())),
+            select_base: Rc::new(Cell::new(None)),
         };
         this.arm_blink(cx);
         if config.watch_files {
@@ -750,10 +820,13 @@ impl Editor {
         // row's cached segments are exactly what paint saw: a Task segment
         // means a box was drawn over those bytes. A revealed line (caret
         // line, fence reveal, markdown off) remaps Task→Marker at row build,
-        // so its raw `[ ]` takes the caret like any other text.
+        // so its raw `[ ]` takes the caret like any other text. The hit
+        // segment's kind is recorded either way, for the view check below.
+        let mut hit = None;
         let mut seg_start = 0;
         for seg in el.segments.iter() {
             if byte_in_row < seg_start + seg.len {
+                hit = seg.kind;
                 if matches!(seg.kind, Some(SpanKind::Task(_))) {
                     self.toggle_task(line);
                     self.pane = Pane::Editor;
@@ -772,6 +845,21 @@ impl Editor {
         let n = line_rows[line] as usize;
         let display_byte =
             rows[first..row].iter().map(|r| r.text.len()).sum::<usize>() + byte_in_row;
+
+        // View posture: the mouse acts on what it hits — a task box
+        // (above) or a link — and never moves the hidden focus, so a click
+        // can't scroll the page. The grammar reset below would also kill a
+        // pending label.
+        if self.vim.view {
+            if matches!(hit, Some(SpanKind::Link)) {
+                let col = self.display_source_col(line, &rows[first..first + n], display_byte);
+                self.follow_link_at(line, col, window, cx);
+            }
+            self.pane = Pane::Editor;
+            window.focus(&self.focus);
+            cx.notify();
+            return;
+        }
 
         let col = self.display_source_col(line, &rows[first..first + n], display_byte);
         let at = self.doc().rope.line_to_char(line) + col;
@@ -814,22 +902,22 @@ impl Editor {
         src[..source_byte.min(src.len())].chars().count()
     }
 
-    /// `gj`/`gk`: move the caret one *visual* row, keeping its column within
-    /// the row. Lives here rather than in `Document` because only the rows
-    /// cache knows wrap boundaries; the cache is current because the two
-    /// grammar keys (`g`, then `j`/`k`) moved nothing since the last render.
-    /// The column maps through the conceal machinery like a click, so landing
-    /// on a concealed line puts the caret on the source char displayed there.
+    /// `gj`/`gk` (and `j`/`k`/`Ctrl-E`/`Ctrl-Y` in view): move the caret
+    /// `count` *visual* rows, keeping its column within the row. Lives here
+    /// rather than in `Document` because only the rows cache knows wrap
+    /// boundaries; the cache is current because the grammar keys that
+    /// produce this moved nothing since the last render. The column maps
+    /// through the conceal machinery like a click, so landing on a concealed
+    /// line puts the caret on the source char displayed there.
     // ponytail: no display goal column — each step re-derives the column
     // from the caret, so a run of gj across a short row drifts left (vim
     // would return to the goal column). Track one if it grates.
-    fn move_display(&mut self, down: bool) {
+    fn move_display(&mut self, down: bool, count: usize) {
         let Some(c) = &self.rows_cache else { return };
-        let target = if down { c.cur_row + 1 } else { c.cur_row.wrapping_sub(1) };
-        if target >= c.rows.len() {
-            return; // first/last row (wrapping_sub underflows past the top)
-        }
-        self.move_to_row(target);
+        let last = c.rows.len() - 1;
+        let target =
+            if down { (c.cur_row + count).min(last) } else { c.cur_row.saturating_sub(count) };
+        self.move_to_row(target); // no-op when target == cur_row
     }
 
     /// Land the caret on visual row `target` (clamped to the buffer), keeping
@@ -930,7 +1018,6 @@ impl Editor {
     fn scroll_rows(&mut self, n: isize, with_caret: bool) {
         let Some(c) = &self.rows_cache else { return };
         let cur_row = c.cur_row;
-        let offsets = c.offsets.clone();
         let line_h = self.line_h();
         let handle = self.scroll.0.borrow().base_handle.clone();
         let mut off = handle.offset();
@@ -947,18 +1034,63 @@ impl Editor {
         handle.set_offset(off);
         if with_caret {
             self.move_to_row(cur_row.saturating_add_signed(n));
-        } else {
-            // First and last fully visible rows at the new offset (a
-            // fraction of a row at either edge counts as hidden).
-            let (top_y, viewport) = (-off.y, self.viewport_h());
-            let top = offsets.partition_point(|&o| o < top_y);
-            let bottom = offsets.partition_point(|&o| o <= top_y + viewport).saturating_sub(2);
-            let bottom = bottom.max(top);
+        } else if let Some((top, bottom)) = self.visible_rows() {
             if cur_row < top {
                 self.move_to_row(top);
             } else if cur_row > bottom {
                 self.move_to_row(bottom);
             }
+        }
+    }
+
+    /// First and last fully visible visual rows at the current scroll offset
+    /// (a partial row at either edge counts as hidden).
+    fn visible_rows(&self) -> Option<(usize, usize)> {
+        let c = self.rows_cache.as_ref()?;
+        let off = self.scroll.0.borrow().base_handle.offset();
+        let (top_y, viewport) = (-off.y, self.viewport_h());
+        let last = c.rows.len().checked_sub(1)?;
+        let top = c.offsets.partition_point(|&o| o < top_y).min(last);
+        let bottom = c
+            .offsets
+            .partition_point(|&o| o <= top_y + viewport)
+            .saturating_sub(2)
+            .clamp(top, last);
+        Some((top, bottom))
+    }
+
+    /// The view pin (`view_anchor`) stands down while a label-targeted
+    /// command is in flight, so a `V 07` doesn't yank the screen to row 7
+    /// before the pick lands, and while visual/operator-pending sequences run
+    /// their own scroll-into-view instead.
+    fn view_suspended(&self) -> bool {
+        self.vim.in_sequence() || self.vim.mode.is_visual() || self.view_focus.is_some()
+    }
+
+    /// Row labels or start-relative selection numbers are on screen with
+    /// line numbers off: the gutter must show though nothing else about the
+    /// content changed, so neither can render as a cache hit.
+    fn gutter_forced(&self) -> bool {
+        (self.labels.is_some() || self.select_base.get().is_some())
+            && self.line_numbers == LineNumbers::Off
+    }
+
+    /// Before a view motion: adopt the anchor if unset, or pull the focus
+    /// back under it when the mouse wheel moved the screen without it. The
+    /// render pin keeps `cur_row == top + anchor` true after every motion —
+    /// shrinking `anchor` itself, never leaving the two to drift apart — so
+    /// a mismatch here can only be the wheel having moved `top` on its own.
+    fn view_sync_focus(&mut self) {
+        let Some((top, _)) = self.visible_rows() else { return };
+        let (cur, last) = match &self.rows_cache {
+            Some(c) => (c.cur_row, c.rows.len() - 1),
+            None => return,
+        };
+        let max = self.viewport_rows(self.line_h()).saturating_sub(1);
+        match self.view_anchor {
+            None => self.view_anchor = Some(cur.saturating_sub(top).min(max)),
+            Some(a) if cur != top + a => self.move_to_row((top + a).min(last)),
+            _ => {}
         }
     }
 
@@ -1321,6 +1453,13 @@ impl Editor {
         // into that one checkpoint).
         let mode_before = self.vim.mode;
         let mut actions = self.vim.on_key(ks);
+        // View pin: adopt the anchor before the first motion, or pull the
+        // focus back under it if the wheel moved the screen since. After
+        // `on_key`, so a key that *starts* a sequence (a label, an operator)
+        // skips this until the sequence's reconcile below restores it.
+        if self.vim.view && !self.view_suspended() {
+            self.view_sync_focus();
+        }
         // `.`: splice in the recorded last change. Everything below —
         // checkpoint, register mirror, renumber, re-recording — then treats
         // it exactly like freshly typed input.
@@ -1367,6 +1506,33 @@ impl Editor {
         // the system clipboard.
         if wrote_register && !self.doc().register_text().is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(self.doc().register_text().to_owned()));
+        }
+        if self.vim.view {
+            // Labels and hints die with the sequence that showed them
+            // (Escape, an aborting key, a pick).
+            if self.labels.is_some() && !self.vim.awaiting_label() {
+                self.labels = None;
+                self.label_base.set(None);
+            }
+            if !self.hints.borrow().is_empty() && !self.vim.awaiting_hint() {
+                self.hints.borrow_mut().clear();
+            }
+            // A label-targeted command ended: put the focus back. If the
+            // screen moved meanwhile (a selection ran off the bottom),
+            // re-derive it from the screen instead so nothing jumps.
+            if let Some((at, top_then)) = self.view_focus {
+                if !self.vim.in_sequence() && !self.vim.mode.is_visual() {
+                    self.view_focus = None;
+                    self.select_base.set(None);
+                    match (self.visible_rows(), self.view_anchor) {
+                        (Some((top, _)), Some(a)) if top != top_then => {
+                            let last = self.rows_cache.as_ref().map_or(0, |c| c.rows.len() - 1);
+                            self.move_to_row((top + a).min(last));
+                        }
+                        _ => self.doc_mut().jump_to(at),
+                    }
+                }
+            }
         }
         // Normal mode disallows the caret one past the line's last char; the
         // shared motions/edits allow it (insert mode appends there), so snap
@@ -1533,7 +1699,7 @@ impl Editor {
                 let line = self.doc().caret_line_col().0;
                 self.doc_mut().indent_lines(line, line + count - 1, width, dedent);
             }
-            Action::MoveDisplay { down } => self.move_display(down),
+            Action::MoveDisplay { down, count } => self.move_display(down, count),
             Action::CollapseSelection => self.doc_mut().collapse_selection(),
             Action::DeleteMotion(m, n) => self.doc_mut().delete_motion(m, n),
             Action::DeleteLines(n) => self.doc_mut().delete_lines(n),
@@ -1593,6 +1759,10 @@ impl Editor {
                     Scroll::Bottom => ScrollStrategy::Bottom,
                 };
                 self.scroll.scroll_to_item_strict(self.last_row, strategy);
+                // The scroll applies during the frame, so reading the offset
+                // here would still see the old one; adoption waits for the
+                // next view motion.
+                self.view_anchor = None;
             }
             Action::ScrollLines { down, count } => {
                 let n = count as isize;
@@ -1607,7 +1777,10 @@ impl Editor {
             Action::SearchNext { reverse, count } => self.search_next(reverse, count),
             Action::BufferNext => self.buffer_next(window),
             Action::BufferPrev => self.buffer_prev(window),
-            Action::FollowLink => self.follow_link(window, cx),
+            Action::FollowLink => {
+                let (line, col) = self.doc().caret_line_col();
+                self.follow_link_at(line, col, window, cx);
+            }
             Action::ToggleTask => {
                 let line = self.doc().caret_line_col().0;
                 self.toggle_task(line);
@@ -1617,6 +1790,12 @@ impl Editor {
             Action::SetMark(name) => self.set_mark(name),
             Action::JumpToMark { name, line } => self.jump_to_mark(name, line, window),
             Action::Fold(op) => self.fold(op),
+            Action::ExitView => self.set_view(false),
+            Action::YankLinesVertical { count, up } => self.doc_mut().yank_lines_dir(count, up),
+            Action::ShowRowLabels => self.show_row_labels(),
+            Action::RowLabelPick { n, then } => self.pick_row_label(n, then),
+            Action::HintsStart => self.show_hints(),
+            Action::HintPick(label) => self.pick_hint(&label, window, cx),
             // Expanded into the recorded change in `feed_vim`, before dispatch;
             // never reaches here.
             Action::Repeat => {}
@@ -1652,6 +1831,101 @@ impl Editor {
         }
     }
 
+    /// `:view` / Escape: enter or leave the reading posture. Entry keeps
+    /// screen and caret where they are — the anchor is adopted on the first
+    /// motion, not jumped to here; exit lands the now-visible caret at first
+    /// non-blank of the focus line, screen untouched. Pending label/hint/
+    /// visual state dies either way.
+    fn set_view(&mut self, on: bool) {
+        self.vim.view = on;
+        self.vim.reset();
+        self.view_anchor = None;
+        self.view_focus = None;
+        self.labels = None;
+        self.label_base.set(None);
+        self.hints.borrow_mut().clear();
+        self.select_base.set(None);
+        if !on {
+            self.doc_mut().move_motion(Motion::FirstNonBlank, 1);
+        }
+    }
+
+    /// Label every logical line whose first visual row is fully on screen (a
+    /// line half-hidden at the top gets none), 1-based from the top. Fixed
+    /// width so the grammar knows when a label is complete.
+    fn show_row_labels(&mut self) {
+        let Some((top, bottom)) = self.visible_rows() else { return };
+        let Some(c) = &self.rows_cache else { return };
+        // Lines with rows (fold-hidden lines emit none), by first row.
+        let mut first_row = 0;
+        let mut lines = Vec::new();
+        for (line, &n) in c.line_rows.iter().enumerate() {
+            if n > 0 && first_row >= top && first_row <= bottom {
+                lines.push(line);
+            }
+            first_row += n as usize;
+        }
+        let (Some(&top_line), count) = (lines.first(), lines.len()) else {
+            self.vim.cancel_pending();
+            return;
+        };
+        let width = count.to_string().len().max(2);
+        self.vim.label_width = width as u8;
+        self.labels = Some(LabelState { top_line, count });
+        self.label_base.set(Some((display_index(self.doc().folds(), top_line), count, width)));
+        if self.view_focus.is_none() {
+            self.view_focus = Some((self.doc().caret_offset(), top));
+        }
+    }
+
+    /// The `n`-th (1-based) logical line from `top_line` that carries a row —
+    /// a fold-hidden line has none, so it isn't counted. Shared by
+    /// `show_row_labels` (which line gets a label) and `pick_row_label`
+    /// (which line a typed label names).
+    fn nth_visible_line(&self, top_line: usize, n: usize) -> Option<usize> {
+        let c = self.rows_cache.as_ref()?;
+        c.line_rows[top_line..]
+            .iter()
+            .enumerate()
+            .filter(|&(_, &rows)| rows > 0)
+            .nth(n.checked_sub(1)?)
+            .map(|(i, _)| top_line + i)
+    }
+
+    /// A row label completed as `n` — run `then` against the line it names.
+    /// `n` out of range (a label typed past what's on screen, or after the
+    /// screen changed underneath it) aborts with a message instead of acting
+    /// on the wrong line.
+    fn pick_row_label(&mut self, n: usize, then: LabelThen) {
+        let Some(LabelState { top_line, count }) = self.labels.take() else { return };
+        self.label_base.set(None);
+        let line = (1..=count).contains(&n).then(|| self.nth_visible_line(top_line, n)).flatten();
+        let Some(line) = line else {
+            let w = self.vim.label_width as usize;
+            self.message = Some(format!("no row {n:0w$}"));
+            self.vim.cancel_pending(); // `y 47` left `Operator(Yank)` armed
+            if self.vim.mode.is_visual() {
+                self.vim.mode = Mode::Normal;
+            }
+            return; // feed_vim's reconcile restores the focus
+        };
+        let at = self.doc().rope.line_to_char(line);
+        match then {
+            LabelThen::Toggle => self.toggle_task(line),
+            LabelThen::YankLines(count) => {
+                self.doc_mut().jump_to(at);
+                self.doc_mut().yank_lines(count);
+            }
+            // The operator/selection now waits on a count + direction (`3j`)
+            // naming its other end; the gutter switches to numbering that
+            // distance from this line until it lands.
+            LabelThen::YankOp | LabelThen::Visual => {
+                self.doc_mut().jump_to(at);
+                self.select_base.set(Some(display_index(self.doc().folds(), line)));
+            }
+        }
+    }
+
     /// Open the closed fold the caret has landed in, if any — see `opens_fold`
     /// in `apply`. Also the arrival path for jumps that don't go through an
     /// `Action` (a grep or outline pick, a heading link).
@@ -1664,13 +1938,13 @@ impl Editor {
         self.doc_mut().open_fold(&spans, line);
     }
 
-    /// `gd`/`gf`/`gx`: follow the link under the caret. A wikilink opens its
-    /// note, or a blank named buffer if it doesn't exist yet (created on `:w`,
-    /// like `:e`); a `#Heading` fragment then lands on that heading, and a
-    /// note-less `[[#Heading]]` stays in the current document. An external URL
-    /// opens in the browser. Off a link it's a silent no-op.
-    fn follow_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (line, col) = self.doc().caret_line_col();
+    /// `gd`/`gf`/`gx`: follow the link at `(line, col)` — the caret outside
+    /// view, a hint pick in it. A wikilink opens its note, or a blank named
+    /// buffer if it doesn't exist yet (created on `:w`, like `:e`); a
+    /// `#Heading` fragment then lands on that heading, and a note-less
+    /// `[[#Heading]]` stays in the current document. An external URL opens in
+    /// the browser. Off a link it's a silent no-op.
+    fn follow_link_at(&mut self, line: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
         let text = line_text(&self.doc().rope, line);
         if let Some((note, heading)) = markdown::wikilink_at(&text, col) {
             if note.is_empty() {
@@ -1698,6 +1972,67 @@ impl Editor {
             }
         } else if let Some(url) = markdown::url_at(&text, col) {
             self.open_external(&url, cx);
+        }
+    }
+
+    /// `f` in view: label every visible link with home-row letters. A
+    /// link split across a soft wrap (consecutive `Link` segments across
+    /// rows of the same line) gets one hint, at its first row's start. No
+    /// links on screen aborts the pending state with a message.
+    fn show_hints(&mut self) {
+        let Some((top, bottom)) = self.visible_rows() else { return };
+        let Some(c) = &self.rows_cache else { return };
+        let (rows, line_rows) = (c.rows.clone(), c.line_rows.clone());
+        let bottom = bottom.min(rows.len().saturating_sub(1));
+
+        let mut targets: Vec<(usize, usize)> = Vec::new(); // (line, display byte)
+        let mut in_link = false;
+        let mut prev_line = None;
+        for row in &rows[top..=bottom] {
+            if prev_line != Some(row.line) {
+                in_link = false; // a new line never continues the last one's link
+            }
+            prev_line = Some(row.line);
+            let mut byte = row.b0;
+            for seg in &row.segments {
+                let is_link = matches!(seg.kind, Some(SpanKind::Link));
+                if is_link && !in_link {
+                    targets.push((row.line, byte));
+                }
+                in_link = is_link;
+                byte += seg.len;
+            }
+        }
+        if targets.is_empty() {
+            self.message = Some("no links on screen".into());
+            self.vim.cancel_pending();
+            return;
+        }
+
+        self.vim.hint_width = if targets.len() <= HINT_ALPHABET.len() { 1 } else { 2 };
+        let width = self.vim.hint_width as usize;
+        let labels = hint_labels(targets.len(), width);
+        let mut hints = Vec::with_capacity(targets.len());
+        for ((line, byte), label) in targets.into_iter().zip(labels) {
+            let first: usize = line_rows[..line].iter().map(|&n| n as usize).sum();
+            let n = line_rows[line] as usize;
+            let col = self.display_source_col(line, &rows[first..first + n], byte);
+            hints.push(Hint { line, byte, label: label.into(), col });
+        }
+        *self.hints.borrow_mut() = hints;
+    }
+
+    /// A link-hint label completed as `label` — follow the link it names.
+    /// No match (the screen changed underneath a pending hint) leaves a
+    /// message instead of acting on the wrong link.
+    fn pick_hint(&mut self, label: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let hints = std::mem::take(&mut *self.hints.borrow_mut());
+        match hints.iter().find(|h| h.label.as_ref() == label) {
+            Some(h) => {
+                let (line, col) = (h.line, h.col);
+                self.follow_link_at(line, col, window, cx);
+            }
+            None => self.message = Some(format!("no link: {label}")),
         }
     }
 
@@ -2010,6 +2345,7 @@ impl Render for Editor {
             q: self.search_query(),
             wrap_width,
             folds: self.doc().folds_gen(),
+            gutter_forced: self.gutter_forced(),
         };
         enum Plan {
             Hit,
@@ -2126,27 +2462,46 @@ impl Render for Editor {
                 None => self.scroll.scroll_to_item_strict(cur_row, ScrollStrategy::Center),
             }
         } else if cur_row != self.last_row {
-            let viewport = self.viewport_h();
-            let c = self.rows_cache.as_ref().unwrap();
-            let line = self.doc().rope.char_to_line(c.key.caret);
-            let first: usize = c.line_rows[..line].iter().map(|&n| n as usize).sum();
-            let last = first + c.line_rows[line] as usize - 1;
-            let offs = &c.offsets;
-            if cur_row > self.last_row {
-                // Deepest row whose bottom edge keeps the caret row's top
-                // within one viewport when scrolled to the bottom.
-                let deep = offs
-                    .partition_point(|&o| o <= offs[cur_row] + viewport)
-                    .saturating_sub(2);
-                let target = last.min(deep.max(cur_row));
-                self.scroll.scroll_to_item(target, ScrollStrategy::Bottom);
+            // View posture: the caret's screen row is pinned — but the
+            // screen can't scroll above row 0, so pinning `cur_row` `anchor`
+            // rows down only works while the document has that many rows
+            // above it. Short of that, `anchor` shrinks to exactly what's
+            // there (`anchor.min(cur_row)`) instead of holding its value and
+            // clamping the scroll target: every way the caret can reach this
+            // — `gg`, a mark, a held `k` — lands here the same way, so the
+            // caret is never somewhere the screen doesn't show, and reversing
+            // direction never means retracing a gap left open behind it.
+            // `view_anchor == None` (a search right after entry, before any
+            // motion) falls to the edge rule below; the next motion adopts
+            // from wherever that left the caret.
+            if let (true, false, Some(a)) = (self.vim.view, self.view_suspended(), self.view_anchor)
+            {
+                let a = a.min(cur_row);
+                self.view_anchor = Some(a);
+                self.scroll.scroll_to_item_strict(cur_row - a, ScrollStrategy::Top);
             } else {
-                // Shallowest row whose top edge keeps the caret row's bottom
-                // within one viewport when scrolled to the top.
-                let shallow =
-                    offs.partition_point(|&o| o < offs[cur_row + 1] - viewport);
-                let target = first.max(shallow.min(cur_row));
-                self.scroll.scroll_to_item(target, ScrollStrategy::Top);
+                let viewport = self.viewport_h();
+                let c = self.rows_cache.as_ref().unwrap();
+                let line = self.doc().rope.char_to_line(c.key.caret);
+                let first: usize = c.line_rows[..line].iter().map(|&n| n as usize).sum();
+                let last = first + c.line_rows[line] as usize - 1;
+                let offs = &c.offsets;
+                if cur_row > self.last_row {
+                    // Deepest row whose bottom edge keeps the caret row's top
+                    // within one viewport when scrolled to the bottom.
+                    let deep = offs
+                        .partition_point(|&o| o <= offs[cur_row] + viewport)
+                        .saturating_sub(2);
+                    let target = last.min(deep.max(cur_row));
+                    self.scroll.scroll_to_item(target, ScrollStrategy::Bottom);
+                } else {
+                    // Shallowest row whose top edge keeps the caret row's
+                    // bottom within one viewport when scrolled to the top.
+                    let shallow =
+                        offs.partition_point(|&o| o < offs[cur_row + 1] - viewport);
+                    let target = first.max(shallow.min(cur_row));
+                    self.scroll.scroll_to_item(target, ScrollStrategy::Top);
+                }
             }
         }
         self.last_row = cur_row;

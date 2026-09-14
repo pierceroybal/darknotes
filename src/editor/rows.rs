@@ -74,6 +74,10 @@ pub(super) struct RowsKey {
     /// content, so without it `za` would render as a cache hit and nothing
     /// would happen on screen.
     pub(super) folds: u64,
+    /// Row labels are on screen with line numbers off: the gutter must show
+    /// though nothing else about the content changed, so a `yy`/`V`/Enter in
+    /// view that arms a label can't render as a cache hit either.
+    pub(super) gutter_forced: bool,
 }
 
 /// The last row build: what it was built from, its rows, the caret's row,
@@ -129,6 +133,8 @@ pub(super) struct RowCtx {
     pub(super) mode: Mode,
     /// View posture: no line reveals its source, the cursor line included.
     pub(super) view: bool,
+    /// Row labels are on screen with line numbers off — see `RowsKey::gutter_forced`.
+    pub(super) gutter_forced: bool,
     pub(super) cur_line: usize,
     pub(super) cur_col: usize,
     /// Fence lines of the block the caret sits in, revealed along with the
@@ -393,6 +399,7 @@ impl Editor {
             mono_quote_cols: mono.map(|(.., c)| c),
             mode,
             view: self.vim.view,
+            gutter_forced: self.gutter_forced(),
             cur_line,
             cur_col,
             reveal_fences,
@@ -729,21 +736,32 @@ impl Editor {
             // The gutter carries its inputs, not a formatted label — the label
             // resolves in `prepaint` against the shared cursor line, so a caret
             // move never invalidates a cached row (see `Gutter`).
-            let gutter = (self.line_numbers != LineNumbers::Off).then(|| Gutter {
+            let gutter = (self.line_numbers != LineNumbers::Off || ctx.gutter_forced).then(|| Gutter {
                 line: i,
                 rel: ctx.display_index(i),
                 // Only a fold header reaches here — hidden lines emit no rows.
                 folded: ctx.fold_at(i).is_some(),
                 continuation: k > 0,
-                width: ctx.num_width,
+                width: if self.line_numbers == LineNumbers::Off {
+                    self.label_base.get().map_or(2, |(_, _, w)| w)
+                } else {
+                    ctx.num_width
+                },
                 relative: self.line_numbers == LineNumbers::Relative,
                 cur_line: self.cur_line.clone(),
                 cur_rel: self.cur_rel.clone(),
+                view: ctx.view,
+                label_base: self.label_base.clone(),
+                select_base: self.select_base.clone(),
             });
             out.push(LineElement {
+                line: i,
+                b0,
                 text: text[b0..b1].to_string().into(),
                 segments: slice_segments(segments, b0, b1),
-                caret: (caret_row == Some(k)).then(|| LineCaret {
+                // Hidden in view: the caret is a scroll carrier only, so no
+                // command may target it, and there is nothing to draw.
+                caret: (caret_row == Some(k) && !ctx.view).then(|| LineCaret {
                     col: cur_col.unwrap_or(0) - c0,
                     block: ctx.mode != Mode::Insert,
                 }),
@@ -767,6 +785,7 @@ impl Editor {
                     }),
                     d => d,
                 },
+                hints: self.hints.clone(),
             });
         }
         caret_at
@@ -843,6 +862,7 @@ pub(super) fn content_change_is_local(old: &RowsKey, new: &RowsKey) -> bool {
         // A fold toggle hides or reveals a span of lines and renumbers every
         // relative label below it — nothing local about it.
         && old.folds == new.folds
+        && old.gutter_forced == new.gutter_forced
 }
 
 /// Greedy word wrap for plain ASCII text in a monospace font: row-start byte
@@ -942,6 +962,7 @@ mod tests {
             q: q.to_string(),
             wrap_width: Some(px(400.)),
             folds: 0,
+            gutter_forced: false,
         };
 
         // No search: a caret move patches, as before.
