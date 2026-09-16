@@ -162,7 +162,7 @@ pub(super) const COMMANDS: &[Command] = &[
         // Toggle the read-only reading posture: the grammar drops mutating
         // commands (`Vim::view`), nothing reveals its concealed source
         // (`rows.rs`), and task toggling stays live.
-        run: |ed, _a, _win, _cx| ed.vim.view = !ed.vim.view,
+        run: |ed, _a, _win, _cx| ed.set_view(!ed.vim.view),
     },
     Command {
         name: "insert-link",

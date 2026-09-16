@@ -5,7 +5,7 @@
 //!
 //! A child module of `editor` so paint can reach private `Editor` state.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gpui::{
@@ -17,6 +17,8 @@ use gpui::{
 
 use crate::markdown::{Segment, Span, SpanKind};
 use crate::theme::Theme;
+
+use super::Hint;
 
 
 /// One caret on the cursor line. `block` is vim's normal/command block caret
@@ -70,6 +72,17 @@ pub(super) struct Gutter {
     pub(super) cur_line: Rc<Cell<usize>>,
     /// The cursor line's `rel`, read at paint time — see `Editor::cur_rel`.
     pub(super) cur_rel: Rc<Cell<usize>>,
+    /// View posture: no cursor line to point at, so the gutter reads absolute
+    /// and muted throughout.
+    pub(super) view: bool,
+    /// Row labels on screen (view, a verb pending): `(display index of the
+    /// first labeled line, label count, digit width)` — see `Editor::labels`.
+    /// Read at paint time, like `cur_line`.
+    pub(super) label_base: Rc<Cell<Option<(usize, usize, usize)>>>,
+    /// A row-label pick is being extended with a count + direction (`V 07
+    /// 3j`): the display index of the row it started from — see
+    /// `Editor::select_base`. Read at paint time, like `cur_line`.
+    pub(super) select_base: Rc<Cell<Option<usize>>>,
 }
 
 impl Gutter {
@@ -80,6 +93,31 @@ impl Gutter {
         if self.continuation {
             return (format!(" {:>width$}  ", "").into(), theme.muted);
         }
+        let mark = if self.folded { "▸" } else { " " };
+        // Row labels (view, a verb pending): 1-based from the first labeled
+        // line, zero-padded to the fixed width the grammar expects.
+        if let Some((base, count, w)) = self.label_base.get() {
+            let n = (self.rel + 1).saturating_sub(base);
+            return if (1..=count).contains(&n) {
+                let label = format!("{n:0w$}");
+                (format!(" {label:>width$} {mark}").into(), theme.mode_view)
+            } else {
+                (format!(" {:>width$} {mark}", "").into(), theme.muted)
+            };
+        }
+        // A row-label pick is being extended with a count + direction
+        // (`V 07 3j`, `y 07 3j`): pure distance from the row it started
+        // from — 0 on that row itself — colored to mark the moving end
+        // distinctly from a plain read.
+        if let Some(base) = self.select_base.get() {
+            let n = self.rel.abs_diff(base);
+            return (format!(" {n:>width$} {mark}").into(), theme.mode_visual);
+        }
+        // View: absolute and muted throughout — there is no cursor line to
+        // point at.
+        if self.view {
+            return (format!(" {:>width$} {mark}", self.line + 1).into(), theme.muted);
+        }
         let cur = self.cur_line.get();
         // Relative counts display lines (`rel`), absolute the real one: a fold
         // header still names the line its heading is on.
@@ -89,7 +127,6 @@ impl Gutter {
             self.line + 1
         };
         let color = if self.line == cur { theme.foreground } else { theme.muted };
-        let mark = if self.folded { "▸" } else { " " };
         (format!(" {n:>width$} {mark}").into(), color)
     }
 
@@ -134,6 +171,14 @@ pub(super) struct Highlight {
 /// needs to know about wrapping.
 #[derive(Clone)]
 pub(super) struct LineElement {
+    /// This row's logical line — link hints (view posture `f`) are keyed by
+    /// `(line, display byte)`, not visual row index, since a patch splice can
+    /// move row indices without moving the line.
+    pub(super) line: usize,
+    /// This row's byte start within its line's *display* text (all the
+    /// line's rows joined) — the base link hints add their row-relative
+    /// segment byte to.
+    pub(super) b0: usize,
     pub(super) text: SharedString,
     /// Styled segments matching `text` (concealed or source), mapped to runs in
     /// `prepaint`. Independent of the caret, so the cache keys on content alone.
@@ -172,6 +217,10 @@ pub(super) struct LineElement {
     /// Block-level paint decoration (code band / quote bar / rule hairline).
     /// `None` on the cursor line and with markdown rendering off.
     pub(super) decor: Option<RowDecor>,
+    /// Link hints on screen (view posture `f`), shared like `scroll_x` — see
+    /// `Editor::hints`. Read at paint time, so showing/hiding hints rebuilds
+    /// no rows.
+    pub(super) hints: Rc<RefCell<Vec<Hint>>>,
 }
 
 pub(super) struct LinePrepaint {
@@ -188,6 +237,8 @@ pub(super) struct LinePrepaint {
     /// Block caret only: the glyph under the caret, repainted dark over the
     /// block. `(font, glyph, x within the line)`. `None` for the bar and at EOL.
     caret_glyph: Option<(FontId, GlyphId, Pixels)>,
+    /// `(x within the line, shaped label)` of each link hint on this row.
+    hints: Vec<(Pixels, ShapedLine)>,
     /// `(x0, x1, checked)` of a task box's transparent `[ ]` span; the box
     /// paints centered in it. `None` when the row has none (or shows source —
     /// those rows carry Marker, not Task).
@@ -361,12 +412,27 @@ impl Element for LineElement {
             byte += seg.len;
         }
 
+        // Link hints on this row: this line's hints whose byte falls in the
+        // row's slice of the line's display text, re-based to a row-local x.
+        let hints = self
+            .hints
+            .borrow()
+            .iter()
+            .filter(|h| h.line == self.line && (self.b0..self.b0 + self.text.len()).contains(&h.byte))
+            .map(|h| {
+                let x = shaped.x_for_index(h.byte - self.b0);
+                let runs = [run(&font, h.label.len(), theme.background)];
+                (x, window.text_system().shape_line(h.label.clone(), base_size * 0.85, &runs, None))
+            })
+            .collect();
+
         LinePrepaint {
             shaped,
             gutter,
             gutter_w,
             selection,
             search,
+            hints,
             caret,
             caret_glyph,
             task,
@@ -534,6 +600,16 @@ impl Element for LineElement {
                         outline(b, theme.muted, BorderStyle::default()).corner_radii(px(3.)),
                     );
                 }
+            }
+            // Link hint labels (view posture `f`): a small pill at each
+            // link's start column.
+            for (x, label) in &prepaint.hints {
+                let b = Bounds::new(
+                    point(ox + *x - px(2.), oy),
+                    size(label.width + px(4.), line_height),
+                );
+                window.paint_quad(fill(b, theme.mode_view).corner_radii(px(2.)));
+                let _ = label.paint(point(ox + *x, oy), line_height, window, cx);
             }
         });
     }
@@ -771,6 +847,9 @@ mod tests {
             relative,
             cur_line: cur.clone(),
             cur_rel: cur.clone(),
+            view: false,
+            label_base: Rc::new(Cell::new(None)),
+            select_base: Rc::new(Cell::new(None)),
         };
         let label = |gut: &Gutter| gut.resolve(&theme).0.to_string();
 
@@ -834,6 +913,40 @@ mod tests {
         cur.set(4);
         assert_eq!(g(4, true, false).resolve(&theme).1, theme.foreground);
         assert_eq!(g(5, true, false).resolve(&theme).1, theme.muted);
+    }
+
+    #[test]
+    fn gutter_select_base_shows_distance_from_the_selection_start() {
+        // A row-label pick under extension (`V 12 3j`) numbers purely by
+        // distance from the row it started at — 0 there, not that row's
+        // absolute number — in the mode-visual color, and overrides both
+        // ordinary and view numbering.
+        let theme = crate::theme::Theme::by_name("dark").unwrap();
+        let cur = Rc::new(Cell::new(0usize));
+        let select_base = Rc::new(Cell::new(Some(12usize)));
+        let g = |line: usize| Gutter {
+            line,
+            rel: line,
+            folded: false,
+            continuation: false,
+            width: 3,
+            relative: false,
+            cur_line: cur.clone(),
+            cur_rel: cur.clone(),
+            view: true,
+            label_base: Rc::new(Cell::new(None)),
+            select_base: select_base.clone(),
+        };
+        let label = |gut: &Gutter| gut.resolve(&theme).0.to_string();
+
+        assert_eq!(label(&g(12)), "   0  ");
+        assert_eq!(label(&g(15)), "   3  ");
+        assert_eq!(label(&g(9)), "   3  ");
+        assert_eq!(g(15).resolve(&theme).1, theme.mode_visual);
+
+        // A continuation row still blanks, same as every other numbering mode.
+        let cont = Gutter { continuation: true, ..g(15) };
+        assert_eq!(label(&cont), "      ");
     }
 
     #[test]
