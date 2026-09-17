@@ -29,8 +29,9 @@ use buffers::{
 };
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
 use line_element::{
-    caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, CaretPaint,
-    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD, QUOTE_PAD,
+    caret_bytes, fence_block, heading_metrics, list_pad, row_decor, run, segments_to_runs,
+    CaretPaint, Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
+    QUOTE_PAD,
 };
 use picker::Picker;
 use row_list::row_list;
@@ -186,6 +187,8 @@ pub struct Editor {
     line_numbers: LineNumbers,
     /// Hide markdown syntax markers on non-cursor lines, from config.
     render_markdown: bool,
+    /// Top margin on top-level list items, from config.
+    list_spacing: bool,
     /// Keymap bindings (defaults + `[keymap.*]` config), resolved per keystroke
     /// before the vim grammar.
     keymap: Resolver,
@@ -465,6 +468,7 @@ impl Editor {
             font_size: config.font_size,
             line_numbers: config.line_numbers,
             render_markdown: config.render_markdown,
+            list_spacing: config.list_spacing,
             keymap,
             timeoutlen: config.keymap.timeoutlen,
             seq_timer: None,
@@ -793,7 +797,7 @@ impl Editor {
 
         // x → byte within this row's display text, mirroring paint's origin:
         // past the gutter, inset when the row carries a decoration (code band,
-        // quote bar), shifted by the horizontal scroll.
+        // quote bar) or a wrap indent, shifted by the horizontal scroll.
         let font = gpui::font(self.font_family.clone());
         let font_size = px(self.font_size);
         let theme = *cx.global::<Theme>();
@@ -813,7 +817,7 @@ impl Editor {
         let runs = segments_to_runs(&el.text, &el.segments, &font, theme.foreground, &theme);
         let shaped =
             window.text_system().shape_line(el.text.clone(), font_size * el.scale, &runs, None);
-        let x = pos.x - bounds.origin.x - gutter_w - pad + self.scroll_x.get();
+        let x = pos.x - bounds.origin.x - gutter_w - pad - el.hang + self.scroll_x.get();
         let byte_in_row = shaped.closest_index_for_x(x.max(Pixels::ZERO));
 
         // A click on the painted task box toggles it, caret untouched. The

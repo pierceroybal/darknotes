@@ -29,6 +29,11 @@ line_numbers = "off"
 # plain source view.
 render_markdown = true
 
+# Add a little space above each top-level list item so long items read as
+# separate blocks. Nested items stay tight to their parent. Only applies
+# while render_markdown is on.
+list_spacing = true
+
 # Soft-wrap long lines at the pane edge (vim 'wrap'). Set false — or use
 # `:set nowrap` — to scroll long lines horizontally instead.
 wrap = true

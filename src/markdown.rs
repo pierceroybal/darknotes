@@ -339,6 +339,21 @@ pub fn task_box(line: &str) -> Option<(usize, bool)> {
     (rest.get(3).is_none_or(|&b| b == b' ')).then_some((at, checked))
 }
 
+/// Byte length of `line`'s wrap-indent prefix: its leading spaces plus, on a
+/// list item, the marker, its space, and any task box with its space — the
+/// column a soft-wrapped continuation row starts under. All ASCII, so bytes
+/// are columns. Identical on source and concealed text: conceal keeps the
+/// indent, the bullet, and the task box's bytes.
+pub fn hang_prefix(line: &str) -> usize {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    let Some(marker) = list_marker(&line[indent..]) else { return indent };
+    let mut at = indent + marker + 1;
+    if task_box(line).is_some() {
+        at += 4; // `[ ]` and its space
+    }
+    at.min(line.len())
+}
+
 /// Ordered-list item as `(number, digit count)`; `None` for unordered items
 /// and non-items.
 pub fn ordered_item(line: &str) -> Option<(u64, usize)> {
@@ -1003,6 +1018,25 @@ mod tests {
         let line = "> quote";
         let segs = flatten(line.len(), &parse(&Rope::from_str(line))[0]);
         assert_eq!(conceal(line, &segs).text, "quote");
+    }
+
+    #[test]
+    fn hang_prefix_covers_indent_marker_and_task_box() {
+        for (line, want) in [
+            ("- item", 2),
+            ("  - item", 4),
+            ("1. x", 3),
+            ("10) x", 4),
+            ("- [ ] x", 6),
+            ("- [x] x", 6),
+            ("  para", 2),
+            ("para", 0),
+            ("-item", 0),
+            ("", 0),
+            ("- [ ]", 5),
+        ] {
+            assert_eq!(hang_prefix(line), want, "{line:?}");
+        }
     }
 
     #[test]

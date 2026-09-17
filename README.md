@@ -44,9 +44,11 @@ Operators (`d`, `c`, `y`, `>`, `<`) compose with motions (`w`, `b`, `e`, `f`,
 
 **Markdown that stays text.** Syntax markers (`#`, `**`, `` ` ``) are hidden on
 every line *except* the one your cursor is on, which reveals its full source for
-editing. Headings scale, links and code render — but the file on disk is exactly
-what you typed. Set `render_markdown = false` in your config for a plain source
-view.
+editing. Headings scale, bold takes a color of its own, links and code render,
+top-level list items get a little air above them, and a soft-wrapped line's
+continuation rows indent under its bullet — but the file on disk is exactly what
+you typed. Set `render_markdown = false` in your config for a plain source view,
+`list_spacing = false` to keep lists tight.
 
 **Wikilinks.** `[[note name]]` resolves across the vault, case-insensitively.
 `insert-link` opens a picker that inserts one; `gd`, `gf`, or `gx` follows the
@@ -249,8 +251,8 @@ reference. Every key is optional; delete one to fall back to its built-in
 default.
 
 Broadly: `vault`, `theme`, `font_family`, `ui_font_family`, `font_size`,
-`tab_width`, `line_numbers`, `render_markdown`, `wrap`, cursor blink, key
-repeat, `watch_files`, a `[keymap.*]` tree, a `[search]` table, and `[notes.*]`
+`tab_width`, `line_numbers`, `render_markdown`, `list_spacing`, `wrap`, cursor
+blink, key repeat, `watch_files`, a `[keymap.*]` tree, a `[search]` table, and `[notes.*]`
 sections for your own note commands.
 
 Machine-owned restore state lives separately in `session.toml`, so darknotes

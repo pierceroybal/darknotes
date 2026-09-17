@@ -34,6 +34,9 @@ pub struct Config {
     /// Render markdown by hiding syntax markers on every line except the one the
     /// cursor is on, which shows full source.
     pub render_markdown: bool,
+    /// Breathing room above each top-level list item when rendering markdown
+    /// (nested items stay tight to their parent).
+    pub list_spacing: bool,
     /// Soft-wrap long lines at the pane edge (vim 'wrap'; `:set nowrap` to
     /// scroll horizontally instead).
     pub wrap: bool,
@@ -153,6 +156,7 @@ impl Default for Config {
             tab_width: 2,
             line_numbers: LineNumbers::Off,
             render_markdown: true,
+            list_spacing: true,
             wrap: true,
             cursor_blink: true,
             cursor_blink_interval: 500,
@@ -288,6 +292,7 @@ mod tests {
         assert_eq!(c.key_repeat_delay, 500);
         assert_eq!(c.key_repeat_interval, 30);
         assert!(c.watch_files);
+        assert!(c.list_spacing);
     }
 
     #[test]
