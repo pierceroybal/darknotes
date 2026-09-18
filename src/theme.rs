@@ -31,6 +31,10 @@ pub struct Theme {
     // punctuation (`##`, `**`, bullets); `code`/`code_bg` style inline and
     // fenced code.
     pub heading: Hsla,
+    /// Bold (`**text**`) — its own hue, bold weight. Weight alone is nearly
+    /// invisible in a monospace face, so this is what makes an emphasized
+    /// phrase scannable. Must differ from `foreground` (see the theme test).
+    pub strong: Hsla,
     pub code: Hsla,
     pub code_bg: Hsla,
     pub muted: Hsla,
@@ -95,6 +99,7 @@ impl Theme {
             status_background: rgb(0x2a2a2a).into(),
             status_foreground: rgb(0x888888).into(),
             heading: rgb(0x87b3ff).into(),
+            strong: rgb(0xe5c07b).into(),
             code: rgb(0xb5cea8).into(),
             code_bg: rgb(0x262626).into(),
             muted: rgb(0x707070).into(),
@@ -125,6 +130,7 @@ impl Theme {
             status_background: rgb(0x242936).into(),
             status_foreground: rgb(0x707a8c).into(),
             heading: rgb(0x73d0ff).into(),
+            strong: rgb(0xffad66).into(),
             code: rgb(0xd5ff80).into(),
             code_bg: rgb(0x242936).into(),
             muted: rgb(0x5c6773).into(),
@@ -154,6 +160,7 @@ impl Theme {
             status_background: rgb(0x2a2a37).into(),
             status_foreground: rgb(0x727169).into(),
             heading: rgb(0x7e9cd8).into(),
+            strong: rgb(0xffa066).into(),
             code: rgb(0x98bb6c).into(),
             code_bg: rgb(0x2a2a37).into(),
             muted: rgb(0x727169).into(),
@@ -184,6 +191,7 @@ impl Theme {
             status_background: rgb(0x343f44).into(),
             status_foreground: rgb(0x859289).into(),
             heading: rgb(0xa7c080).into(),
+            strong: rgb(0xe69875).into(),
             code: rgb(0x83c092).into(),
             code_bg: rgb(0x343f44).into(),
             muted: rgb(0x7a8478).into(),
@@ -214,6 +222,7 @@ impl Theme {
             status_background: rgb(0x32302f).into(),
             status_foreground: rgb(0x928374).into(),
             heading: rgb(0xe78a4e).into(),
+            strong: rgb(0xd8a657).into(),
             code: rgb(0xa9b665).into(),
             code_bg: rgb(0x32302f).into(),
             muted: rgb(0x7c6f64).into(),
@@ -246,6 +255,7 @@ impl Theme {
             status_background: rgb(0x313244).into(),
             status_foreground: rgb(0x7f849c).into(),
             heading: rgb(0x89b4fa).into(),
+            strong: rgb(0xfab387).into(),
             code: rgb(0xa6e3a1).into(),
             code_bg: rgb(0x2a2a3e).into(),
             muted: rgb(0x6c7086).into(),
@@ -275,6 +285,7 @@ impl Theme {
             status_background: rgb(0xe9e9e6).into(),
             status_foreground: rgb(0x555555).into(),
             heading: rgb(0x1d63d1).into(),
+            strong: rgb(0xb45309).into(),
             code: rgb(0x9a3b2f).into(),
             code_bg: rgb(0xecebe7).into(),
             muted: rgb(0x8a8a8a).into(),
@@ -307,5 +318,16 @@ mod tests {
             assert!(Theme::by_name(name).is_some(), "{name} in table but unresolvable");
         }
         assert!(Theme::by_name("nope").is_none());
+    }
+
+    #[test]
+    fn strong_differs_from_foreground_in_every_palette() {
+        // gpui merges adjacent same-colored runs and drops the bold weight
+        // (see `line_element::nudge`); a distinct color is what keeps it.
+        for name in Theme::names() {
+            let t = Theme::by_name(name).unwrap();
+            assert_ne!(t.strong, t.foreground, "{name}");
+            assert_ne!(t.strong, t.heading, "{name}");
+        }
     }
 }

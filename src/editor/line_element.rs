@@ -214,6 +214,12 @@ pub(super) struct LineElement {
     /// row carries rendered markdown's top margin. Zero everywhere else.
     /// Included in `height`; text and quads paint below it.
     pub(super) pad_top: Pixels,
+    /// Wrap indent on a continuation row: the width of the line's leading
+    /// spaces and list marker, so wrapped text starts under the item's first
+    /// word. Zero on a line's first row and on unwrapped lines. Offsets the
+    /// text origin like `decor`'s inset; the wrap width shrank to match in
+    /// `append_line_rows`. Not part of `height`.
+    pub(super) hang: Pixels,
     /// Block-level paint decoration (code band / quote bar / rule hairline).
     /// `None` on the cursor line and with markdown rendering off.
     pub(super) decor: Option<RowDecor>,
@@ -465,14 +471,15 @@ impl Element for LineElement {
         let text_origin_x = bounds.origin.x + prepaint.gutter_w;
         // Decorated rows inset all their content (text, caret, highlights):
         // code rows by CODE_MARGIN + CODE_PAD so it clears the band border,
-        // quote rows by QUOTE_PAD so it clears the bar. Wrap width shrank to
-        // match in `append_line_rows`.
+        // quote rows by QUOTE_PAD so it clears the bar. A continuation row
+        // adds its wrap indent. Wrap width shrank to match in
+        // `append_line_rows`.
         let pad = match self.decor {
             Some(RowDecor::CodeBand { .. }) => CODE_MARGIN + CODE_PAD,
             Some(RowDecor::QuoteBar) => QUOTE_PAD,
             _ => Pixels::ZERO,
         };
-        let ox = text_origin_x + pad - self.scroll_x.get();
+        let ox = text_origin_x + pad + self.hang - self.scroll_x.get();
         let text_bounds = Bounds::new(
             point(text_origin_x, bounds.origin.y),
             size(bounds.size.width - prepaint.gutter_w, bounds.size.height),
@@ -675,6 +682,24 @@ pub(super) fn heading_metrics(segments: &[Segment]) -> (f32, f32) {
     }
 }
 
+/// Top margin, in lines, above a top-level list item (`list_pad`). Matches
+/// H3's margin so the vertical rhythm has one small step, not two.
+pub(super) const LIST_PAD: f32 = 0.3;
+
+/// Top margin, in lines, for line `line`: `LIST_PAD` when its role is
+/// `ListItem` (from the parse — a `- ` inside a fence is code) and its source
+/// text has no indent, else 0. A function of this line alone: the one-line-edit
+/// patch re-emits only the edited line, so a pad that read a neighbour would go
+/// stale when that neighbour changed.
+pub(super) fn list_pad(spans: &[Vec<Span>], line: usize, text: &str) -> f32 {
+    let lead = spans.get(line).and_then(|s| s.first()).map(|s| s.kind);
+    if lead == Some(SpanKind::ListItem) && !text.starts_with(' ') {
+        LIST_PAD
+    } else {
+        0.0
+    }
+}
+
 /// Block-level paint decoration for a row. Applied only to concealed rows —
 /// the cursor line and raw view show plain source, like conceal.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -767,7 +792,7 @@ fn segment_style(
     let Some(kind) = kind else { return normal };
     match kind {
         SpanKind::Heading(_) => (theme.heading, FontWeight::BOLD, FontStyle::Normal, None),
-        SpanKind::Strong => (nudge(fg, 1.), FontWeight::BOLD, FontStyle::Normal, None),
+        SpanKind::Strong => (theme.strong, FontWeight::BOLD, FontStyle::Normal, None),
         SpanKind::Emphasis => (nudge(fg, 2.), FontWeight::NORMAL, FontStyle::Italic, None),
         SpanKind::Code | SpanKind::CodeText | SpanKind::CodeFence => {
             (theme.code, FontWeight::NORMAL, FontStyle::Normal, Some(theme.code_bg))
@@ -786,22 +811,14 @@ fn segment_style(
     }
 }
 
-// ponytail: gpui's `layout_line` (text_system.rs) infers "same font" from
-// "same decoration" (color/underline/strikethrough) and merges adjacent runs
-// on that basis without checking weight or style — so a Strong or Emphasis
-// run flanked by same-`fg` text (exactly what concealment produces once the
-// differently-colored delimiter is dropped) gets folded into the surrounding
-// regular run and silently loses its bold or italic. Nudging alpha by an
-// imperceptible amount keeps a run "different" so gpui resolves its own font
-// instead of assuming it's unchanged. Strong and Emphasis use different step
-// counts so two adjacent runs of each don't merge into *each other* either.
-// Remove this workaround (and the color nudge it does) whichever comes
-// first: (1) `LineElement` switches its shaping call from `shape_line` to
-// `shape_text` — likely when line wrapping is implemented, since
-// `shape_text`'s `process_line` already resolves fonts per-run correctly and
-// this bug can't occur there; or (2) a gpui upgrade fixes `layout_line` to
-// compare fonts directly instead of inferring sameness from decoration
-// (reported upstream to zed-industries/zed).
+// gpui's `layout_line` infers "same font" from "same decoration" (color,
+// underline, strikethrough) and merges adjacent runs without checking weight
+// or style, so an Emphasis run flanked by same-`fg` text — what concealment
+// leaves once the `*` delimiters drop — folds into its neighbours and loses
+// its italic. An imperceptible alpha nudge keeps the run distinct. Strong
+// needs none: `theme.strong` differs from `foreground` in every palette (a
+// theme test guards it). Remove once gpui compares fonts directly (reported
+// upstream to zed-industries/zed).
 fn nudge(fg: Hsla, steps: f32) -> Hsla {
     Hsla { a: (fg.a - steps * 0.001).max(0.0), ..fg }
 }
@@ -824,7 +841,8 @@ pub(super) fn caret_bytes(text: &str, col: usize) -> (usize, Option<usize>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        caret_bytes, fence_block, heading_metrics, row_decor, segment_style, Gutter, RowDecor,
+        caret_bytes, fence_block, heading_metrics, list_pad, row_decor, segment_style, Gutter,
+        RowDecor, LIST_PAD,
     };
     use crate::markdown::{self, SpanKind};
     use gpui::{FontStyle, FontWeight, Hsla};
@@ -951,11 +969,11 @@ mod tests {
 
     #[test]
     fn strong_and_emphasis_colors_differ_from_plain_and_each_other() {
-        // Neither must share an exact color with plain body text or with each
+        // Neither may share an exact color with plain body text or with each
         // other: gpui's layout_line treats equal-decoration adjacent runs as
         // equal-font and merges them, dropping weight/slant when concealment
-        // leaves a styled run flanked by plain `fg` text (see `nudge`'s doc
-        // comment).
+        // leaves a styled run flanked by plain `fg` text (see `nudge`). Strong
+        // gets there through its theme color, Emphasis through the nudge.
         let fg: Hsla = gpui::rgb(0xcccccc).into();
         let theme = crate::theme::Theme::by_name("dark").unwrap();
         let (strong_color, strong_weight, strong_style, _) =
@@ -963,6 +981,7 @@ mod tests {
         let (em_color, em_weight, em_style, _) =
             segment_style(Some(SpanKind::Emphasis), fg, &theme);
         let (plain_color, _, _, _) = segment_style(None, fg, &theme);
+        assert_eq!(strong_color, theme.strong);
         assert_ne!(strong_color, plain_color);
         assert_ne!(em_color, plain_color);
         assert_ne!(strong_color, em_color);
@@ -983,6 +1002,19 @@ mod tests {
         assert_eq!(heading_metrics(&[seg(Some(SpanKind::Heading(4)))]), (1.0, 0.0));
         assert_eq!(heading_metrics(&[seg(None)]), (1.0, 0.0));
         assert_eq!(heading_metrics(&[]), (1.0, 0.0));
+    }
+
+    #[test]
+    fn list_pad_marks_top_level_items_only() {
+        let src = "- a\n  - b\n```\n- c\n```\n1. d\n- [ ] e\npara\n";
+        let spans = markdown::parse(&Rope::from_str(src));
+        let pad = |i: usize| list_pad(&spans, i, src.lines().nth(i).unwrap());
+        assert_eq!(pad(0), LIST_PAD);
+        assert_eq!(pad(1), 0.0); // nested
+        assert_eq!(pad(3), 0.0); // a bullet inside a fence is code
+        assert_eq!(pad(5), LIST_PAD); // ordered
+        assert_eq!(pad(6), LIST_PAD); // task
+        assert_eq!(pad(7), 0.0);
     }
 
     #[test]

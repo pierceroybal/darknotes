@@ -49,8 +49,9 @@ use crate::theme::Theme;
 use crate::vim::Mode;
 
 use super::{
-    caret_bytes, fence_block, heading_metrics, row_decor, run, segments_to_runs, Editor,
-    Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD, QUOTE_PAD,
+    caret_bytes, fence_block, heading_metrics, list_pad, row_decor, run, segments_to_runs,
+    Editor, Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
+    QUOTE_PAD,
 };
 
 /// Everything the editor's row list is built from, beyond session constants
@@ -124,6 +125,9 @@ pub(super) struct RowCtx {
     /// Columns per row when the font probed monospace; the plain-ASCII
     /// column-walk wrap path.
     pub(super) mono_cols: Option<usize>,
+    /// One glyph's advance when the font probed monospace — the wrap indent
+    /// in pixels is `mono_advance × columns`.
+    pub(super) mono_advance: Option<Pixels>,
     /// `mono_cols` shrunk by the `CODE_MARGIN + CODE_PAD` text inset — the
     /// column budget for code-band lines, which wrap inside the band's border.
     pub(super) mono_band_cols: Option<usize>,
@@ -217,6 +221,8 @@ pub(super) struct LineForm {
     metrics: (f32, f32),
     decor: Option<RowDecor>,
     row_starts: Vec<usize>,
+    /// Wrap indent of the continuation rows, in pixels.
+    hang: Pixels,
 }
 
 /// `LineForm` per logical line, so a rebuild driven by something other than
@@ -358,7 +364,7 @@ impl Editor {
         // ('i' and 'M' advance alike ⇒ monospace); the per-line gate in
         // `append_line_rows` keeps the exact shaped path for anything the
         // walk can't promise.
-        let mono: Option<(usize, usize, usize)> = wrap_width.and_then(|w| {
+        let mono: Option<(usize, usize, usize, Pixels)> = wrap_width.and_then(|w| {
             let advance = |s: &'static str| {
                 let runs = [run(&font, 1, theme.foreground)];
                 window.text_system().shape_line(s.into(), font_size, &runs, None).width
@@ -366,7 +372,7 @@ impl Editor {
             let (iw, mw) = (advance("i"), advance("M"));
             ((iw - mw).abs() < px(0.01) && iw > Pixels::ZERO).then(|| {
                 let cols = |w: Pixels| ((w / iw) as usize).max(1);
-                (cols(w), cols(w - (CODE_MARGIN + CODE_PAD) * 2.), cols(w - QUOTE_PAD))
+                (cols(w), cols(w - (CODE_MARGIN + CODE_PAD) * 2.), cols(w - QUOTE_PAD), iw)
             })
         });
 
@@ -395,8 +401,9 @@ impl Editor {
             line_h: self.line_h(),
             wrap_width,
             mono_cols: mono.map(|(c, ..)| c),
-            mono_band_cols: mono.map(|(_, c, _)| c),
-            mono_quote_cols: mono.map(|(.., c)| c),
+            mono_band_cols: mono.map(|(_, c, ..)| c),
+            mono_quote_cols: mono.map(|(_, _, c, _)| c),
+            mono_advance: mono.map(|(.., a)| a),
             mode,
             view: self.vim.view,
             gutter_forced: self.gutter_forced(),
@@ -508,15 +515,16 @@ impl Editor {
             && selection.is_none()
             && search.is_empty();
         if let Some(form) = cacheable.then(|| self.line_forms.take(i)).flatten() {
-            let LineForm { text, segments, metrics: (scale, pad), decor, row_starts } = form;
+            let LineForm { text, segments, metrics: (scale, pad), decor, row_starts, hang } =
+                form;
             let pad_top = (ctx.line_h * pad).round();
             self.emit_rows(
-                ctx, i, &text, &segments, &row_starts, None, &[], None, scale, pad_top, decor,
-                out,
+                ctx, i, &text, &segments, &row_starts, None, &[], None, scale, pad_top, hang,
+                decor, out,
             );
             self.line_forms.put(
                 i,
-                LineForm { text, segments, metrics: (scale, pad), decor, row_starts },
+                LineForm { text, segments, metrics: (scale, pad), decor, row_starts, hang },
             );
             // Never the cursor line, so the only caret it can own is one hidden
             // inside the fold it heads.
@@ -528,6 +536,15 @@ impl Editor {
         // full source so caret math stays on real document bytes.
         let text = line_text(&ctx.rope, i);
         let line_spans = ctx.spans.get(i).map_or(&[][..], Vec::as_slice);
+        // Top-level list items get a heading-style top margin. Computed from
+        // the source before the conceal branch so the revealed cursor line and
+        // the concealed form agree — row heights must not change on a caret
+        // move.
+        let list_pad = if self.list_spacing && self.render_markdown {
+            list_pad(&ctx.spans, i, &text)
+        } else {
+            0.0
+        };
         let segs = markdown::flatten(text.len(), line_spans);
         let mut cur_col = ctx.cur_col;
         // Heading lines shape larger in a taller row, the revealed cursor
@@ -575,8 +592,10 @@ impl Editor {
                 .filter(|d| matches!(d, RowDecor::CodeBand { .. }));
             (text, segs, selection, search, metrics, decor)
         };
-        // Breathing room above a heading — on the line's first visual row
-        // only; wrapped continuation rows keep just the scaled box.
+        // Breathing room above a heading or a top-level list item — on the
+        // line's first visual row only; wrapped continuation rows keep just
+        // the scaled box.
+        let pad = pad.max(list_pad);
         let pad_top = (ctx.line_h * pad).round();
 
         // Byte offset where each visual row starts: 0, plus one per wrap
@@ -584,9 +603,10 @@ impl Editor {
         // lines in a monospace font take the column walk; anything the
         // walk can't promise — non-ASCII (fallback fonts, wide glyphs),
         // tabs, bold spans (a family's bold could differ) — shapes for
-        // exact boundaries, cached in `wrap_cache` across rebuilds.
-        let row_starts: Vec<usize> = match ctx.wrap_width {
-            None => vec![0],
+        // exact boundaries, cached in `wrap_cache` across rebuilds. Paired
+        // with the wrap indent its continuation rows paint at.
+        let (row_starts, hang_px): (Vec<usize>, Pixels) = match ctx.wrap_width {
+            None => (vec![0], Pixels::ZERO),
             Some(w) => {
                 // A decorated row's text is inset by paint — a code band by
                 // CODE_MARGIN + CODE_PAD per side, a quote by QUOTE_PAD on the
@@ -601,6 +621,35 @@ impl Editor {
                     Some(RowDecor::QuoteBar) => (w - QUOTE_PAD, ctx.mono_quote_cols, 2),
                     _ => (w, ctx.mono_cols, 0),
                 };
+                // Wrap indent (vim `breakindent`): continuation rows start
+                // under the line's leading spaces and list marker. Not inside
+                // a code band — its rows share one budget. Clamped to half
+                // the width so a deeply nested item keeps a readable measure;
+                // the column count and the pixel offset both come from this
+                // one clamped value, or the walk and the paint disagree and
+                // rows spill past the edge.
+                let hang_cols = match decor {
+                    Some(RowDecor::CodeBand { .. }) => 0,
+                    _ => markdown::hang_prefix(&text),
+                };
+                let (hang_cols, hang_px) = match (mono_cols, ctx.mono_advance) {
+                    _ if hang_cols == 0 => (0, Pixels::ZERO),
+                    (Some(cols), Some(adv)) => {
+                        let h = hang_cols.min(cols / 2);
+                        (h, adv * h as f32)
+                    }
+                    // Proportional font: measure the prefix (plain ASCII, one
+                    // short `shape_line`; these fonts shape every line anyway).
+                    _ => {
+                        let runs = [run(&ctx.font, hang_cols, ctx.theme.muted)];
+                        let prefix = text[..hang_cols].to_string().into();
+                        let measured = window
+                            .text_system()
+                            .shape_line(prefix, ctx.font_size, &runs, None)
+                            .width;
+                        (hang_cols, measured.min(w / 2.))
+                    }
+                };
                 let plain = text.is_ascii()
                     && !text.contains('\t')
                     && segments.iter().all(|s| {
@@ -609,44 +658,62 @@ impl Editor {
                             Some(SpanKind::Heading(_) | SpanKind::Strong | SpanKind::Emphasis)
                         )
                     });
-                match mono_cols {
-                    Some(cols) if plain => wrap_columns(&text, cols),
+                let starts = match mono_cols {
+                    Some(cols) if plain => wrap_columns(&text, cols, hang_cols),
                     _ => {
                         let key = (text.clone(), segments.clone(), inset);
                         match self.wrap_cache.get(&key) {
                             Some(starts) => starts,
                             None => {
-                                let runs = segments_to_runs(
-                                    &text,
-                                    &segments,
-                                    &ctx.font,
-                                    ctx.theme.foreground,
-                                    &ctx.theme,
-                                );
-                                let wrapped = window
-                                    .text_system()
-                                    .shape_text(
-                                        text.clone().into(),
-                                        ctx.font_size * scale,
-                                        &runs,
-                                        Some(w),
-                                        None,
-                                    )
-                                    .ok()
-                                    .and_then(|lines| lines.into_iter().next());
+                                // Row-start byte offsets of `text` wrapped at
+                                // `width`: 0, then one per boundary glyph.
+                                let shape = |text: &str, segments: &[Segment], width: Pixels| {
+                                    let runs = segments_to_runs(
+                                        text,
+                                        segments,
+                                        &ctx.font,
+                                        ctx.theme.foreground,
+                                        &ctx.theme,
+                                    );
+                                    let wrapped = window
+                                        .text_system()
+                                        .shape_text(
+                                            text.to_string().into(),
+                                            ctx.font_size * scale,
+                                            &runs,
+                                            Some(width),
+                                            None,
+                                        )
+                                        .ok()
+                                        .and_then(|lines| lines.into_iter().next());
+                                    let mut starts = vec![0];
+                                    if let Some(wl) = wrapped {
+                                        starts.extend(wl.wrap_boundaries.iter().map(|b| {
+                                            wl.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix]
+                                                .index
+                                        }));
+                                    }
+                                    starts
+                                };
+                                // Row 0 wraps at the full width and only its
+                                // first boundary is kept; the remainder wraps
+                                // at the width less the hang, indices re-based.
+                                // gpui wraps at one width, hence two passes.
+                                let first = shape(&text, &segments, w);
                                 let mut starts = vec![0];
-                                if let Some(wl) = wrapped {
-                                    starts.extend(wl.wrap_boundaries.iter().map(|b| {
-                                        wl.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix]
-                                            .index
-                                    }));
+                                if let Some(&b1) = first.get(1) {
+                                    starts.push(b1);
+                                    let rest = slice_segments(&segments, b1, text.len());
+                                    let tail = shape(&text[b1..], &rest, w - hang_px);
+                                    starts.extend(tail.into_iter().skip(1).map(|b| b + b1));
                                 }
                                 self.wrap_cache.cur.insert(key, starts.clone());
                                 starts
                             }
                         }
                     }
-                }
+                };
+                (starts, hang_px)
             }
         };
         let caret_at = self.emit_rows(
@@ -660,14 +727,16 @@ impl Editor {
             (i == ctx.cur_line).then_some(cur_col),
             scale,
             pad_top,
+            hang_px,
             decor,
             out,
         );
         // Only the caret/selection-independent lines are worth keeping, and
         // only they are safe to: a cached form carries no highlight or caret.
         if cacheable {
-            self.line_forms
-                .put(i, LineForm { text, segments, metrics: (scale, pad), decor, row_starts });
+            let hang = hang_px;
+            let form = LineForm { text, segments, metrics: (scale, pad), decor, row_starts, hang };
+            self.line_forms.put(i, form);
         }
         // `caret_at` already holds the real row when the caret is on the header
         // itself; otherwise the header answers for a caret hidden in its fold.
@@ -694,6 +763,8 @@ impl Editor {
         cur_col: Option<usize>,
         scale: f32,
         pad_top: Pixels,
+        // Wrap indent for rows after the first.
+        hang: Pixels,
         decor: Option<RowDecor>,
         out: &mut Vec<LineElement>,
     ) -> Option<usize> {
@@ -776,6 +847,7 @@ impl Editor {
                 follow_h: ctx.wrap_width.is_none(),
                 scale,
                 pad_top: if k == 0 { pad_top } else { Pixels::ZERO },
+                hang: if k > 0 { hang } else { Pixels::ZERO },
                 // A wrapped band line closes its border only on its outermost
                 // visual rows; middle rows keep the sides running through.
                 decor: match decor {
@@ -867,21 +939,26 @@ pub(super) fn content_change_is_local(old: &RowsKey, new: &RowsKey) -> bool {
 
 /// Greedy word wrap for plain ASCII text in a monospace font: row-start byte
 /// offsets for rows of at most `cols` chars, breaking after the last space in
-/// the row, or mid-word when one word overruns a whole row. Only valid where
-/// byte == char == column — the caller gates on ASCII.
-// ponytail: a break can leave a space at a row edge — cosmetic, vim-like.
-fn wrap_columns(text: &str, cols: usize) -> Vec<usize> {
+/// the row, or mid-word when one word overruns a whole row. Every row after
+/// the first gives up `hang` columns to the wrap indent (the caller clamps it;
+/// at least one column always remains), so those rows hold fewer characters.
+/// Only valid where byte == char == column — the caller gates on ASCII.
+// A break can leave a space at a row edge — cosmetic, vim-like.
+fn wrap_columns(text: &str, cols: usize, hang: usize) -> Vec<usize> {
     let cols = cols.max(1);
+    let rest = cols.saturating_sub(hang).max(1);
     let bytes = text.as_bytes();
     let mut starts = vec![0];
     let (mut row_start, mut last_space) = (0usize, None);
+    let mut budget = cols;
     let mut i = 0;
     while i < bytes.len() {
-        if i - row_start == cols {
+        if i - row_start == budget {
             let next = last_space.map_or(i, |s: usize| s + 1);
             starts.push(next);
             row_start = next;
             last_space = None;
+            budget = rest;
             i = next;
             continue;
         }
@@ -1060,6 +1137,7 @@ mod tests {
             metrics: (1.0, 0.0),
             decor: None,
             row_starts: vec![0],
+            hang: Pixels::ZERO,
         };
         let w: Option<Pixels> = Some(px(400.));
         let fill = |c: &mut LineForms, n: usize| {
@@ -1123,14 +1201,20 @@ mod tests {
     fn wrap_columns_breaks_words_and_walls() {
         // Word break: "hello worl|d…" overflows at 10; the row breaks after
         // the space, so row 2 starts at 'w'.
-        assert_eq!(wrap_columns("hello world foo", 10), vec![0, 6]);
+        assert_eq!(wrap_columns("hello world foo", 10, 0), vec![0, 6]);
         // No spaces: hard breaks every `cols`.
-        assert_eq!(wrap_columns("aaaaaaaaaaaa", 5), vec![0, 5, 10]);
+        assert_eq!(wrap_columns("aaaaaaaaaaaa", 5, 0), vec![0, 5, 10]);
         // Exact fit and empty: single row.
-        assert_eq!(wrap_columns("aaaaa", 5), vec![0]);
-        assert_eq!(wrap_columns("", 5), vec![0]);
+        assert_eq!(wrap_columns("aaaaa", 5, 0), vec![0]);
+        assert_eq!(wrap_columns("", 5, 0), vec![0]);
         // cols 0 clamps to 1 instead of looping forever.
-        assert_eq!(wrap_columns("ab", 0), vec![0, 1]);
+        assert_eq!(wrap_columns("ab", 0, 0), vec![0, 1]);
+        // Hang: rows after the first give up `hang` columns, so the same text
+        // needs an extra row.
+        assert_eq!(wrap_columns("- aaaa bbbb cccc dddd", 10, 0), vec![0, 7, 17]);
+        assert_eq!(wrap_columns("- aaaa bbbb cccc dddd", 10, 2), vec![0, 7, 12, 17]);
+        // A hang that eats the whole budget still leaves one column per row.
+        assert_eq!(wrap_columns("aaaaaa", 3, 3), vec![0, 3, 4, 5]);
     }
 
     #[test]
