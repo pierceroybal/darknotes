@@ -272,7 +272,7 @@ never rewrites the file you edit by hand.
 Issues and pull requests are welcome. To get set up:
 
 ```sh
-cargo test        # 238 tests, no GPU or display required
+cargo test        # 254 tests, no GPU or display required
 cargo clippy --all-targets -- -D warnings
 cargo run -- ~/notes
 cargo perf -- ~/notes   # release build + instrumentation, prints `perf:` to stderr
