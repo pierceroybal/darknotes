@@ -1,5 +1,6 @@
 mod buffers;
 mod command;
+mod key_repeat;
 mod line_element;
 mod picker;
 mod row_list;
@@ -28,6 +29,7 @@ use buffers::{
     vault_relative, with_md_ext, Buffer,
 };
 use command::{parse_ex, CmdArgs, COMMANDS, DEFAULT_BINDINGS};
+use key_repeat::KeyRepeat;
 use line_element::{
     caret_bytes, fence_block, heading_metrics, list_pad, row_decor, run, segments_to_runs,
     CaretPaint, Gutter, Highlight, LineCaret, LineElement, RowDecor, CODE_MARGIN, CODE_PAD,
@@ -198,16 +200,10 @@ pub struct Editor {
     /// replacing it cancels the timer (gpui cancels a dropped `Task`). On fire
     /// the buffered keys replay through the grammar as ordinary input.
     seq_timer: Option<Task<()>>,
-    /// `key_repeat_delay`/`key_repeat_interval` (ms), from config — see
-    /// `on_key`. `key_repeat_interval == 0` disables self-driven repeat and
-    /// passes the backend's native repeat events straight through.
-    key_repeat_delay: u64,
-    key_repeat_interval: u64,
-    /// The keystroke we're currently auto-repeating, or `None`. While set,
-    /// `on_key` swallows the backend's echoes of it (see there for how an
-    /// echo is recognized). Cleared by any `KeyUp` and on window
-    /// deactivation.
-    repeat_stroke: Option<Keystroke>,
+    /// Self-driven auto-repeat (macOS only): the held key, if any, and the
+    /// config cadence — see `on_key` and `key_repeat.rs`. Off macOS, or with
+    /// a zero interval, native repeat events pass straight through.
+    key_repeat: KeyRepeat,
     /// Pending repeat cadence. Replacing/clearing cancels the timer (gpui
     /// cancels a dropped `Task`), like `blink_timer`/`seq_timer`.
     repeat_timer: Option<Task<()>>,
@@ -337,11 +333,11 @@ impl Editor {
         // OS focus dims the caret (render reads `is_window_active`); repaint on
         // the change, and restart the blink phase so re-focusing shows it solid.
         // Also drop any in-flight key-repeat: alt-tabbing away mid-hold loses
-        // the `KeyUp`, and a stale `repeat_stroke` would swallow that key's
-        // next real press.
+        // the `KeyUp`, and a stale hold would swallow that key's next real
+        // press.
         cx.observe_window_activation(window, |this, _, cx| {
             this.arm_blink(cx);
-            this.repeat_stroke = None;
+            this.key_repeat.release();
             this.repeat_timer = None;
             cx.notify();
         })
@@ -472,9 +468,7 @@ impl Editor {
             keymap,
             timeoutlen: config.keymap.timeoutlen,
             seq_timer: None,
-            key_repeat_delay: config.key_repeat_delay,
-            key_repeat_interval: config.key_repeat_interval,
-            repeat_stroke: None,
+            key_repeat: KeyRepeat::new(config.key_repeat_delay, config.key_repeat_interval),
             repeat_timer: None,
             picker: None,
             picker_scroll: UniformListScrollHandle::new(),
@@ -1286,78 +1280,54 @@ impl Editor {
             }))
     }
 
-    /// Entry point for every raw `KeyDown`. darknotes drives its own repeat
-    /// cadence instead of trusting the OS/platform backend: macOS's native
-    /// auto-repeat stays slow even at its fastest setting, and gpui's X11
-    /// backend (WSLg included) delivers every X-server repeat pulse looking
-    /// like a fresh press. So while `repeat_stroke` is set, a `KeyDown`
-    /// recognized as a backend echo is swallowed — `arm_key_repeat`'s timer
-    /// drives the cadence instead.
-    ///
-    /// An echo is recognized by `is_held` first, falling back to a `key`
-    /// compare. The fallback exists only for X11, which hardcodes `is_held`
-    /// to `false`; it can't be the primary test because macOS folds Shift
-    /// into `key` for symbol keys, so releasing Shift mid-hold renames the
-    /// still-held key (`:` → `;`) and a `key` match would misread its next
-    /// pulse as a fresh press, inserting a stray character.
-    ///
-    /// On every backend, releasing a bare modifier never produces a `KeyUp`
-    /// (it only ever reaches `on_modifiers_changed`), and the OS keeps
-    /// retranslating a still-held key's modifiers on each native repeat
-    /// pulse. So an echo recognized here — by either path — carries the
-    /// corrected modifiers and must be saved back to `repeat_stroke`:
-    /// `arm_key_repeat`'s loop replays whatever is stored there, and a
-    /// still-held key with a since-released modifier would otherwise keep
-    /// repeating with the stale modifier baked in.
+    /// Entry point for every raw `KeyDown`. On macOS darknotes drives its own
+    /// repeat cadence, since native auto-repeat stays slow even at its
+    /// fastest setting: while a key is held, a `KeyDown` recognized as the
+    /// backend's echo of it is swallowed (`KeyRepeat::absorb_echo`) and
+    /// `arm_key_repeat`'s timer drives the cadence instead. Elsewhere native
+    /// repeat passes straight through — see `key_repeat.rs` for why.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let same_key = self.repeat_stroke.as_ref().is_some_and(|s| s.key == ev.keystroke.key);
-        let is_echo = self.repeat_stroke.is_some() && (ev.is_held || same_key);
-        if self.key_repeat_interval > 0 && is_echo {
-            self.repeat_stroke = Some(ev.keystroke.clone());
+        if self.key_repeat.enabled() && self.key_repeat.absorb_echo(ev) {
             return;
         }
         self.handle_key(ev, window, cx);
-        if self.key_repeat_interval > 0 {
-            self.arm_key_repeat(ev.keystroke.clone(), window, cx);
+        if self.key_repeat.enabled() {
+            self.key_repeat.press(ev.keystroke.clone(), Instant::now());
+            self.arm_key_repeat(window, cx);
         }
     }
 
     /// A physical key released: stop repeating. Deliberately doesn't check
-    /// *which* key came up — the Shift fold (see `on_key`) means a `KeyUp`
-    /// can report a different `key` than the `KeyDown` we stored. Only one
-    /// key repeats at a time, so any `KeyUp` is almost certainly its
-    /// release; the rare false positive (another key tapped mid-hold) costs
-    /// one extra "fresh press" before the next native pulse re-arms it —
-    /// far cheaper than a repeat that never stops.
+    /// *which* key came up — see `KeyRepeat::release`. So a key tapped
+    /// mid-hold ends the hold, as it does under macOS's own repeat.
     fn on_key_up(&mut self, _ev: &KeyUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.repeat_stroke = None;
+        self.key_repeat.release();
         self.repeat_timer = None;
     }
 
-    /// (Re)arm `stroke`'s auto-repeat: after `key_repeat_delay`, replay it
-    /// through `handle_key` every `key_repeat_interval` until `on_key_up` (or
-    /// a window-activation change) clears `repeat_stroke`. Mirrors
+    /// (Re)arm the held key's auto-repeat: after `key_repeat_delay`, replay
+    /// it through `handle_key` every `key_repeat_interval` for as long as
+    /// `KeyRepeat::tick` confirms no key has come up since the press.
+    /// `on_key_up` (or a window-activation change) cancels it outright;
+    /// `tick` is what ends it when that `KeyUp` never arrives. Mirrors
     /// `arm_blink`/`arm_fs_watch`'s bridge from gpui's background executor
     /// back onto the entity; replacing `repeat_timer` cancels whatever was
-    /// running before (a different key was already repeating).
-    ///
-    /// Each tick re-reads `repeat_stroke` rather than closing over `stroke`
-    /// by value, so a mid-hold correction from `on_key` (a released
-    /// modifier) is picked up on the next replay instead of being repeated
-    /// forever with the modifiers it had when the hold started.
-    fn arm_key_repeat(&mut self, stroke: Keystroke, window: &Window, cx: &mut Context<Self>) {
-        self.repeat_stroke = Some(stroke);
-        let delay = Duration::from_millis(self.key_repeat_delay);
-        let interval = Duration::from_millis(self.key_repeat_interval);
+    /// running before.
+    fn arm_key_repeat(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let delay = self.key_repeat.delay();
+        let interval = self.key_repeat.interval();
         self.repeat_timer = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(delay).await;
             loop {
                 let alive = this.update_in(cx, |this, window, cx| {
-                    let Some(stroke) = this.repeat_stroke.clone() else { return };
+                    let Some(stroke) = this.key_repeat.tick(key_repeat::hid_released_since) else {
+                        return false;
+                    };
                     let ev = KeyDownEvent { keystroke: stroke, is_held: true };
                     this.handle_key(&ev, window, cx);
+                    true
                 });
-                if alive.is_err() {
+                if !matches!(alive, Ok(true)) {
                     return;
                 }
                 cx.background_executor().timer(interval).await;

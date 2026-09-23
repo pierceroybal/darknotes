@@ -47,11 +47,12 @@ pub struct Config {
     /// 0 also disables blinking.
     pub cursor_blink_interval: u64,
     /// Milliseconds a held key waits before it starts auto-repeating.
-    /// darknotes drives repeat itself so held keys behave identically on
-    /// every platform — see `Editor::on_key` and `config.default.toml`.
+    /// macOS only: darknotes drives repeat itself there, where native repeat
+    /// is slow; elsewhere the system's own repeat is used — see
+    /// `editor/key_repeat.rs` and `config.default.toml`.
     pub key_repeat_delay: u64,
-    /// Milliseconds between repeats after that. 0 disables self-driven
-    /// repeat, falling back to the backend's native behavior.
+    /// Milliseconds between repeats after that (macOS only). 0 disables
+    /// self-driven repeat, falling back to the native behavior.
     pub key_repeat_interval: u64,
     /// Reload open buffers and refresh the sidebar when something outside
     /// darknotes changes a file under the vault (an agent, a script,
