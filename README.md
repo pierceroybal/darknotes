@@ -98,7 +98,7 @@ warns instead.
 leaves task toggling live.
 
 **Themes.** `dark`, `light`, `ayu-mirage`, `kanagawa`, `everforest`,
-`gruvbox-material`, `catppuccin-mocha`. Switch live with `:theme <name>`.
+`gruvbox-material`, `catppuccin-mocha`, `molokai`. Switch live with `:theme <name>`.
 
 ## Install
 

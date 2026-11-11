@@ -68,6 +68,7 @@ const BUILTINS: &[(&str, fn() -> Theme)] = &[
     ("everforest", Theme::everforest),
     ("gruvbox-material", Theme::gruvbox_material),
     ("catppuccin-mocha", Theme::catppuccin_mocha),
+    ("molokai", Theme::molokai),
 ];
 
 impl Theme {
@@ -265,6 +266,39 @@ impl Theme {
             mode_insert: rgb(0xa6e3a1).into(),
             mode_visual: rgb(0xcba6f7).into(),
             mode_view: rgb(0x89b4fa).into(),
+        }
+    }
+
+    /// Molokai (dark) — near-black ground with saturated pink, green, cyan,
+    /// orange and violet. Values approximate the canonical tomasr/molokai
+    /// palette.
+    fn molokai() -> Self {
+        Self {
+            background: rgb(0x1b1d1e).into(),
+            foreground: rgb(0xf8f8f2).into(),
+            accent: rgb(0xfd971f).into(),
+            selection: rgb(0x403d3d).into(),
+            // Molokai's own search highlight is a bright #ffe792 under dark
+            // text; a dim olive keeps `foreground` readable instead.
+            search_match: rgb(0x4f4a26).into(),
+            sidebar_background: rgb(0x161718).into(),
+            sidebar_foreground: rgb(0xbcbcbc).into(),
+            sidebar_active_foreground: rgb(0xf8f8f2).into(),
+            sidebar_current_background: rgb(0x293739).into(),
+            sidebar_cursor_background: rgb(0x3a4a4c).into(),
+            status_background: rgb(0x232526).into(),
+            status_foreground: rgb(0x8f8f8f).into(),
+            heading: rgb(0xf92672).into(),
+            strong: rgb(0xe6db74).into(),
+            code: rgb(0xa6e22e).into(),
+            code_bg: rgb(0x232526).into(),
+            muted: rgb(0x7e8e91).into(),
+            link: rgb(0x66d9ef).into(),
+            border: rgb(0x2e3032).into(),
+            hover: hsla(0., 0., 1., 0.06),
+            mode_insert: rgb(0xa6e22e).into(),
+            mode_visual: rgb(0xae81ff).into(),
+            mode_view: rgb(0x66d9ef).into(),
         }
     }
 
