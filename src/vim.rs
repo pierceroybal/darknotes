@@ -845,12 +845,18 @@ impl Vim {
                 self.mode = Mode::Normal;
                 return vec![Action::DeleteSelection { linewise: true, change: false }];
             }
-            // `c`: delete the selection and enter insert. A linewise span keeps
-            // one empty line to type into (vim `Vc`).
-            ("c", false) => {
+            // `c` (or its alias `s`): delete the selection and enter insert. A
+            // linewise span keeps one empty line to type into (vim `Vc`).
+            ("c", false) | ("s", false) => {
                 self.count = None;
                 return self
                     .enter_insert(vec![Action::DeleteSelection { linewise: line, change: true }]);
+            }
+            // `S`/`R`/`C` change the selected lines whatever the submode (vim).
+            ("s", true) | ("r", true) | ("c", true) => {
+                self.count = None;
+                return self
+                    .enter_insert(vec![Action::DeleteSelection { linewise: true, change: true }]);
             }
             ("y", false) => {
                 self.count = None;
@@ -1681,6 +1687,29 @@ mod tests {
             vec![Action::DeleteSelection { linewise: true, change: true }]
         );
         assert_eq!(v.mode, Mode::Insert);
+    }
+
+    #[test]
+    fn visual_s_is_change() {
+        for line in [false, true] {
+            let mut v = vim();
+            v.on_key(&if line { shift("v", "V") } else { k("v") });
+            assert_eq!(
+                v.on_key(&k("s")),
+                vec![Action::DeleteSelection { linewise: line, change: true }]
+            );
+            assert_eq!(v.mode, Mode::Insert);
+        }
+        // `S`/`R`/`C` change whole lines even from charwise visual.
+        for (key, ch) in [("s", "S"), ("r", "R"), ("c", "C")] {
+            let mut v = vim();
+            v.on_key(&k("v"));
+            assert_eq!(
+                v.on_key(&shift(key, ch)),
+                vec![Action::DeleteSelection { linewise: true, change: true }]
+            );
+            assert_eq!(v.mode, Mode::Insert);
+        }
     }
 
     #[test]
