@@ -228,6 +228,9 @@ pub struct Editor {
     /// Memoized match scan; see `MatchCache`. Shared by the incsearch jump and
     /// the render path, which otherwise scanned the buffer twice per keystroke.
     match_cache: Option<MatchCache>,
+    /// `(revision, words)` for the statusline's whole-buffer word count.
+    /// Revisions are unique across buffers, so one slot serves them all.
+    word_count_cache: Option<(u64, usize)>,
     /// Blink the caret while the editor pane is focused, from config.
     cursor_blink: bool,
     /// Length (ms) of each blink phase, from config. 0 disables blinking.
@@ -478,6 +481,7 @@ impl Editor {
             search_cfg: config.search,
             note_cmds,
             match_cache: None,
+            word_count_cache: None,
             cursor_blink: config.cursor_blink,
             blink_interval: config.cursor_blink_interval,
             blink_show: true,
@@ -2548,6 +2552,28 @@ impl Render for Editor {
             format!("{count}{}%", (line + 1) * 100 / total)
         };
 
+        // Word count left of progress: the whole buffer, or `sel / total`
+        // while a visual selection is up.
+        let words = {
+            let revision = self.doc().revision();
+            let total = match self.word_count_cache {
+                Some((r, n)) if r == revision => n,
+                _ => {
+                    let n = self.doc().word_count(0, self.doc().rope.len_chars());
+                    self.word_count_cache = Some((revision, n));
+                    n
+                }
+            };
+            let unit = if total == 1 { "word" } else { "words" };
+            if matches!(mode, Mode::Visual | Mode::VisualLine) {
+                let (a, b) = self.doc().selection_span(mode == Mode::VisualLine);
+                let sel = self.doc().word_count(a, b);
+                format!("{} / {} {unit}", group_thousands(sel), group_thousands(total))
+            } else {
+                format!("{} {unit}", group_thousands(total))
+            }
+        };
+
         let open_path = self.doc().path().map(Path::to_path_buf);
         let tabline = self.render_tabline(&theme, cx);
         let trash_dir = self.vault.root.join(".trash");
@@ -2829,12 +2855,26 @@ impl Render for Editor {
                                 div().min_w_0().truncate().child(bar),
                             )
                             .child(div().flex_1()) // pushes the progress segment to the right edge
+                            .child(div().text_color(theme.muted).child(words))
                             .child(div().text_color(theme.muted).child(progress)),
                     ),
             )
             .children(self.render_picker(&theme))
             .children(self.render_confirm_quit(&theme))
     }
+}
+
+/// `12345` → `12,345`, for the statusline word count.
+fn group_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Line of the first heading titled `name`, case-insensitively and ignoring the

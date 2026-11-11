@@ -405,6 +405,23 @@ impl Document {
         h.finish()
     }
 
+    /// Words in char range `[start, end)`: whitespace-separated runs holding at
+    /// least one alphanumeric char, so bare markdown syntax (`#`, `-`, `---`,
+    /// `|`) doesn't count. A run cut by the range edge counts as a word.
+    pub fn word_count(&self, start: usize, end: usize) -> usize {
+        let mut count = 0;
+        let mut counted = false; // this run already counted
+        for c in self.rope.slice(start..end).chars() {
+            if c.is_whitespace() {
+                counted = false;
+            } else if !counted && c.is_alphanumeric() {
+                count += 1;
+                counted = true;
+            }
+        }
+        count
+    }
+
     /// Content generation — changes iff the rope changed. See the field doc.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -2158,6 +2175,31 @@ fn heading_title(spans: &markdown::Parsed, rope: &Rope, line: usize) -> Option<S
 fn find_heading(spans: &markdown::Parsed, rope: &Rope, title: &str) -> Option<usize> {
     (0..rope.len_lines())
         .find(|&l| heading_title(spans, rope, l).is_some_and(|t| t.eq_ignore_ascii_case(title)))
+}
+
+#[cfg(test)]
+mod word_count {
+    use super::*;
+
+    fn all(text: &str) -> usize {
+        let d = Document::new(text);
+        d.word_count(0, d.rope.len_chars())
+    }
+
+    #[test]
+    fn skips_markdown_syntax() {
+        assert_eq!(all(""), 0);
+        assert_eq!(all("# Title\n\n- one two\n---\n| a | b |\n"), 5);
+        assert_eq!(all("don't **stop** — x2"), 3);
+        assert_eq!(all("  café\tnaïve\n"), 2);
+    }
+
+    #[test]
+    fn partial_range() {
+        let d = Document::new("alpha beta gamma");
+        assert_eq!(d.word_count(2, 8), 2); // "pha be"
+        assert_eq!(d.word_count(5, 6), 0); // the space
+    }
 }
 
 #[cfg(test)]

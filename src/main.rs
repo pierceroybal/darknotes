@@ -19,9 +19,13 @@ use std::path::PathBuf;
 use config::Config;
 use editor::Editor;
 use gpui::{
-    App, Application, AssetSource, Bounds, Focusable, SharedString, WindowBounds, WindowOptions,
-    prelude::*, px, size,
+    App, Application, AssetSource, Bounds, Focusable, KeyBinding, Menu, MenuItem, SharedString,
+    WindowBounds, WindowOptions, actions, prelude::*, px, size,
 };
+
+// App-level Quit: Cmd-Q and the app menu's Quit item. gpui binds neither by
+// default, so without this the macOS app menu offers no way out.
+actions!(darknotes, [Quit]);
 
 /// Sidebar icons (lucide, ISC — `assets/icons/LICENSE-lucide.txt`), compiled
 /// in like the fonts. gpui's `svg()` element loads by path through the app's
@@ -155,7 +159,7 @@ fn main() {
 
         // Start maximized; the centered size is the restore bounds.
         let bounds = Bounds::centered(None, size(px(900.), px(640.)), cx);
-        cx.open_window(
+        let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Maximized(bounds)),
                 ..Default::default()
@@ -175,6 +179,22 @@ fn main() {
             },
         )
         .unwrap();
+
+        // Quit takes the same path as the titlebar X: unsaved buffers raise
+        // the save/discard dialog instead of being dropped, and the session
+        // snapshot is written. A window that's already gone has nothing to
+        // guard, so quit outright.
+        cx.on_action(move |_: &Quit, cx| {
+            let ok = window.update(cx, |editor, _, cx| editor.confirm_close(cx)).unwrap_or(true);
+            if ok {
+                cx.quit();
+            }
+        });
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![Menu {
+            name: "darknotes".into(),
+            items: vec![MenuItem::action("Quit darknotes", Quit)],
+        }]);
         cx.activate(true);
     });
 }
